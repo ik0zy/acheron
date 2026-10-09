@@ -24,6 +24,7 @@ namespace Core {
 namespace Audio {
 
 class AudioPipeline;
+class VoiceConnection;
 
 struct VoiceParticipant
 {
@@ -33,6 +34,8 @@ struct VoiceParticipant
     bool serverMute = false;
     bool serverDeaf = false;
     bool suppress = false;
+    bool selfVideo = false;
+    bool selfStream = false;
     bool speaking = false;
 };
 
@@ -45,6 +48,13 @@ public:
 
     void handleVoiceStateUpdate(const Discord::VoiceState &state);
     void handleVoiceServerUpdate(const Discord::VoiceServerUpdate &event);
+
+    // The id of the gateway session this client is, from READY. A voice state for this account
+    // carrying any other session id belongs to another of the account's devices.
+    void setGatewaySessionId(const QString &sessionId);
+
+    // A private call ended: everyone the gateway listed in it is gone.
+    void forgetChannelVoiceStates(Snowflake channelId);
 
     void disconnect();
 
@@ -100,6 +110,9 @@ public:
 signals:
     void voiceConnected();
     void voiceDisconnected();
+    // Another session of this account joined voice while this client was connected, which ends
+    // this client's connection without it having asked to leave.
+    void takenOverByAnotherSession(Snowflake channelId, Snowflake guildId);
     void voiceStateChanged();
     void audioLevelChanged(float rms);
     void speakingChanged(bool speaking);
@@ -131,6 +144,7 @@ private:
     Snowflake accountId;
     ProxyConfig proxy;
 
+    QString gatewaySessionId;
     QString voiceSessionId;
     Snowflake guildId;
     Snowflake channelId;
@@ -172,7 +186,7 @@ private:
     QHash<Snowflake, Discord::VoiceState> knownVoiceStates;
     QString cachedPrivacyCode;
 
-    QThread *voiceThread = nullptr;
+    VoiceConnection *voiceConnection = nullptr;
     Discord::Voice::VoiceClient *voiceClient = nullptr;
     AudioPipeline *audioPipeline = nullptr;
     unsigned int voiceGeneration = 0;

@@ -1,10 +1,13 @@
 #include "Socks5UdpAssociation.hpp"
 
+#include "PacketBuffer.hpp"
+
 #include "Core/Logging.hpp"
 
 #include <QtEndian>
 
 #include <algorithm>
+#include <cstring>
 
 namespace Acheron {
 namespace Discord {
@@ -23,6 +26,9 @@ constexpr char ATYP_DOMAIN = 0x03;
 constexpr char ATYP_IPV6 = 0x04;
 constexpr char REPLY_SUCCEEDED = 0x00;
 
+// RSV (two bytes) and FRAG, ahead of the address in every relayed datagram
+constexpr int DATAGRAM_PREFIX_SIZE = 3;
+
 void appendAddress(QByteArray &out, const QHostAddress &address, quint16 port)
 {
     if (address.protocol() == QAbstractSocket::IPv6Protocol) {
@@ -40,23 +46,28 @@ void appendAddress(QByteArray &out, const QHostAddress &address, quint16 port)
 }
 
 // Length of the ATYP+ADDR+PORT tail starting at `offset`, or -1 if incomplete or unknown.
-int addressFieldLength(const QByteArray &data, int offset)
+int addressFieldLength(const char *data, int size, int offset)
 {
-    if (data.size() <= offset)
+    if (size <= offset)
         return -1;
 
-    switch (data.at(offset)) {
+    switch (data[offset]) {
     case ATYP_IPV4:
         return 1 + 4 + 2;
     case ATYP_IPV6:
         return 1 + 16 + 2;
     case ATYP_DOMAIN:
-        if (data.size() <= offset + 1)
+        if (size <= offset + 1)
             return -1;
-        return 1 + 1 + static_cast<quint8>(data.at(offset + 1)) + 2;
+        return 1 + 1 + static_cast<quint8>(data[offset + 1]) + 2;
     default:
         return -1;
     }
+}
+
+int addressFieldLength(const QByteArray &data, int offset)
+{
+    return addressFieldLength(data.constData(), data.size(), offset);
 }
 
 QString replyErrorString(quint8 code)
@@ -320,27 +331,53 @@ void Socks5UdpAssociation::fail(const QString &error)
     QMetaObject::invokeMethod(this, [this, error] { emit failed(error); }, Qt::QueuedConnection);
 }
 
-QByteArray Socks5UdpAssociation::encapsulate(const QByteArray &payload, const QHostAddress &destination,
-                                             quint16 destinationPort)
+int Socks5UdpAssociation::writeRelayHeader(std::span<uint8_t> out, const QHostAddress &destination, quint16 destinationPort)
 {
-    QByteArray datagram(3, '\0');
-    appendAddress(datagram, destination, destinationPort);
-    datagram.append(payload);
+    const bool ipv6 = destination.protocol() == QAbstractSocket::IPv6Protocol;
+    const int size = DATAGRAM_PREFIX_SIZE + 1 + (ipv6 ? 16 : 4) + 2;
+    if (static_cast<int>(out.size()) < size)
+        return -1;
 
-    return datagram;
+    uint8_t *p = out.data();
+    std::memset(p, 0, DATAGRAM_PREFIX_SIZE);
+    p += DATAGRAM_PREFIX_SIZE;
+
+    if (ipv6) {
+        *p++ = ATYP_IPV6;
+        const Q_IPV6ADDR raw = destination.toIPv6Address();
+        std::memcpy(p, raw.c, 16);
+        p += 16;
+    } else {
+        *p++ = ATYP_IPV4;
+        qToBigEndian(destination.toIPv4Address(), p);
+        p += 4;
+    }
+    qToBigEndian(destinationPort, p);
+
+    return size;
 }
 
-QByteArray Socks5UdpAssociation::decapsulate(const QByteArray &datagram)
+bool Socks5UdpAssociation::wrap(PacketBuffer &packet, std::span<const uint8_t> relayHeader)
 {
+    if (!packet.growFront(static_cast<int>(relayHeader.size())))
+        return false;
+    std::memcpy(packet.data(), relayHeader.data(), relayHeader.size());
+    return true;
+}
+
+bool Socks5UdpAssociation::unwrap(PacketBuffer &packet)
+{
+    const char *datagram = reinterpret_cast<const char *>(packet.data());
+
     // fragmented relays (FRAG != 0) are not supported; Discord never fragments
-    if (datagram.size() < 4 || datagram.at(2) != 0)
-        return QByteArray();
+    if (packet.size() < DATAGRAM_PREFIX_SIZE + 1 || datagram[2] != 0)
+        return false;
 
-    const int tail = addressFieldLength(datagram, 3);
-    if (tail < 0 || datagram.size() < 3 + tail)
-        return QByteArray();
+    const int tail = addressFieldLength(datagram, packet.size(), DATAGRAM_PREFIX_SIZE);
+    if (tail < 0)
+        return false;
 
-    return datagram.mid(3 + tail);
+    return packet.dropFront(DATAGRAM_PREFIX_SIZE + tail);
 }
 
 } // namespace Voice

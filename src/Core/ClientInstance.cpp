@@ -11,6 +11,9 @@
 
 #include "Core/Logging.hpp"
 #include "ForumManager.hpp"
+#include "Calls/CallStore.hpp"
+#include "Streams/StreamManager.hpp"
+#include "Streams/StreamPreviews.hpp"
 #include "Discord/Enums.hpp"
 #include "Storage/DatabaseManager.hpp"
 #include "Storage/GuildRepository.hpp"
@@ -74,6 +77,22 @@ ClientInstance::ClientInstance(const AccountInfo &info,
     emojiManager = new EmojiManager(client, this, this);
     favoriteGifManager = new FavoriteGifs(client, this);
     messageManager->setEmojiManager(emojiManager);
+
+    callStore = new CallStore(this);
+    connect(client, &Discord::Client::callCreated, this, &ClientInstance::onCallCreated);
+    connect(client, &Discord::Client::callUpdated, callStore, &CallStore::handleCallUpdate);
+    connect(client, &Discord::Client::callDeleted, this, &ClientInstance::onCallDeleted);
+
+    streamManager = new StreamManager(this);
+    connect(client, &Discord::Client::streamCreated, streamManager, &StreamManager::handleStreamCreate);
+    connect(client, &Discord::Client::streamServerUpdated, streamManager, &StreamManager::handleStreamServerUpdate);
+    connect(client, &Discord::Client::streamUpdated, streamManager, &StreamManager::handleStreamUpdate);
+    connect(client, &Discord::Client::streamDeleted, streamManager, &StreamManager::handleStreamDelete);
+    streamPreviewCache = new StreamPreviews(
+            [this](const QString &streamKey, std::function<void(const Discord::StreamPreviewLookup &)> done) {
+                client->fetchStreamPreview(streamKey, std::move(done));
+            },
+            this);
 #ifndef ACHERON_NO_VOICE
     voiceManager = new Audio::VoiceManager(info.id, info.proxy, this);
     connect(voiceManager, &Audio::VoiceManager::voiceConnected, this, &ClientInstance::onVoiceConnected);
@@ -86,6 +105,15 @@ ClientInstance::ClientInstance(const AccountInfo &info,
             [this]() { emit authenticationFailed(account); });
 
     connect(client, &Discord::Client::ready, this, [this](const Discord::Ready &ready) {
+        gatewaySessionId = ready.sessionId;
+#ifndef ACHERON_NO_VOICE
+        voiceManager->setGatewaySessionId(gatewaySessionId);
+#endif
+        callStore->reset();
+        streamManager->reset();
+        streamPreviewCache->clear();
+        connectSelectedCall(true);
+
         QString connName = Storage::DatabaseManager::instance().getCacheConnectionName(account.id);
         QSqlDatabase db = QSqlDatabase::database(connName);
 
@@ -291,30 +319,7 @@ ClientInstance::ClientInstance(const AccountInfo &info,
     connect(readStateManager, &ReadStateManager::ackRequested, this, &ClientInstance::handleAckRequest);
     connect(readStateManager, &ReadStateManager::bulkAckRequested, this, &ClientInstance::handleBulkAckRequest);
 
-    connect(client, &Discord::Client::voiceStateUpdated, this,
-            [this](const Discord::VoiceState &event) {
-                qCInfo(LogVoice) << "VOICE_STATE_UPDATE: user" << event.userId.get()
-                                 << "channel" << (event.channelId.isNull() ? 0 : static_cast<quint64>(event.channelId.get()))
-                                 << "session" << event.sessionId.get()
-                                 << "mute" << event.selfMute.get()
-                                 << "deaf" << event.selfDeaf.get();
-
-                // track our own voice state
-                if (event.userId.get() == account.id) {
-                    if (event.channelId.isNull() || !event.channelId.get().isValid()) {
-                        currentVoiceChannelId = Snowflake::Invalid;
-                        currentVoiceGuildId = Snowflake::Invalid;
-                    } else {
-                        currentVoiceChannelId = event.channelId.get();
-                        currentVoiceGuildId = event.guildId.hasValue() ? event.guildId.get() : Snowflake::Invalid;
-                    }
-                    emit voiceStateChanged(currentVoiceChannelId, currentVoiceGuildId);
-                }
-
-#ifndef ACHERON_NO_VOICE
-                voiceManager->handleVoiceStateUpdate(event);
-#endif
-            });
+    connect(client, &Discord::Client::voiceStateUpdated, this, &ClientInstance::onVoiceStateUpdated);
 
 #ifndef ACHERON_NO_VOICE
     connect(client, &Discord::Client::voiceServerUpdated, this,
@@ -326,6 +331,82 @@ ClientInstance::ClientInstance(const AccountInfo &info,
                 voiceManager->handleVoiceServerUpdate(event);
             });
 #endif
+}
+
+void ClientInstance::onVoiceStateUpdated(const Discord::VoiceState &event)
+{
+    qCInfo(LogVoice) << "VOICE_STATE_UPDATE: user" << event.userId.get()
+                     << "channel" << (event.channelId.isNull() ? 0 : static_cast<quint64>(event.channelId.get()))
+                     << "session" << event.sessionId.get()
+                     << "mute" << event.selfMute.get()
+                     << "deaf" << event.selfDeaf.get();
+
+    if (event.userId.get() == account.id) {
+        const bool left = event.channelId.isNull() || !event.channelId.get().isValid();
+        const bool heldByThisSession = gatewaySessionId.isEmpty() || event.sessionId.get() == gatewaySessionId;
+
+        // Only a voice state this gateway session holds puts this client in voice. One held by
+        // another of the account's sessions means this client is not, or no longer, connected.
+        const bool takenByAnotherSession = !heldByThisSession && !left && currentVoiceChannelId.isValid();
+
+        if (heldByThisSession && !left) {
+            currentVoiceChannelId = event.channelId.get();
+            currentVoiceGuildId = event.guildId.hasValue() ? event.guildId.get() : Snowflake::Invalid;
+            emit voiceStateChanged(currentVoiceChannelId, currentVoiceGuildId);
+        } else if (heldByThisSession || takenByAnotherSession) {
+            currentVoiceChannelId = Snowflake::Invalid;
+            currentVoiceGuildId = Snowflake::Invalid;
+            emit voiceStateChanged(currentVoiceChannelId, currentVoiceGuildId);
+        }
+    }
+
+    if (!event.selfStream.valueOr(false))
+        streamPreviewCache->forgetOwner(event.userId.get());
+
+#ifndef ACHERON_NO_VOICE
+    voiceManager->handleVoiceStateUpdate(event);
+#endif
+}
+
+void ClientInstance::onCallCreated(const Discord::CallCreate &event)
+{
+    callStore->handleCallCreate(event);
+
+    if (!event.voiceStates.hasValue())
+        return;
+
+    for (Discord::VoiceState state : event.voiceStates.get()) {
+        if (state.channelId.isNull() || !state.channelId.get().isValid())
+            state.channelId = event.channelId.get();
+        onVoiceStateUpdated(state);
+    }
+}
+
+void ClientInstance::onCallDeleted(const Discord::CallDelete &event)
+{
+    callStore->handleCallDelete(event);
+#ifndef ACHERON_NO_VOICE
+    voiceManager->forgetChannelVoiceStates(event.channelId.get());
+#endif
+}
+
+void ClientInstance::noteChannelSelected(Snowflake channelId)
+{
+    selectedChannelId = channelId;
+    connectSelectedCall(false);
+}
+
+void ClientInstance::connectSelectedCall(bool force)
+{
+    if (!selectedChannelId.isValid() || gatewaySessionId.isEmpty())
+        return;
+
+    const auto channel = getChannel(selectedChannelId);
+    if (!channel || (channel->type != Discord::ChannelType::DM && channel->type != Discord::ChannelType::GROUP_DM))
+        return;
+
+    if (callStore->shouldConnect(selectedChannelId, force))
+        client->sendCallConnect(selectedChannelId);
 }
 
 void ClientInstance::onVoiceConnected()
@@ -593,6 +674,7 @@ void ClientInstance::onChannelDeleted(const Discord::ChannelDelete &event)
         return;
 
     Core::Snowflake channelId = event.id.get();
+    callStore->forget(channelId);
 
     qCDebug(LogCore) << "Channel deleted:" << channelId;
 
@@ -1438,6 +1520,21 @@ EmojiManager *ClientInstance::emojis() const
 FavoriteGifs *ClientInstance::favoriteGifs() const
 {
     return favoriteGifManager;
+}
+
+CallStore *ClientInstance::calls() const
+{
+    return callStore;
+}
+
+StreamManager *ClientInstance::streams() const
+{
+    return streamManager;
+}
+
+StreamPreviews *ClientInstance::streamPreviews() const
+{
+    return streamPreviewCache;
 }
 
 #ifndef ACHERON_NO_VOICE

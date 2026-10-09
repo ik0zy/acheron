@@ -155,6 +155,18 @@ public:
     void ackBulk(const QList<AckEntry> &entries, std::function<void(bool success)> onFinished);
 
     void sendVoiceStateUpdate(Snowflake guildId, Snowflake channelId, bool selfMute, bool selfDeaf);
+
+    // Asks the gateway for the call in a DM or group DM; it answers with CALL_CREATE if one exists.
+    void sendCallConnect(Snowflake channelId);
+
+    void sendStreamCreate(const StreamKey &channel, const QString &preferredRegion);
+    void sendStreamDelete(const QString &streamKey);
+    void sendStreamWatch(const QString &streamKey);
+    void sendStreamPing(const QString &streamKey);
+    void sendStreamSetPaused(const QString &streamKey, bool paused);
+
+    using StreamPreviewCallback = std::function<void(const StreamPreviewLookup &)>;
+    void fetchStreamPreview(const QString &streamKey, StreamPreviewCallback callback);
     void setVoiceConnected(bool connected);
 
     void restoreHeartbeatSession(const std::optional<HeartbeatSession> &stored);
@@ -310,6 +322,13 @@ signals:
     void guildMemberListUpdate(const GuildMemberListUpdate &event);
     void voiceStateUpdated(const VoiceState &event);
     void voiceServerUpdated(const VoiceServerUpdate &event);
+    void callCreated(const CallCreate &event);
+    void callUpdated(const CallUpdate &event);
+    void callDeleted(const CallDelete &event);
+    void streamCreated(const StreamCreate &event);
+    void streamServerUpdated(const StreamServerUpdate &event);
+    void streamUpdated(const StreamUpdate &event);
+    void streamDeleted(const StreamDelete &event);
     void relationshipAdded(const Relationship &event);
     void relationshipUpdated(const RelationshipPartial &event);
     void relationshipRemoved(const RelationshipPartial &event);

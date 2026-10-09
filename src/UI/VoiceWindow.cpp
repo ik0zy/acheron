@@ -164,7 +164,7 @@ VoiceUserWidget::VoiceUserWidget(Core::Snowflake userId, QWidget *parent)
             "QPushButton:hover { border-color: palette(highlight); }");
 
     stateLabel = new QLabel(this);
-    stateLabel->setFixedWidth(24);
+    stateLabel->setFixedWidth(40);
     stateLabel->setAlignment(Qt::AlignCenter);
     stateLabel->setStyleSheet("QLabel { color: palette(mid); font-size: 9px; }");
 
@@ -214,16 +214,32 @@ void VoiceUserWidget::setAudioLevel(float rms)
     }
 }
 
-void VoiceUserWidget::setVoiceStateFlags(bool selfMute, bool selfDeaf, bool serverMute, bool serverDeaf, bool suppress)
+void VoiceUserWidget::setVoiceStateFlags(bool selfMute, bool selfDeaf, bool serverMute, bool serverDeaf, bool suppress, bool selfVideo, bool selfStream)
 {
     QString flags;
-    if (serverDeaf || selfDeaf)
+    QStringList meanings;
+    if (selfStream) {
+        flags += "L";
+        meanings << tr("Live");
+    }
+    if (selfVideo) {
+        flags += "V";
+        meanings << tr("Video");
+    }
+    if (serverDeaf || selfDeaf) {
         flags += "D";
-    if (serverMute || selfMute)
+        meanings << tr("Deafened");
+    }
+    if (serverMute || selfMute) {
         flags += "M";
-    if (suppress)
+        meanings << tr("Muted");
+    }
+    if (suppress) {
         flags += "S";
+        meanings << tr("Suppressed");
+    }
     stateLabel->setText(flags);
+    stateLabel->setToolTip(meanings.join(QStringLiteral(", ")));
 }
 
 void VoiceUserWidget::setLocallyMuted(bool muted)
@@ -838,7 +854,7 @@ void VoiceWindow::onParticipantJoined(Core::Snowflake userId)
 
         const auto *p = voiceManager->participant(userId);
         if (p)
-            widget->setVoiceStateFlags(p->selfMute, p->selfDeaf, p->serverMute, p->serverDeaf, p->suppress);
+            widget->setVoiceStateFlags(p->selfMute, p->selfDeaf, p->serverMute, p->serverDeaf, p->suppress, p->selfVideo, p->selfStream);
     }
 
     connect(widget, &VoiceUserWidget::volumeChanged, this, [this](Core::Snowflake uid, int pct) {
@@ -895,7 +911,7 @@ void VoiceWindow::onParticipantUpdated(Core::Snowflake userId)
 
     const auto *p = voiceManager->participant(userId);
     if (p)
-        it.value()->setVoiceStateFlags(p->selfMute, p->selfDeaf, p->serverMute, p->serverDeaf, p->suppress);
+        it.value()->setVoiceStateFlags(p->selfMute, p->selfDeaf, p->serverMute, p->serverDeaf, p->suppress, p->selfVideo, p->selfStream);
 }
 
 void VoiceWindow::onParticipantSpeakingChanged(Core::Snowflake userId, bool speaking)

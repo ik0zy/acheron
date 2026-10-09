@@ -23,16 +23,18 @@ class VoiceGateway : public QObject
 {
     Q_OBJECT
 public:
-    VoiceGateway(const QString &endpoint, Core::Snowflake serverId, Core::Snowflake channelId,
-                 Core::Snowflake userId, const QString &sessionId, const QString &token,
-                 const Core::ProxyConfig &proxy, QObject *parent = nullptr);
+    explicit VoiceGateway(const ConnectionParams &params, QObject *parent = nullptr);
     ~VoiceGateway();
 
     void start();
     void stop();
     void hardStop();
 
-    void sendSelectProtocol(const QString &address, int port, const QString &mode);
+    void sendSelectProtocol(const SelectProtocolData &data);
+    void sendVideo(const LocalVideoState &state);
+    void sendSessionUpdate(const QList<Codec> &codecs);
+    void sendMediaSinkWants(const MediaSinkWants &wants);
+    void sendVoiceBackendVersion();
     void sendSpeaking(int flags, int delay, quint32 ssrc);
     void sendBinaryPayload(int opcode, const QByteArray &data);
     void sendDaveReadyForTransition(int transitionId);
@@ -52,6 +54,8 @@ signals:
     void clientConnected(const ClientConnectData &data);
     void clientsConnected(const QStringList &userIds);
     void clientDisconnected(Core::Snowflake userId);
+    void sessionUpdated(const SessionUpdate &update);
+    void mediaSinkWantsReceived(const MediaSinkWants &wants);
     void resumed();
 
     void payloadReceived(const QJsonObject &root);
@@ -87,13 +91,7 @@ private:
     void heartbeatLoop();
 
 private:
-    QString endpoint;
-    Core::Snowflake serverId;
-    Core::Snowflake channelId;
-    Core::Snowflake userId;
-    QString sessionId;
-    QString token;
-    Core::ProxyConfig proxy;
+    ConnectionParams params;
 
     std::atomic<bool> running{ false };
 

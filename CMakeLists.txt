@@ -169,6 +169,9 @@ set(PROJECT_SOURCES
     src/Core/MessageReactors.cpp
     src/Core/MessageSegments.cpp
     src/Core/ForumManager.cpp
+    src/Core/Calls/CallStore.cpp
+    src/Core/Streams/StreamManager.cpp
+    src/Core/Streams/StreamPreviews.cpp
     src/Core/ImageManager.cpp
     src/Core/AnimatedImageCache.cpp
     src/Core/ApngDecoder.cpp
@@ -215,6 +218,7 @@ set(PROJECT_SOURCES
     src/UI/TrayIcon.cpp
     src/UI/ProxyLineEdit.cpp
     src/UI/ImageViewer.cpp
+    src/UI/StreamPreviewPopup.cpp
     src/UI/VideoFullscreenWindow.cpp
     src/UI/Accounts/AccountsWindow.cpp
     src/UI/Settings/SettingsWindow.cpp
@@ -315,6 +319,7 @@ set(PROJECT_SOURCES
     src/Discord/RequestWorker.cpp
     src/Discord/CurlUtils.cpp
     src/Discord/CdnUrls.cpp
+    src/Discord/StreamKey.cpp
     src/Discord/ClientIdentity.cpp
     src/Discord/ContextProperties.cpp
     src/Proto/ProtoReader.cpp
@@ -337,6 +342,7 @@ if(ENABLE_VOICE)
         src/Discord/Voice/VoiceEncryption.cpp
         src/Discord/Voice/DaveSession.cpp
         src/Core/Audio/VoiceManager.cpp
+        src/Core/Audio/VoiceConnection.cpp
         src/Core/Audio/AudioPipeline.cpp
         src/Core/Audio/IAudioBackend.cpp
         src/Core/Audio/MiniaudioAudioBackend.cpp
@@ -411,6 +417,40 @@ if(BUILD_TESTS)
     target_include_directories(TestProxy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME ProxyTests COMMAND TestProxy)
 
+    qt_add_executable(TestVoicePayloads tests/tst_VoicePayloads.cpp src/Core/OrderedJson.cpp
+        src/Core/Snowflake.cpp)
+    target_link_libraries(TestVoicePayloads PRIVATE Qt::Core Qt::Network Qt::Test)
+    target_include_directories(TestVoicePayloads PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME VoicePayloadTests COMMAND TestVoicePayloads)
+
+    qt_add_executable(TestStreams tests/tst_Streams.cpp src/Core/Streams/StreamManager.cpp
+        src/Core/Streams/StreamPreviews.cpp src/Discord/StreamKey.cpp src/Core/Logging.cpp
+        src/Core/OrderedJson.cpp src/Core/Snowflake.cpp)
+    target_link_libraries(TestStreams PRIVATE Qt::Core Qt::Gui Qt::Network Qt::Test)
+    target_include_directories(TestStreams PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME StreamTests COMMAND TestStreams)
+
+    qt_add_executable(TestCalls tests/tst_Calls.cpp src/Core/Calls/CallStore.cpp
+        src/Core/OrderedJson.cpp src/Core/Snowflake.cpp)
+    target_link_libraries(TestCalls PRIVATE Qt::Core Qt::Gui Qt::Network Qt::Test)
+    target_include_directories(TestCalls PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME CallTests COMMAND TestCalls)
+
+    if(ENABLE_VOICE)
+        qt_add_executable(TestRtp tests/tst_Rtp.cpp src/Core/Logging.cpp
+            src/Discord/Voice/RtpPacket.cpp src/Discord/Voice/VoiceEncryption.cpp)
+        target_link_libraries(TestRtp PRIVATE Qt::Core Qt::Test ${SODIUM_TARGET})
+        target_include_directories(TestRtp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME RtpTests COMMAND TestRtp)
+
+        qt_add_executable(TestUdpTransport tests/tst_UdpTransport.cpp src/Core/Logging.cpp
+            src/Core/ProxyConfig.cpp src/Discord/Voice/UdpTransport.cpp
+            src/Discord/Voice/Socks5UdpAssociation.cpp)
+        target_link_libraries(TestUdpTransport PRIVATE Qt::Core Qt::Network Qt::Test)
+        target_include_directories(TestUdpTransport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME UdpTransportTests COMMAND TestUdpTransport)
+    endif()
+
     qt_add_executable(TestEmojiGrid tests/tst_EmojiGrid.cpp
         src/UI/Emoji/EmojiGridView.cpp src/UI/Emoji/EmojiGlyphs.cpp src/UI/Emoji/EmojiPainting.cpp
         src/UI/Emoji/PaintedImages.cpp
@@ -466,9 +506,12 @@ if (MSVC)
     endif()
 
     if(BUILD_TESTS)
-        set(_msvc_test_targets TestMarkdown TestUnicodeEmoji TestOrderedJson TestFrecency TestProto TestProxy TestEmojiGrid TestCdnUrls TestEmbeds TestFavoriteGifs)
+        set(_msvc_test_targets TestMarkdown TestUnicodeEmoji TestOrderedJson TestFrecency TestProto TestProxy TestEmojiGrid TestCdnUrls TestEmbeds TestFavoriteGifs TestVoicePayloads TestStreams TestCalls)
         if(TARGET TestApng)
             list(APPEND _msvc_test_targets TestApng TestClips)
+        endif()
+        if(TARGET TestRtp)
+            list(APPEND _msvc_test_targets TestRtp TestUdpTransport)
         endif()
         foreach(test_target ${_msvc_test_targets})
             target_link_options(${test_target} PRIVATE $<$<CONFIG:Debug>:/INCREMENTAL>)

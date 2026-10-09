@@ -5,6 +5,7 @@
 #include <QGuiApplication>
 #include <QMessageBox>
 #include <QPointer>
+#include <QPushButton>
 #include <QSettings>
 #include <QSystemTrayIcon>
 
@@ -54,6 +55,8 @@
 #include "Dialogs/ReactionsPopup.hpp"
 #include "Dialogs/ConfirmPopup.hpp"
 #include "Dialogs/UserProfilePopup.hpp"
+#include "StreamPreviewPopup.hpp"
+#include "Core/Streams/StreamPreviews.hpp"
 #include "Chat/ReactionTooltip.hpp"
 #include "Discord/CdnUrls.hpp"
 #include "Core/ImageManager.hpp"
@@ -368,6 +371,7 @@ void MainWindow::onChannelSelectionChanged(const QModelIndex &current, const QMo
     }
 
     selectedInstance->readState()->setActiveChannel(node->id);
+    selectedInstance->noteChannelSelected(node->id);
     setViewMode(ViewMode::TextChannel);
 
     ChannelNode *guildNode = ChannelTreeModel::findGuildNode(node);
@@ -1089,6 +1093,57 @@ void MainWindow::setupPermanentConnections(Core::ClientInstance *instance)
                 channelTreeModel->updateVoiceParticipantState(channelId, userId,
                                                               instance->accountId());
             });
+
+    connect(instance->voice(), &Core::Audio::VoiceManager::takenOverByAnotherSession,
+            this, [this, instance = QPointer<ClientInstance>(instance)](Core::Snowflake channelId, Core::Snowflake guildId) {
+                auto *box = new QMessageBox(QMessageBox::Information, tr("Voice Disconnected"),
+                                            tr("Your voice has been disconnected because you connected at another location."),
+                                            QMessageBox::Close, this);
+                box->setAttribute(Qt::WA_DeleteOnClose);
+                QPushButton *reconnect = box->addButton(tr("Reconnect"), QMessageBox::AcceptRole);
+                connect(reconnect, &QPushButton::clicked, box, [instance, channelId, guildId]() {
+                    if (instance)
+                        instance->discord()->sendVoiceStateUpdate(guildId, channelId, false, false);
+                });
+                box->open();
+            });
+#endif
+}
+
+void MainWindow::onLiveParticipantHoverChanged(const QModelIndex &proxyIndex)
+{
+#ifndef ACHERON_NO_VOICE
+    if (!proxyIndex.isValid()) {
+        if (streamPreviewPopup)
+            streamPreviewPopup->dismiss();
+        return;
+    }
+
+    auto *node = channelTreeModel->nodeFromIndex(channelFilterProxy->mapToSource(proxyIndex));
+    if (!node || node->type != ChannelNode::Type::VoiceParticipant || !node->parent)
+        return;
+
+    ChannelNode *accountNode = channelTreeModel->getAccountNodeFor(node);
+    Core::ClientInstance *instance = accountNode ? session->client(accountNode->id) : nullptr;
+    if (!instance)
+        return;
+
+    const Snowflake channelId = node->parent->id;
+    ChannelNode *guildNode = ChannelTreeModel::findGuildNode(node);
+    const Snowflake guildId = guildNode ? guildNode->id : Snowflake::Invalid;
+
+    // Mirrors the official client: a preview is looked up only by someone who could join the
+    // channel, or is already in it.
+    const bool mayLook = instance->voiceChannelId() == channelId || !guildId.isValid() || instance->permissions()->hasChannelPermission(instance->accountId(), channelId, Discord::Permission::CONNECT);
+
+    if (!streamPreviewPopup)
+        streamPreviewPopup = new StreamPreviewPopup(session->getImageManager(), this);
+
+    const QRect row = channelTree->visualRect(proxyIndex);
+    const QRect rowOnScreen(channelTree->viewport()->mapToGlobal(row.topLeft()), row.size());
+    streamPreviewPopup->showFor(mayLook ? instance->streamPreviews() : nullptr, instance->accountId(), Discord::StreamKey::forChannel(guildId, channelId, node->id).toString(), rowOnScreen);
+#else
+    Q_UNUSED(proxyIndex);
 #endif
 }
 
@@ -1526,6 +1581,8 @@ void MainWindow::setupUi()
                 Snowflake guildId = guildNode ? guildNode->id : Snowflake::Invalid;
                 showUserContextMenu(session->client(accountNode->id), node->id, guildId, globalPos);
             });
+
+    connect(channelTree, &ChannelTreeView::liveParticipantHoverChanged, this, &MainWindow::onLiveParticipantHoverChanged);
 
     connect(channelTree, &ChannelTreeView::openInNewTabRequested, this,
             [this](const QModelIndex &proxyIndex) {
@@ -2114,6 +2171,7 @@ void MainWindow::activateChannel(const TabEntry &entry)
     }
 
     instance->readState()->setActiveChannel(entry.channelId);
+    instance->noteChannelSelected(entry.channelId);
     setViewMode(ViewMode::TextChannel);
 
     if (!entry.isDm && entry.guildId.isValid())

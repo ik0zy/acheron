@@ -1,5 +1,6 @@
 #include "VoiceManager.hpp"
 #include "AudioPipeline.hpp"
+#include "VoiceConnection.hpp"
 
 #include "Core/Logging.hpp"
 
@@ -34,9 +35,28 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
 {
     Snowflake userId = state.userId.get();
     bool isMe = (userId == accountId);
+    bool leftVoice = state.channelId.isNull() || !state.channelId.get().isValid();
+    Snowflake newChannel = leftVoice ? Snowflake::Invalid : state.channelId.get();
 
-    // cache all non-self voice states so we can populate participants when joining a channel
-    if (!isMe) {
+    // A user has one voice state, whichever of their sessions holds it. The account's own state
+    // is this client's connection only while this gateway session holds it. Held by another
+    // session, the account is a participant like any other and this client is not in voice,
+    // which is how the official client treats it.
+    bool isOwnConnection = isMe && (gatewaySessionId.isEmpty() || state.sessionId.get() == gatewaySessionId);
+
+    bool takenByAnotherSession = isMe && !isOwnConnection && !leftVoice && channelId.isValid();
+    Snowflake takenChannel = channelId;
+    Snowflake takenGuild = guildId;
+    if (takenByAnotherSession) {
+        voiceSessionId.clear();
+        channelId = Snowflake::Invalid;
+        guildId = Snowflake::Invalid;
+        pending = {};
+    }
+
+    // cache every voice state that is not this client's own connection, so participants can be
+    // populated when joining a channel
+    if (!isOwnConnection) {
         Snowflake oldChannel;
         bool hadOld = false;
         Discord::VoiceState oldState;
@@ -47,9 +67,6 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
             if (!oldIt->channelId.isNull())
                 oldChannel = oldIt->channelId.get();
         }
-
-        bool leftVoice = state.channelId.isNull() || !state.channelId.get().isValid();
-        Snowflake newChannel = leftVoice ? Snowflake::Invalid : state.channelId.get();
 
         if (leftVoice)
             knownVoiceStates.remove(userId);
@@ -66,13 +83,39 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
                                 oldState.selfDeaf.get() != state.selfDeaf.get() ||
                                 oldState.mute.get() != state.mute.get() ||
                                 oldState.deaf.get() != state.deaf.get() ||
-                                oldState.suppress.get() != state.suppress.get();
+                                oldState.suppress.get() != state.suppress.get() ||
+                                oldState.selfVideo.get() != state.selfVideo.get() ||
+                                oldState.selfStream.valueOr(false) != state.selfStream.valueOr(false);
             if (stateDiffers)
                 emit participantVoiceStateChanged(newChannel, userId);
         }
     }
 
-    if (isMe) {
+    if (takenByAnotherSession) {
+        qCInfo(LogVoice) << "Voice state: another session of this account connected, leaving voice here";
+
+        if (takenChannel != newChannel)
+            emit channelVoiceMemberChanged(takenChannel, accountId, false);
+
+        if (!voiceConnection && !participants.isEmpty()) {
+            participants.clear();
+            emit participantsCleared();
+        }
+        disconnect();
+        emit takenOverByAnotherSession(takenChannel, takenGuild);
+        return;
+    }
+
+    if (isOwnConnection) {
+        // until now the account's voice state may have been another session's
+        auto otherSessionState = knownVoiceStates.constFind(accountId);
+        if (otherSessionState != knownVoiceStates.constEnd()) {
+            Snowflake otherSessionChannel = otherSessionState->channelId.isNull() ? Snowflake::Invalid : otherSessionState->channelId.get();
+            knownVoiceStates.remove(accountId);
+            if (otherSessionChannel.isValid() && otherSessionChannel != newChannel)
+                emit channelVoiceMemberChanged(otherSessionChannel, accountId, false);
+        }
+
         if (state.channelId.isNull() || !state.channelId.get().isValid()) {
             qCInfo(LogVoice) << "Voice state: disconnected from channel";
             Snowflake oldChannel = channelId;
@@ -84,7 +127,7 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
             if (oldChannel.isValid())
                 emit channelVoiceMemberChanged(oldChannel, accountId, false);
 
-            if (voiceThread)
+            if (voiceConnection)
                 disconnect();
             return;
         }
@@ -163,6 +206,8 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
         p.serverMute = state.mute.get();
         p.serverDeaf = state.deaf.get();
         p.suppress = state.suppress.get();
+        p.selfVideo = state.selfVideo.get();
+        p.selfStream = state.selfStream.valueOr(false);
 
         if (isNew)
             emit participantJoined(userId);
@@ -191,7 +236,7 @@ void VoiceManager::handleVoiceServerUpdate(const Discord::VoiceServerUpdate &eve
     qCInfo(LogVoice) << "Voice server update: guild =" << eventGuildId
                      << "endpoint =" << eventEndpoint;
 
-    if (voiceThread && guildId == eventGuildId) {
+    if (voiceConnection && guildId == eventGuildId) {
         qCInfo(LogVoice) << "Server-commanded voice reconnection";
         stopVoiceThread();
         connectToVoiceServer(eventEndpoint, eventToken);
@@ -206,6 +251,31 @@ void VoiceManager::handleVoiceServerUpdate(const Discord::VoiceServerUpdate &eve
     if (pending.hasStateUpdate && !voiceSessionId.isEmpty()) {
         connectToVoiceServer(eventEndpoint, eventToken);
         pending = {};
+    }
+}
+
+void VoiceManager::setGatewaySessionId(const QString &sessionId)
+{
+    gatewaySessionId = sessionId;
+}
+
+void VoiceManager::forgetChannelVoiceStates(Snowflake targetChannelId)
+{
+    QList<Snowflake> gone;
+    for (auto it = knownVoiceStates.constBegin(); it != knownVoiceStates.constEnd(); ++it) {
+        if (!it->channelId.isNull() && it->channelId.get() == targetChannelId)
+            gone.append(it.key());
+    }
+
+    for (Snowflake userId : gone) {
+        knownVoiceStates.remove(userId);
+        emit channelVoiceMemberChanged(targetChannelId, userId, false);
+
+        if (targetChannelId == channelId && participants.remove(userId)) {
+            if (audioPipeline)
+                QMetaObject::invokeMethod(audioPipeline, [p = audioPipeline, userId]() { p->removeUser(userId); });
+            emit participantLeft(userId);
+        }
     }
 }
 
@@ -320,14 +390,14 @@ void VoiceManager::setUseRnnoiseVad(bool enabled)
 
 QList<AudioDeviceInfo> VoiceManager::availableInputDevices() const
 {
-    if (voiceThread)
+    if (voiceConnection)
         return cachedInputDevices;
     return backend()->availableInputDevices();
 }
 
 QList<AudioDeviceInfo> VoiceManager::availableOutputDevices() const
 {
-    if (voiceThread)
+    if (voiceConnection)
         return cachedOutputDevices;
     return backend()->availableOutputDevices();
 }
@@ -457,20 +527,26 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
     qCInfo(LogVoice) << "Creating voice thread for endpoint" << endpoint
                      << "guild" << guildId << "channel" << channelId;
 
-    voiceThread = new QThread(this);
-    voiceThread->setObjectName("VoiceThread");
+    Discord::Voice::ConnectionParams params;
+    params.endpoint = endpoint;
+    params.token = token;
+    params.serverId = guildId.isValid() ? guildId : channelId;
+    params.channelId = channelId;
+    params.userId = accountId;
+    params.sessionId = voiceSessionId;
+    params.proxy = proxy;
+
+    voiceConnection = new VoiceConnection(params, this);
+    voiceClient = voiceConnection->client();
+    audioPipeline = new AudioPipeline;
 
 #ifdef Q_OS_WIN
     // workaround for ma_context_init and ma_device_init being called on different threads
     // ma_context_init does the CoInitializeEx
     // will be fixed in miniaudio 0.12
-    connect(voiceThread, &QThread::started, this, [] { CoInitializeEx(nullptr, COINIT_MULTITHREADED); }, Qt::DirectConnection);
-    connect(voiceThread, &QThread::finished, this, [] { CoUninitialize(); }, Qt::DirectConnection);
+    connect(voiceConnection->networkThread(), &QThread::started, this, [] { CoInitializeEx(nullptr, COINIT_MULTITHREADED); }, Qt::DirectConnection);
+    connect(voiceConnection->networkThread(), &QThread::finished, this, [] { CoUninitialize(); }, Qt::DirectConnection);
 #endif
-
-    Snowflake serverId = guildId.isValid() ? guildId : channelId;
-    voiceClient = new Discord::Voice::VoiceClient(endpoint, token, serverId, channelId, accountId, voiceSessionId, proxy);
-    audioPipeline = new AudioPipeline;
 
     QList<Snowflake> channelUsers;
     for (auto it = knownVoiceStates.constBegin(); it != knownVoiceStates.constEnd(); ++it) {
@@ -483,9 +559,8 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
     cachedInputDevices = backend()->availableInputDevices();
     cachedOutputDevices = backend()->availableOutputDevices();
 
-    voiceClient->moveToThread(voiceThread);
-    audioPipeline->moveToThread(voiceThread);
-    backend()->moveToThread(voiceThread);
+    voiceConnection->adopt(audioPipeline);
+    voiceConnection->adopt(backend());
 
     connect(voiceClient, &Discord::Voice::VoiceClient::audioReceived, audioPipeline, &AudioPipeline::onAudioReceived);
 
@@ -581,13 +656,13 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
                 emit privacyCodeChanged(code);
             });
 
-    voiceThread->start();
-    QMetaObject::invokeMethod(voiceClient, &Discord::Voice::VoiceClient::start);
+    if (!voiceConnection->start())
+        stopVoiceThread();
 }
 
 void VoiceManager::stopVoiceThread()
 {
-    if (!voiceThread)
+    if (!voiceConnection)
         return;
 
     voiceGeneration++;
@@ -598,32 +673,14 @@ void VoiceManager::stopVoiceThread()
     if (hadParticipants)
         emit participantsCleared();
 
-    AudioPipeline *ap = audioPipeline;
-    Discord::Voice::VoiceClient *vc = voiceClient;
-    IAudioBackend *audio = backend();
-    QThread *mainThread = thread();
-    QMetaObject::invokeMethod(audioPipeline, [ap, vc, audio, mainThread]() {
-        ap->stop();
-        vc->stop();
-        ap->moveToThread(mainThread);
-        vc->moveToThread(mainThread);
-        audio->moveToThread(mainThread); }, Qt::BlockingQueuedConnection);
-
-    voiceThread->quit();
-    if (!voiceThread->wait(5000)) {
-        qCWarning(LogVoice) << "Voice thread did not stop in time, terminating";
-        voiceThread->terminate();
-        voiceThread->wait();
-    }
+    voiceConnection->stop([ap = audioPipeline]() { ap->stop(); });
 
     delete audioPipeline;
     audioPipeline = nullptr;
 
-    delete voiceClient;
+    delete voiceConnection;
+    voiceConnection = nullptr;
     voiceClient = nullptr;
-
-    delete voiceThread;
-    voiceThread = nullptr;
 
     qCDebug(LogVoice) << "Voice thread stopped";
 }
@@ -644,6 +701,8 @@ void VoiceManager::populateParticipantsFromCache()
         p.serverMute = vs.mute.get();
         p.serverDeaf = vs.deaf.get();
         p.suppress = vs.suppress.get();
+        p.selfVideo = vs.selfVideo.get();
+        p.selfStream = vs.selfStream.valueOr(false);
         participants.insert(it.key(), p);
         emit participantJoined(it.key());
     }

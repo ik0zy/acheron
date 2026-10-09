@@ -87,7 +87,7 @@ public:
 
     void setSpeaking(bool speaking);
     void setAudioLevel(float rms);
-    void setVoiceStateFlags(bool selfMute, bool selfDeaf, bool serverMute, bool serverDeaf, bool suppress);
+    void setVoiceStateFlags(bool selfMute, bool selfDeaf, bool serverMute, bool serverDeaf, bool suppress, bool selfVideo, bool selfStream);
     void setLocallyMuted(bool muted);
     void setVolume(int pct);
     void setDisplayName(const QString &name);

@@ -13,6 +13,8 @@
 
 #include "Core/ProxyConfig.hpp"
 #include "Core/Snowflake.hpp"
+#include "PacketBuffer.hpp"
+#include "RtpPacket.hpp"
 #include "VoiceEnums.hpp"
 #include "VoiceEntities.hpp"
 
@@ -41,9 +43,7 @@ public:
     };
     Q_ENUM(State)
 
-    VoiceClient(const QString &endpoint, const QString &token, Core::Snowflake serverId,
-                Core::Snowflake channelId, Core::Snowflake userId, const QString &sessionId,
-                const Core::ProxyConfig &proxy, QObject *parent = nullptr);
+    explicit VoiceClient(const ConnectionParams &params, QObject *parent = nullptr);
     ~VoiceClient() override;
 
     void start();
@@ -88,7 +88,7 @@ private slots:
     void onGatewayResumed();
     void onIpDiscovered(const QString &ip, int port);
     void onIpDiscoveryFailed(const QString &error);
-    void onDatagram(const QByteArray &data);
+    void onRelayLost(const QString &error);
 
 private:
     void setState(State state);
@@ -96,19 +96,26 @@ private:
     void cleanupTransport();
     void ensureDaveSession(uint16_t protocolVersion);
 
+    void onPacket(PacketPool::Handle packet);
+    void receiveAudio(const ParsedRtp &rtp, PacketPool::Handle packet);
+    // Replaces the packet with its end-to-end decrypted contents.
+    bool daveDecryptAudio(quint32 ssrc, PacketPool::Handle &packet);
+
 private:
     VoiceGateway *gateway = nullptr;
     UdpTransport *udpTransport = nullptr;
 
-    QString endpoint;
-    QString token;
-    Core::ProxyConfig proxy;
-    Core::Snowflake serverId;
-    Core::Snowflake channelId;
-    Core::Snowflake userId;
-    QString sessionId;
+    ConnectionParams params;
 
     std::atomic<State> currentState{ State::Disconnected };
+
+    // Packets this connection receives but has no consumer for yet.
+    struct UnroutedCounters
+    {
+        quint64 rtcp = 0;
+        quint64 rtp = 0;
+    };
+    UnroutedCounters unrouted;
 
     // ready
     quint32 localSsrc = 0;

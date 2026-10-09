@@ -51,6 +51,7 @@ class GuildSettingsWindow;
 class TrayIcon;
 #ifndef ACHERON_NO_VOICE
 class VoiceStatusBar;
+class StreamPreviewPopup;
 #endif
 } // namespace UI
 } // namespace Acheron
@@ -131,6 +132,7 @@ private:
     void recordLastViewedChannel(Core::Snowflake accountId, Core::Snowflake guildId, Core::Snowflake channelId);
 #ifndef ACHERON_NO_VOICE
     void updateVoiceStatusLabel();
+    void onLiveParticipantHoverChanged(const QModelIndex &proxyIndex);
 #endif
 
 private:
@@ -231,6 +233,7 @@ private:
 
 #ifndef ACHERON_NO_VOICE
     VoiceStatusBar *voiceStatusBar;
+    StreamPreviewPopup *streamPreviewPopup = nullptr;
 #endif
     AccountsWindow *accountsWindow = nullptr;
     SettingsWindow *settingsWindow = nullptr;

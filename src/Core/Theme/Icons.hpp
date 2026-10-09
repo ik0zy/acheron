@@ -73,6 +73,7 @@ inline constexpr auto TriangleAlert = "triangle-alert";
 inline constexpr auto UserMinus = "user-minus";
 inline constexpr auto UserPlus = "user-plus";
 inline constexpr auto Utensils = "utensils";
+inline constexpr auto Video = "video";
 inline constexpr auto VolumeOff = "volume-x";
 inline constexpr auto VolumeOn = "volume-2";
 inline constexpr auto X = "x";

@@ -5,6 +5,7 @@
 #include "ChannelFilterProxyModel.hpp"
 
 #include "Core/Theme/Icons.hpp"
+#include "Core/Theme/Manager.hpp"
 #include "UI/StatusIndicator.hpp"
 
 namespace Acheron {
@@ -449,9 +450,21 @@ void ChannelDelegate::paint(QPainter *painter, const QStyleOptionViewItem &optio
 
         bool muted = index.data(ChannelTreeModel::IsVoiceMutedRole).toBool();
         bool deafened = index.data(ChannelTreeModel::IsVoiceDeafenedRole).toBool();
+        bool hasVideo = index.data(ChannelTreeModel::IsVoiceVideoRole).toBool();
+        bool isLive = index.data(ChannelTreeModel::IsVoiceLiveRole).toBool();
         constexpr int statusIconSize = 14;
-        int iconCount = (muted ? 1 : 0) + (deafened ? 1 : 0);
-        int rightReserve = iconCount > 0 ? (iconCount * (statusIconSize + 4) + 4) : 4;
+        constexpr int markerSpacing = 4;
+
+        QFont liveFont = painter->font();
+        liveFont.setBold(true);
+        liveFont.setPointSizeF(liveFont.pointSizeF() * 0.75);
+        const QString liveText = tr("LIVE");
+        constexpr int livePillPadding = 4;
+        const int livePillWidth = QFontMetrics(liveFont).horizontalAdvance(liveText) + 2 * livePillPadding;
+
+        int iconCount = (muted ? 1 : 0) + (deafened ? 1 : 0) + (hasVideo ? 1 : 0);
+        int markersWidth = iconCount * (statusIconSize + markerSpacing) + (isLive ? livePillWidth + markerSpacing : 0);
+        int rightReserve = markersWidth + 4;
 
         QColor textColor = option.palette.text().color();
         QRect textRect =
@@ -461,7 +474,7 @@ void ChannelDelegate::paint(QPainter *painter, const QStyleOptionViewItem &optio
                 index.data(Qt::DisplayRole).toString(), Qt::ElideRight, textRect.width());
         painter->drawText(textRect, Qt::AlignLeft | Qt::AlignVCenter, elidedName);
 
-        if (muted || deafened) {
+        if (markersWidth > 0) {
             QColor iconColor = option.palette.text().color();
             iconColor.setAlphaF(0.7f);
             QColor bgColor = option.palette.base().color();
@@ -471,12 +484,31 @@ void ChannelDelegate::paint(QPainter *painter, const QStyleOptionViewItem &optio
                 drawDeafenedIcon(painter,
                                  QRectF(iconX, iconY, statusIconSize, statusIconSize), iconColor,
                                  bgColor);
-                iconX -= (statusIconSize + 4);
+                iconX -= (statusIconSize + markerSpacing);
             }
             if (muted) {
                 drawMutedMicIcon(painter,
                                  QRectF(iconX, iconY, statusIconSize, statusIconSize), iconColor,
                                  bgColor);
+                iconX -= (statusIconSize + markerSpacing);
+            }
+            if (hasVideo) {
+                const qreal dpr = painter->device() ? painter->device()->devicePixelRatioF() : 1.0;
+                painter->drawPixmap(QRect(iconX, iconY, statusIconSize, statusIconSize),
+                                    Core::Theme::Icons::pixmap(Core::Theme::Icons::Name::Video, statusIconSize, iconColor, dpr));
+                iconX -= (statusIconSize + markerSpacing);
+            }
+            if (isLive) {
+                const QRect pill(iconX + statusIconSize - livePillWidth, iconY, livePillWidth, statusIconSize);
+                painter->save();
+                painter->setRenderHint(QPainter::Antialiasing);
+                painter->setPen(Qt::NoPen);
+                painter->setBrush(Core::Theme::Manager::instance().color(Core::Theme::Token::ChatError));
+                painter->drawRoundedRect(pill, 3, 3);
+                painter->setFont(liveFont);
+                painter->setPen(Qt::white);
+                painter->drawText(pill, Qt::AlignCenter, liveText);
+                painter->restore();
             }
         }
 

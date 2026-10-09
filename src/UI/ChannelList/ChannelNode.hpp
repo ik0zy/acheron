@@ -63,6 +63,12 @@ struct ChannelNode
     std::vector<std::unique_ptr<ChannelNode>> children;
     ChannelNode *parent = nullptr;
 
+    // A guild voice channel lists who is in it; so does a DM or group DM with a call going.
+    [[nodiscard]] bool listsVoiceParticipants() const
+    {
+        return type == Type::VoiceChannel || type == Type::DMChannel;
+    }
+
     [[nodiscard]] bool opensChat() const
     {
         return type == Type::Channel ||

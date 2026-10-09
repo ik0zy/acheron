@@ -11,6 +11,9 @@
 namespace Acheron {
 namespace UI {
 
+// The official client shows a live user's stream preview after hovering their row this long.
+static constexpr int LIVE_HOVER_DELAY_MS = 100;
+
 static bool isAlwaysExpanded(ChannelNode::Type type)
 {
     return type == ChannelNode::Type::Forum;
@@ -24,6 +27,54 @@ ChannelTreeView::ChannelTreeView(QWidget *parent)
         if (isAlwaysExpanded(nodeType))
             expand(index);
     });
+
+    viewport()->setMouseTracking(true);
+    liveHoverDelay.setSingleShot(true);
+    liveHoverDelay.setInterval(LIVE_HOVER_DELAY_MS);
+    connect(&liveHoverDelay, &QTimer::timeout, this, [this] {
+        if (!pendingLiveHover.isValid())
+            return;
+        shownLiveHover = pendingLiveHover;
+        pendingLiveHover = QPersistentModelIndex();
+        emit liveParticipantHoverChanged(shownLiveHover);
+    });
+}
+
+void ChannelTreeView::mouseMoveEvent(QMouseEvent *event)
+{
+    QTreeView::mouseMoveEvent(event);
+    setHoveredLiveParticipant(indexAt(event->pos()));
+}
+
+void ChannelTreeView::leaveEvent(QEvent *event)
+{
+    QTreeView::leaveEvent(event);
+    setHoveredLiveParticipant(QModelIndex());
+}
+
+void ChannelTreeView::setHoveredLiveParticipant(const QModelIndex &proxyIndex)
+{
+    const bool isLiveParticipant = proxyIndex.isValid() && static_cast<ChannelNode::Type>(proxyIndex.data(ChannelTreeModel::TypeRole).toInt()) == ChannelNode::Type::VoiceParticipant && proxyIndex.data(ChannelTreeModel::IsVoiceLiveRole).toBool();
+
+    if (!isLiveParticipant) {
+        liveHoverDelay.stop();
+        pendingLiveHover = QPersistentModelIndex();
+        if (shownLiveHover.isValid()) {
+            shownLiveHover = QPersistentModelIndex();
+            emit liveParticipantHoverChanged(QModelIndex());
+        }
+        return;
+    }
+
+    if (proxyIndex == shownLiveHover || proxyIndex == pendingLiveHover)
+        return;
+
+    if (shownLiveHover.isValid()) {
+        shownLiveHover = QPersistentModelIndex();
+        emit liveParticipantHoverChanged(QModelIndex());
+    }
+    pendingLiveHover = proxyIndex;
+    liveHoverDelay.start();
 }
 
 void ChannelTreeView::setModel(QAbstractItemModel *m)
@@ -59,6 +110,7 @@ void ChannelTreeView::onRowsInserted(const QModelIndex &parent, int first, int l
     if (parent.isValid()) {
         auto parentType = static_cast<ChannelNode::Type>(parent.data(ChannelTreeModel::TypeRole).toInt());
         if ((parentType == ChannelNode::Type::VoiceChannel ||
+             parentType == ChannelNode::Type::DMChannel ||
              parentType == ChannelNode::Type::Channel ||
              isAlwaysExpanded(parentType)) &&
             !isExpanded(parent))

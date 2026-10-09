@@ -225,5 +225,67 @@ struct UpdateVoiceStateData : Core::JsonUtils::JsonObject
 };
 using UpdateVoiceState = Outbound<OpCode::VOICE_STATE_UPDATE, UpdateVoiceStateData>;
 
+struct ConnectCallData : Core::JsonUtils::JsonObject
+{
+    Field<Core::Snowflake> channelId;
+
+    Core::OrderedJson toJson() const
+    {
+        Core::OrderedJson obj;
+        insert(obj, "channel_id", channelId);
+        return obj;
+    }
+};
+using ConnectCall = Outbound<OpCode::CALL_CONNECT, ConnectCallData>;
+
+struct CreateStreamData : Core::JsonUtils::JsonObject
+{
+    Field<QString> type;
+    Field<Core::Snowflake, false, true> guildId;
+    Field<Core::Snowflake> channelId;
+    Field<QString, false, true> preferredRegion;
+
+    Core::OrderedJson toJson() const
+    {
+        Core::OrderedJson obj;
+        insert(obj, "type", type);
+        insert(obj, "guild_id", guildId);
+        insert(obj, "channel_id", channelId);
+        insert(obj, "preferred_region", preferredRegion);
+        return obj;
+    }
+};
+using CreateStream = Outbound<OpCode::STREAM_CREATE, CreateStreamData>;
+
+struct StreamKeyData : Core::JsonUtils::JsonObject
+{
+    Field<QString> streamKey;
+
+    Core::OrderedJson toJson() const
+    {
+        Core::OrderedJson obj;
+        insert(obj, "stream_key", streamKey);
+        return obj;
+    }
+};
+using DeleteStream = Outbound<OpCode::STREAM_DELETE, StreamKeyData>;
+using WatchStream = Outbound<OpCode::STREAM_WATCH, StreamKeyData>;
+using PingStream = Outbound<OpCode::STREAM_PING, StreamKeyData>;
+
+struct SetStreamPausedData : Core::JsonUtils::JsonObject
+{
+    Field<QString> streamKey;
+    Field<bool> paused;
+
+    Core::OrderedJson toJson() const
+    {
+        Core::OrderedJson obj;
+        insert(obj, "stream_key", streamKey);
+        insert(obj, "paused", paused);
+        return obj;
+    }
+};
+using SetStreamPaused = Outbound<OpCode::STREAM_SET_PAUSED, SetStreamPausedData>;
+
 } // namespace Discord
 } // namespace Acheron

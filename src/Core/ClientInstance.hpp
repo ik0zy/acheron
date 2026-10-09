@@ -34,6 +34,9 @@ class VoiceManager;
 
 class ReadStateManager;
 class ForumManager;
+class CallStore;
+class StreamManager;
+class StreamPreviews;
 
 class ClientInstance : public QObject
 {
@@ -58,6 +61,9 @@ public:
     [[nodiscard]] PresenceManager *presences() const;
     [[nodiscard]] EmojiManager *emojis() const;
     [[nodiscard]] FavoriteGifs *favoriteGifs() const;
+    [[nodiscard]] CallStore *calls() const;
+    [[nodiscard]] StreamManager *streams() const;
+    [[nodiscard]] StreamPreviews *streamPreviews() const;
 #ifndef ACHERON_NO_VOICE
     [[nodiscard]] Audio::VoiceManager *voice() const;
 #endif
@@ -73,6 +79,10 @@ public:
     [[nodiscard]] int getChannelRateLimit(Snowflake channelId);
 
     [[nodiscard]] bool isThreadJoined(Snowflake threadId) const;
+
+    // The channel the user is looking at changed. For a DM or group DM the gateway is asked
+    // about its call, once, as the official client does when a private channel is selected.
+    void noteChannelSelected(Snowflake channelId);
 
     [[nodiscard]] QList<Discord::Ban> observedBans(Snowflake guildId) const;
     [[nodiscard]] QList<Discord::Invite> createdInvites(Snowflake guildId) const;
@@ -159,6 +169,9 @@ private slots:
     void handleBulkAckRequest(const QList<QPair<Snowflake, Snowflake>> &pairs);
     void onVoiceConnected();
     void onVoiceDisconnected();
+    void onVoiceStateUpdated(const Discord::VoiceState &event);
+    void onCallCreated(const Discord::CallCreate &event);
+    void onCallDeleted(const Discord::CallDelete &event);
     void onHeartbeatSessionChanged(const Discord::HeartbeatSession &session);
     bool isMessageMentioningMe(const Discord::Message &msg) const;
 
@@ -190,6 +203,9 @@ private:
     PresenceManager *presenceManager;
     EmojiManager *emojiManager;
     FavoriteGifs *favoriteGifManager;
+    CallStore *callStore;
+    StreamManager *streamManager;
+    StreamPreviews *streamPreviewCache;
 #ifndef ACHERON_NO_VOICE
     Audio::VoiceManager *voiceManager;
 #endif
@@ -204,6 +220,11 @@ private:
 
     Snowflake currentVoiceChannelId;
     Snowflake currentVoiceGuildId;
+
+    // Empty until READY. Voice states and calls are tied to the gateway session they came from.
+    QString gatewaySessionId;
+    Snowflake selectedChannelId;
+    void connectSelectedCall(bool force);
 
     // notFound members are kept in here so we dont ask for them again
     QSet<QPair<Snowflake /*guildId*/, Snowflake /*userId*/>> pendingMemberRequests;
