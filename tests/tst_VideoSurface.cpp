@@ -65,6 +65,9 @@ private slots:
     void resizeRedrawsTheLastFrame();
     void clearForgetsThePicture();
     void messagesDoNotDisturbThePicture();
+    void avatarStandsInUntilThereIsAPicture();
+    void speakingRingAndLiveMarkerAreDrawn();
+    void statisticsAreLeftOffASmallTile();
 };
 
 void TestVideoSurface::emptySurfaceIsBlack()
@@ -213,6 +216,82 @@ void TestVideoSurface::messagesDoNotDisturbThePicture()
     surface.setMessage({});
     image = shot(surface);
     QVERIFY(isNear(image.pixel(image.width() - 2, image.height() - 2), 255, 255, 255));
+}
+
+void TestVideoSurface::avatarStandsInUntilThereIsAPicture()
+{
+    VideoSurface surface;
+    surface.resize(320, 180);
+    surface.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&surface));
+
+    QPixmap avatar(64, 64);
+    avatar.fill(QColor(0, 200, 0));
+    surface.setPlaceholder(avatar);
+
+    QImage image = shot(surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 0, 200, 0));
+    QVERIFY(isNear(image.pixel(4, 4), 0, 0, 0));
+
+    present(surface, solidFrame(640, 360, 235, 128, 128));
+    image = shot(surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 255, 255, 255));
+
+    // And comes back when the picture is gone.
+    surface.clear();
+    image = shot(surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 0, 200, 0));
+}
+
+void TestVideoSurface::speakingRingAndLiveMarkerAreDrawn()
+{
+    VideoSurface surface;
+    surface.resize(320, 180);
+    surface.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&surface));
+
+    QImage image = shot(surface);
+    QVERIFY(isNear(image.pixel(1, image.height() / 2), 0, 0, 0));
+
+    surface.setSpeaking(true);
+    image = shot(surface);
+    QVERIFY(!isNear(image.pixel(1, image.height() / 2), 0, 0, 0));
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 0, 0, 0));
+
+    surface.setSpeaking(false);
+    surface.setLive(true);
+    image = shot(surface);
+    QVERIFY(isNear(image.pixel(1, image.height() / 2), 0, 0, 0));
+    // Somewhere in the top right corner there is now red.
+    bool red = false;
+    for (int x = image.width() - 60; x < image.width() - 8 && !red; x++) {
+        for (int y = 8; y < 30 && !red; y++)
+            red = qRed(image.pixel(x, y)) > 200 && qGreen(image.pixel(x, y)) < 110;
+    }
+    QVERIFY(red);
+}
+
+void TestVideoSurface::statisticsAreLeftOffASmallTile()
+{
+    const QString stats = QStringLiteral("Codec: H264\nResolution: 1280x720\nFrame rate: 30.0 fps\nBitrate: 900 kbps");
+
+    VideoSurface large;
+    large.resize(480, 270);
+    large.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&large));
+    present(large, solidFrame(640, 360, 235, 128, 128));
+    large.setStatsText(stats);
+    QImage image = shot(large);
+    QVERIFY(!isNear(image.pixel(12, 12), 255, 255, 255));
+
+    VideoSurface small;
+    small.resize(160, 90);
+    small.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&small));
+    present(small, solidFrame(640, 360, 235, 128, 128));
+    small.setStatsText(stats);
+    image = shot(small);
+    QVERIFY(isNear(image.pixel(12, 12), 255, 255, 255));
 }
 
 QTEST_MAIN(TestVideoSurface)

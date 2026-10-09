@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QPixmap>
 #include <QTimer>
 #include <QWidget>
 
@@ -28,6 +29,16 @@ public:
     void setStatsText(const QString &text);
     // A short label in the bottom corner, such as whose video this is.
     void setCaption(const QString &text);
+    [[nodiscard]] QString caption() const { return captionText; }
+    // What stands in for the picture while there is none: the person's avatar.
+    void setPlaceholder(const QPixmap &avatar);
+    // A ring around the tile while the person is speaking.
+    void setSpeaking(bool speaking);
+    // The red LIVE marker of someone who is streaming.
+    void setLive(bool live);
+
+    // Sends geometryChanged again, for a listener that was not there the first time.
+    void announceGeometry();
 
     // Forgets the picture, so that a stream which is over does not leave its last frame up.
     void clear();
@@ -56,6 +67,9 @@ private:
     QString messageDetail;
     QString statsText;
     QString captionText;
+    QPixmap placeholder;
+    bool speaking = false;
+    bool live = false;
 };
 
 } // namespace UI

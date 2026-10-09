@@ -2,6 +2,9 @@
 
 #include <QHash>
 #include <QObject>
+#include <QSet>
+
+#include <optional>
 
 #include "Core/ProxyConfig.hpp"
 #include "Core/Snowflake.hpp"
@@ -40,6 +43,11 @@ public:
     void reset();
 
     [[nodiscard]] StreamSession *session(const QString &streamKey) const;
+    [[nodiscard]] QList<StreamSession *> openSessions() const { return sessions.values(); }
+
+    // Watches the stream as soon as this account is in its channel, for when joining the
+    // channel and watching are asked for in one gesture.
+    void watchWhenConnected(const Discord::StreamKey &key);
 
 signals:
     // Also sent for a stream already being watched, when it is asked for again.
@@ -50,6 +58,7 @@ private slots:
     void onStreamChanged(const QString &streamKey);
     void onStreamEnded(const QString &streamKey, Acheron::Core::StreamEndReason reason);
     void onVoiceStateChanged();
+    void autoWatch();
 
 private:
     void remove(const QString &streamKey, bool tellGateway);
@@ -62,6 +71,9 @@ private:
     QString gatewaySessionId;
 
     QHash<QString, StreamSession *> sessions;
+    std::optional<Discord::StreamKey> pendingWatch;
+    // Streams that turned this account away for being full; not asked for again on its behalf.
+    QSet<QString> fullStreams;
     quint32 nextAudioSource = 1;
 };
 

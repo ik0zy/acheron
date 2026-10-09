@@ -52,7 +52,7 @@ class TrayIcon;
 #ifndef ACHERON_NO_VOICE
 class VoiceStatusBar;
 class StreamPreviewPopup;
-class StreamWindow;
+class CallWindow;
 #endif
 } // namespace UI
 } // namespace Acheron
@@ -103,7 +103,8 @@ private:
     void confirmAndLeaveGuild(Core::Snowflake accountId, Core::Snowflake guildId);
     [[nodiscard]] QList<GuildSettingsSection> guildSettingsSections(Core::Snowflake accountId, Core::Snowflake guildId);
     void openGuildSettings(Core::Snowflake accountId, Core::Snowflake guildId, GuildSettingsSection section);
-    void showUserContextMenu(Core::ClientInstance *instance, Core::Snowflake userId, Core::Snowflake guildId, QPoint globalPos);
+    // `extend` may put entries of its own ahead of the usual ones.
+    void showUserContextMenu(Core::ClientInstance *instance, Core::Snowflake userId, Core::Snowflake guildId, QPoint globalPos, const std::function<void(QMenu &)> &extend = {});
     void selectChannelInTree(Core::Snowflake accountId, Core::Snowflake channelId);
 
 public:
@@ -237,10 +238,9 @@ private:
 #ifndef ACHERON_NO_VOICE
     VoiceStatusBar *voiceStatusBar;
     StreamPreviewPopup *streamPreviewPopup = nullptr;
-    // Open stream viewers, by account id and stream key.
-    QHash<QString, StreamWindow *> streamWindows;
-    // The camera view of each account's call, by account id.
-    QHash<quint64, QPointer<QWidget>> callVideoWindows;
+    // The video window of each account's call, by account id.
+    QHash<quint64, QPointer<CallWindow>> callWindows;
+    CallWindow *openCallWindow(Core::ClientInstance *instance);
 #endif
     AccountsWindow *accountsWindow = nullptr;
     SettingsWindow *settingsWindow = nullptr;

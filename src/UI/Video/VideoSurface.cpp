@@ -3,6 +3,7 @@
 #include <QFontDatabase>
 #include <QImage>
 #include <QPainter>
+#include <QPen>
 
 #include <mutex>
 
@@ -18,6 +19,10 @@ namespace UI {
 namespace {
 
 constexpr int RESCALE_DELAY_MS = 120;
+// Drawn over video, so these do not follow the theme: the green Discord rings a speaker
+// with, and the red of its LIVE marker.
+const QColor SPEAKING_RING(0x23, 0xA5, 0x5A);
+const QColor LIVE_RED(0xED, 0x42, 0x45);
 constexpr int HD_HEIGHT = 720;
 
 // QImage::Format_RGB32 is a 32-bit word per pixel, so its byte order follows the machine's.
@@ -218,6 +223,33 @@ void VideoSurface::setCaption(const QString &text)
     update();
 }
 
+void VideoSurface::setPlaceholder(const QPixmap &avatar)
+{
+    placeholder = avatar;
+    update();
+}
+
+void VideoSurface::setSpeaking(bool value)
+{
+    if (speaking == value)
+        return;
+    speaking = value;
+    update();
+}
+
+void VideoSurface::setLive(bool value)
+{
+    if (live == value)
+        return;
+    live = value;
+    update();
+}
+
+void VideoSurface::announceGeometry()
+{
+    reportGeometry();
+}
+
 void VideoSurface::clear()
 {
     frameSink->forget();
@@ -270,9 +302,11 @@ void VideoSurface::paintEvent(QPaintEvent *)
     QPainter painter(this);
     painter.fillRect(rect(), Qt::black);
 
+    bool hasPicture = false;
     frameSink->withFront([&](const QImage &image) {
         if (image.isNull())
             return;
+        hasPicture = true;
         const qreal ratio = devicePixelRatioF();
         const QSize widgetPixels = size() * ratio;
         if (image.size() == fitted(image.size(), widgetPixels)) {
@@ -286,6 +320,13 @@ void VideoSurface::paintEvent(QPaintEvent *)
         const QRectF where(QPointF((width() - shown.width()) / 2.0, (height() - shown.height()) / 2.0), shown);
         painter.drawImage(where, image, QRectF(QPointF(0, 0), QSizeF(image.size())));
     });
+
+    if (!hasPicture && !placeholder.isNull()) {
+        const int side = qBound(24, qMin(width(), height()) / 3, 128);
+        const QRect where((width() - side) / 2, (height() - side) / 2, side, side);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform);
+        painter.drawPixmap(where, placeholder);
+    }
 
     if (!messageTitle.isEmpty()) {
         painter.fillRect(rect(), QColor(0, 0, 0, 160));
@@ -311,13 +352,38 @@ void VideoSurface::paintEvent(QPaintEvent *)
         painter.drawText(bounds, Qt::AlignLeft | Qt::AlignBottom, captionText);
     }
 
+    if (live) {
+        QFont bold = font();
+        bold.setBold(true);
+        painter.setFont(bold);
+        const QString label = tr("LIVE");
+        const QSize text = painter.fontMetrics().size(Qt::TextSingleLine, label);
+        const QRect pill(width() - text.width() - 20, 8, text.width() + 12, text.height() + 4);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(LIVE_RED);
+        painter.drawRoundedRect(pill, 4, 4);
+        painter.setPen(Qt::white);
+        painter.drawText(pill, Qt::AlignCenter, label);
+    }
+
+    if (speaking) {
+        painter.setRenderHint(QPainter::Antialiasing, false);
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(SPEAKING_RING, 2));
+        painter.drawRect(rect().adjusted(1, 1, -1, -1));
+    }
+
     if (!statsText.isEmpty()) {
         const QFont fixed = QFontDatabase::systemFont(QFontDatabase::FixedFont);
         painter.setFont(fixed);
         const QRect bounds = painter.boundingRect(rect().adjusted(8, 8, -8, -8), Qt::AlignLeft | Qt::AlignTop, statsText);
-        painter.fillRect(bounds.adjusted(-4, -4, 4, 4), QColor(0, 0, 0, 170));
-        painter.setPen(Qt::white);
-        painter.drawText(bounds, Qt::AlignLeft | Qt::AlignTop, statsText);
+        // Left off a tile too small to hold them and still show its picture.
+        if (bounds.height() <= height() / 2 && bounds.width() <= width() - 16) {
+            painter.fillRect(bounds.adjusted(-4, -4, 4, 4), QColor(0, 0, 0, 170));
+            painter.setPen(Qt::white);
+            painter.drawText(bounds, Qt::AlignLeft | Qt::AlignTop, statsText);
+        }
     }
 }
 

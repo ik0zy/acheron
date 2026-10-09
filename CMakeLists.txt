@@ -367,8 +367,7 @@ if(ENABLE_VOICE AND TARGET ffmpeg)
         src/Core/Video/CallVideo.cpp
         src/Core/Video/TileVisibility.cpp
         src/UI/Video/VideoSurface.cpp
-        src/UI/StreamWindow.cpp
-        src/UI/CallVideoWindow.cpp
+        src/UI/CallWindow.cpp
     )
 endif()
 

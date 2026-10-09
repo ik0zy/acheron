@@ -57,8 +57,7 @@
 #include "Dialogs/UserProfilePopup.hpp"
 #include "StreamPreviewPopup.hpp"
 #ifdef ACHERON_HAVE_STREAM_VIEW
-#include "StreamWindow.hpp"
-#include "CallVideoWindow.hpp"
+#include "CallWindow.hpp"
 #include "Core/Streams/StreamWatcher.hpp"
 #endif
 #include "Core/Streams/StreamPreviews.hpp"
@@ -1115,48 +1114,50 @@ void MainWindow::setupPermanentConnections(Core::ClientInstance *instance)
 #endif
 
 #ifdef ACHERON_HAVE_STREAM_VIEW
+    // Watching a stream brings up the call window, which is where it is shown.
     connect(instance->streamWatcher(), &Core::StreamWatcher::sessionOpened, this,
             [this, instance = QPointer<ClientInstance>(instance)](Core::StreamSession *streamSession) {
                 if (!instance)
                     return;
-
-                const QString id = QStringLiteral("%1/%2").arg(quint64(instance->accountId())).arg(streamSession->key().toString());
-                if (StreamWindow *open = streamWindows.value(id, nullptr)) {
-                    open->raise();
-                    open->activateWindow();
-                    return;
-                }
-
-                const Discord::StreamKey key = streamSession->key();
-                auto *window = new StreamWindow(streamSession, instance->users()->getDisplayName(key.ownerId, key.guildId));
-                streamWindows.insert(id, window);
-                connect(window, &QObject::destroyed, this, [this, id, window] {
-                    if (streamWindows.value(id, nullptr) == window)
-                        streamWindows.remove(id);
-                });
-                connect(window, &StreamWindow::stopRequested, this, [instance](const QString &streamKey) {
-                    if (instance)
-                        instance->streamWatcher()->stopWatching(streamKey);
-                });
-                connect(window, &StreamWindow::viewersNeeded, this, [instance, window, streamSession = QPointer<Core::StreamSession>(streamSession)] {
-                    if (!instance || !streamSession)
-                        return;
-                    QStringList names;
-                    const QList<Snowflake> viewers = streamSession->viewerIds();
-                    for (Snowflake viewer : viewers)
-                        names.append(instance->users()->getDisplayName(viewer, streamSession->key().guildId));
-                    window->setViewerNames(names);
-                });
-                window->show();
-            });
-
-    connect(instance->streamWatcher(), &Core::StreamWatcher::sessionClosed, this,
-            [this, accountId = instance->accountId()](const QString &streamKey) {
-                if (StreamWindow *window = streamWindows.take(QStringLiteral("%1/%2").arg(quint64(accountId)).arg(streamKey)))
-                    window->close();
+                if (CallWindow *window = openCallWindow(instance))
+                    window->setFocusedTile(QStringLiteral("stream:%1").arg(quint64(streamSession->key().ownerId)));
             });
 #endif
 }
+
+#ifdef ACHERON_HAVE_STREAM_VIEW
+CallWindow *MainWindow::openCallWindow(Core::ClientInstance *instance)
+{
+    const quint64 accountId = static_cast<quint64>(instance->accountId());
+    if (CallWindow *open = callWindows.value(accountId)) {
+        open->setWindowState(open->windowState() & ~Qt::WindowMinimized);
+        open->show();
+        open->raise();
+        open->activateWindow();
+        return open;
+    }
+    if (!instance->isInVoice())
+        return nullptr;
+
+    QPointer<Core::UserManager> users = instance->users();
+    const Snowflake guildId = instance->voiceGuildId();
+    auto names = [users, guildId](Snowflake userId) {
+        return users ? users->getDisplayName(userId, guildId) : QString::number(quint64(userId));
+    };
+    auto avatars = [users, guildId](Snowflake userId) -> QUrl {
+        if (!users)
+            return {};
+        const auto user = users->getUser(userId);
+        return user ? users->getAvatarUrl(*user, guildId, 128) : QUrl();
+    };
+
+    ChannelNode *channel = channelTreeModel->findChannelTreeNode(instance->voiceChannelId());
+    auto *window = new CallWindow(instance->voice(), instance->streamWatcher(), session->getImageManager(), instance->accountId(), names, avatars, channel ? channel->name : tr("Call"));
+    callWindows.insert(accountId, window);
+    window->show();
+    return window;
+}
+#endif
 
 void MainWindow::onWatchStreamRequested(const QModelIndex &proxyIndex)
 {
@@ -1167,12 +1168,20 @@ void MainWindow::onWatchStreamRequested(const QModelIndex &proxyIndex)
 
     ChannelNode *accountNode = channelTreeModel->getAccountNodeFor(node);
     Core::ClientInstance *instance = accountNode ? session->client(accountNode->id) : nullptr;
-    if (!instance)
+    if (!instance || node->id == instance->accountId())
         return;
 
     ChannelNode *guildNode = ChannelTreeModel::findGuildNode(node);
     const Snowflake guildId = guildNode ? guildNode->id : Snowflake::Invalid;
-    instance->streamWatcher()->watch(Discord::StreamKey::forChannel(guildId, node->parent->id, node->id));
+    const Discord::StreamKey key = Discord::StreamKey::forChannel(guildId, node->parent->id, node->id);
+    if (instance->streamWatcher()->canWatch(key)) {
+        instance->streamWatcher()->watch(key);
+        return;
+    }
+
+    // Not in the channel yet: join it the usual way, and watch once in.
+    instance->streamWatcher()->watchWhenConnected(key);
+    emit channelTree->joinVoiceChannelRequested(proxyIndex.parent());
 #else
     Q_UNUSED(proxyIndex);
 #endif
@@ -1188,24 +1197,8 @@ void MainWindow::onShowCallVideoRequested(const QModelIndex &proxyIndex)
     ChannelNode *accountNode = channelTreeModel->getAccountNodeFor(node);
     Core::ClientInstance *instance = accountNode ? session->client(accountNode->id) : nullptr;
     // Cameras are only received by someone in the call.
-    if (!instance || instance->voiceChannelId() != node->parent->id)
-        return;
-
-    const quint64 accountId = static_cast<quint64>(instance->accountId());
-    if (QWidget *open = callVideoWindows.value(accountId)) {
-        open->raise();
-        open->activateWindow();
-        return;
-    }
-
-    ChannelNode *guildNode = ChannelTreeModel::findGuildNode(node);
-    const Snowflake guildId = guildNode ? guildNode->id : Snowflake::Invalid;
-    auto names = [instance = QPointer<ClientInstance>(instance), guildId](Snowflake userId) {
-        return instance ? instance->users()->getDisplayName(userId, guildId) : QString();
-    };
-    auto *window = new CallVideoWindow(instance->voice()->video(), names, node->parent->name);
-    callVideoWindows.insert(accountId, window);
-    window->show();
+    if (instance && instance->voiceChannelId() == node->parent->id)
+        openCallWindow(instance);
 #else
     Q_UNUSED(proxyIndex);
 #endif
@@ -1680,7 +1673,34 @@ void MainWindow::setupUi()
 
                 ChannelNode *guildNode = ChannelTreeModel::findGuildNode(node);
                 Snowflake guildId = guildNode ? guildNode->id : Snowflake::Invalid;
-                showUserContextMenu(session->client(accountNode->id), node->id, guildId, globalPos);
+
+                std::function<void(QMenu &)> streamEntries;
+#ifdef ACHERON_HAVE_STREAM_VIEW
+                ClientInstance *instance = session->client(accountNode->id);
+                const bool live = proxyIndex.data(ChannelTreeModel::IsVoiceLiveRole).toBool();
+                if (instance && live && node->parent && node->id != instance->accountId()) {
+                    const QString streamKey = Discord::StreamKey::forChannel(guildId, node->parent->id, node->id).toString();
+                    const QPersistentModelIndex row(proxyIndex);
+                    streamEntries = [this, streamKey, row, watcher = QPointer<Core::StreamWatcher>(instance->streamWatcher())](QMenu &menu) {
+                        if (!watcher)
+                            return;
+                        const Core::StreamSession *watched = watcher->session(streamKey);
+                        if (watched && !watched->isOver()) {
+                            connect(menu.addAction(tr("Stop Watching")), &QAction::triggered, this, [watcher, streamKey] {
+                                if (watcher)
+                                    watcher->stopWatching(streamKey);
+                            });
+                        } else {
+                            connect(menu.addAction(tr("Watch Stream")), &QAction::triggered, this, [this, row] {
+                                if (row.isValid())
+                                    onWatchStreamRequested(row);
+                            });
+                        }
+                        menu.addSeparator();
+                    };
+                }
+#endif
+                showUserContextMenu(session->client(accountNode->id), node->id, guildId, globalPos, streamEntries);
             });
 
     connect(channelTree, &ChannelTreeView::liveParticipantHoverChanged, this, &MainWindow::onLiveParticipantHoverChanged);
@@ -2861,7 +2881,7 @@ QWidget *buildRoleChip(const Discord::Role &role, QWidget *parent)
 } // namespace
 
 void MainWindow::showUserContextMenu(ClientInstance *instance, Snowflake userId, Snowflake guildId,
-                                     QPoint globalPos)
+                                     QPoint globalPos, const std::function<void(QMenu &)> &extend)
 {
     QMenu menu(this);
     QPointer<ClientInstance> instanceGuard(instance);
@@ -2880,6 +2900,9 @@ void MainWindow::showUserContextMenu(ClientInstance *instance, Snowflake userId,
         menu.addAction(headerAction);
         menu.addSeparator();
     }
+
+    if (extend)
+        extend(menu);
 
     QAction *profileAction = menu.addAction(tr("Profile"));
     connect(profileAction, &QAction::triggered, this, [this, instanceGuard, userId, guildId]() {
