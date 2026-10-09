@@ -660,6 +660,29 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
         stopVoiceThread();
 }
 
+void VoiceManager::attachAudioSource(quint32 source, Discord::Voice::VoiceClient *client)
+{
+    if (!audioPipeline)
+        return;
+
+    connect(client, &Discord::Voice::VoiceClient::audioReceived, audioPipeline,
+            [ap = audioPipeline, source](quint32 ssrc, uint16_t sequence, uint32_t timestamp, const QByteArray &opusData) {
+                ap->onSourceAudioReceived(source, ssrc, sequence, timestamp, opusData);
+            });
+}
+
+void VoiceManager::detachAudioSource(quint32 source)
+{
+    if (audioPipeline)
+        QMetaObject::invokeMethod(audioPipeline, [p = audioPipeline, source]() { p->removeSource(source); });
+}
+
+void VoiceManager::setAudioSourceVolume(quint32 source, float volume)
+{
+    if (audioPipeline)
+        QMetaObject::invokeMethod(audioPipeline, [p = audioPipeline, source, volume]() { p->setSourceVolume(source, volume); });
+}
+
 void VoiceManager::stopVoiceThread()
 {
     if (!voiceConnection)

@@ -109,9 +109,26 @@ void AudioPipeline::stopCapture()
     }
 }
 
-void AudioPipeline::onAudioReceived(quint32 ssrc, uint16_t sequence, uint32_t /*timestamp*/, const QByteArray &opusData)
+void AudioPipeline::onAudioReceived(quint32 ssrc, uint16_t sequence, uint32_t timestamp, const QByteArray &opusData)
 {
-    auto it = speakers.find(ssrc);
+    onSourceAudioReceived(0, ssrc, sequence, timestamp, opusData);
+}
+
+void AudioPipeline::setSourceVolume(quint32 source, float volume)
+{
+    sourceVolumes.insert(source, volume);
+}
+
+void AudioPipeline::removeSource(quint32 source)
+{
+    sourceVolumes.remove(source);
+    std::erase_if(speakers, [source](const auto &entry) { return (entry.first >> 32) == source; });
+}
+
+void AudioPipeline::onSourceAudioReceived(quint32 source, quint32 ssrc, uint16_t sequence, uint32_t /*timestamp*/, const QByteArray &opusData)
+{
+    const quint64 key = (quint64(source) << 32) | ssrc;
+    auto it = speakers.find(key);
     if (it == speakers.end()) {
         SpeakerState state;
         state.decoder = std::make_unique<OpusDecoder>();
@@ -121,7 +138,7 @@ void AudioPipeline::onAudioReceived(quint32 ssrc, uint16_t sequence, uint32_t /*
         }
         state.jitterBuffer = std::make_unique<JitterBuffer>();
 
-        auto [inserted, _] = speakers.emplace(ssrc, std::move(state));
+        auto [inserted, _] = speakers.emplace(key, std::move(state));
         it = inserted;
     }
 
@@ -332,7 +349,8 @@ void AudioPipeline::onMixTick()
     QVector<std::pair<QByteArray, float>> streams;
 
     for (auto it = speakers.begin(); it != speakers.end(); ++it) {
-        quint32 ssrc = it->first;
+        const quint32 source = static_cast<quint32>(it->first >> 32);
+        const quint32 ssrc = static_cast<quint32>(it->first);
         SpeakerState &state = it->second;
 
         QByteArray pcm;
@@ -361,7 +379,7 @@ void AudioPipeline::onMixTick()
             continue;
 
         // rms before gain
-        auto userIt = ssrcToUser.constFind(ssrc);
+        auto userIt = source == 0 ? ssrcToUser.constFind(ssrc) : ssrcToUser.constEnd();
         Snowflake userId;
         if (userIt != ssrcToUser.constEnd())
             userId = userIt.value();
@@ -383,6 +401,8 @@ void AudioPipeline::onMixTick()
         float gain = 1.0f;
         if (userId.isValid())
             gain = userVolumes.value(userId, 1.0f);
+        else if (source != 0)
+            gain = sourceVolumes.value(source, 1.0f);
 
         streams.append({ pcm, gain });
     }

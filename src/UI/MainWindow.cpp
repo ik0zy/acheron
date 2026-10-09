@@ -56,6 +56,10 @@
 #include "Dialogs/ConfirmPopup.hpp"
 #include "Dialogs/UserProfilePopup.hpp"
 #include "StreamPreviewPopup.hpp"
+#ifdef ACHERON_HAVE_STREAM_VIEW
+#include "StreamWindow.hpp"
+#include "Core/Streams/StreamWatcher.hpp"
+#endif
 #include "Core/Streams/StreamPreviews.hpp"
 #include "Chat/ReactionTooltip.hpp"
 #include "Discord/CdnUrls.hpp"
@@ -1108,6 +1112,69 @@ void MainWindow::setupPermanentConnections(Core::ClientInstance *instance)
                 box->open();
             });
 #endif
+
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    connect(instance->streamWatcher(), &Core::StreamWatcher::sessionOpened, this,
+            [this, instance = QPointer<ClientInstance>(instance)](Core::StreamSession *streamSession) {
+                if (!instance)
+                    return;
+
+                const QString id = QStringLiteral("%1/%2").arg(quint64(instance->accountId())).arg(streamSession->key().toString());
+                if (StreamWindow *open = streamWindows.value(id, nullptr)) {
+                    open->raise();
+                    open->activateWindow();
+                    return;
+                }
+
+                const Discord::StreamKey key = streamSession->key();
+                auto *window = new StreamWindow(streamSession, instance->users()->getDisplayName(key.ownerId, key.guildId));
+                streamWindows.insert(id, window);
+                connect(window, &QObject::destroyed, this, [this, id, window] {
+                    if (streamWindows.value(id, nullptr) == window)
+                        streamWindows.remove(id);
+                });
+                connect(window, &StreamWindow::stopRequested, this, [instance](const QString &streamKey) {
+                    if (instance)
+                        instance->streamWatcher()->stopWatching(streamKey);
+                });
+                connect(window, &StreamWindow::viewersNeeded, this, [instance, window, streamSession = QPointer<Core::StreamSession>(streamSession)] {
+                    if (!instance || !streamSession)
+                        return;
+                    QStringList names;
+                    const QList<Snowflake> viewers = streamSession->viewerIds();
+                    for (Snowflake viewer : viewers)
+                        names.append(instance->users()->getDisplayName(viewer, streamSession->key().guildId));
+                    window->setViewerNames(names);
+                });
+                window->show();
+            });
+
+    connect(instance->streamWatcher(), &Core::StreamWatcher::sessionClosed, this,
+            [this, accountId = instance->accountId()](const QString &streamKey) {
+                if (StreamWindow *window = streamWindows.take(QStringLiteral("%1/%2").arg(quint64(accountId)).arg(streamKey)))
+                    window->close();
+            });
+#endif
+}
+
+void MainWindow::onWatchStreamRequested(const QModelIndex &proxyIndex)
+{
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    auto *node = channelTreeModel->nodeFromIndex(channelFilterProxy->mapToSource(proxyIndex));
+    if (!node || node->type != ChannelNode::Type::VoiceParticipant || !node->parent)
+        return;
+
+    ChannelNode *accountNode = channelTreeModel->getAccountNodeFor(node);
+    Core::ClientInstance *instance = accountNode ? session->client(accountNode->id) : nullptr;
+    if (!instance)
+        return;
+
+    ChannelNode *guildNode = ChannelTreeModel::findGuildNode(node);
+    const Snowflake guildId = guildNode ? guildNode->id : Snowflake::Invalid;
+    instance->streamWatcher()->watch(Discord::StreamKey::forChannel(guildId, node->parent->id, node->id));
+#else
+    Q_UNUSED(proxyIndex);
+#endif
 }
 
 void MainWindow::onLiveParticipantHoverChanged(const QModelIndex &proxyIndex)
@@ -1583,6 +1650,7 @@ void MainWindow::setupUi()
             });
 
     connect(channelTree, &ChannelTreeView::liveParticipantHoverChanged, this, &MainWindow::onLiveParticipantHoverChanged);
+    connect(channelTree, &ChannelTreeView::watchStreamRequested, this, &MainWindow::onWatchStreamRequested);
 
     connect(channelTree, &ChannelTreeView::openInNewTabRequested, this,
             [this](const QModelIndex &proxyIndex) {

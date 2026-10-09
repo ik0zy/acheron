@@ -1,5 +1,7 @@
 #pragma once
 
+#include <QElapsedTimer>
+#include <QHash>
 #include <QObject>
 #include <QTimer>
 
@@ -9,12 +11,14 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "Core/ProxyConfig.hpp"
 #include "Core/Snowflake.hpp"
 #include "PacketBuffer.hpp"
 #include "RtpPacket.hpp"
+#include "VideoReceiver.hpp"
 #include "VoiceEnums.hpp"
 #include "VoiceEntities.hpp"
 
@@ -26,6 +30,22 @@ class VoiceGateway;
 class UdpTransport;
 class VoiceEncryption;
 class DaveSession;
+
+// What one connection has received of remote video, summed over its senders.
+struct VideoReceiveStats
+{
+    QString codec;
+    quint64 packets = 0;
+    quint64 bytes = 0;
+    quint64 frames = 0;
+    quint64 keyframes = 0;
+    quint64 retransmitted = 0;
+    quint64 nacked = 0;
+    quint64 keyframeRequests = 0;
+    quint64 decryptFailures = 0;
+    // Share of packets lost since the previous report, 0 to 1.
+    double lossFraction = 0;
+};
 
 class VoiceClient : public QObject
 {
@@ -63,10 +83,29 @@ public:
     bool isDaveEnabled() const;
     void requestVerificationCode(Core::Snowflake targetUserId, std::function<void(const QString &)> callback);
 
+    // Receives every complete, decrypted frame of remote video, on this client's thread. Set it
+    // before start().
+    using VideoFrameHandler = std::function<void(Core::Snowflake userId, VideoCodec codec, EncodedVideoFrame frame)>;
+    void setVideoFrameHandler(VideoFrameHandler handler);
+
+    // How much of the remote video is wanted: the size it is being shown at, in pixels, or
+    // nothing at all while it is not shown.
+    void setVideoWants(int pixelCount, bool wanted);
+
+    // A frame handed out could not be decoded; ask every sender to start over.
+    void requestVideoKeyframe();
+
 signals:
     void stateChanged(State newState);
     void connected();
     void disconnected();
+    // The gateway socket dropped and is being reopened.
+    void reconnecting();
+
+    // A user's video started, changed or (inactive) stopped. The size and rate are the most the
+    // sender says it will send, and are zero when it does not say.
+    void remoteVideoChanged(Acheron::Core::Snowflake userId, bool active, int maxWidth, int maxHeight, int maxFramerate);
+    void videoStatsUpdated(const Acheron::Discord::Voice::VideoReceiveStats &stats);
 
     void speakingReceived(const SpeakingData &data);
     void clientConnected(const ClientConnectData &data);
@@ -100,6 +139,22 @@ private:
     void receiveAudio(const ParsedRtp &rtp, PacketPool::Handle packet);
     // Replaces the packet with its end-to-end decrypted contents.
     bool daveDecryptAudio(quint32 ssrc, PacketPool::Handle &packet);
+
+    struct RemoteVideo
+    {
+        Core::Snowflake userId;
+        quint32 rtxSsrc = 0;
+        std::unique_ptr<VideoReceiver> receiver;
+    };
+
+    void receiveVideo(const ParsedRtp &rtp, PacketPool::Handle packet, VideoCodec codec, bool retransmission);
+    void deliverVideoFrames(quint32 ssrc, RemoteVideo &video);
+    bool daveDecryptVideo(quint32 ssrc, std::vector<uint8_t> &frame);
+    void applyRemoteVideo(const ClientConnectData &data);
+    void removeRemoteVideo(Core::Snowflake userId);
+    void startVideoTimer();
+    void onVideoTick();
+    void sendVideoWants();
 
 private:
     VoiceGateway *gateway = nullptr;
@@ -140,9 +195,28 @@ private:
     std::set<std::string> connectedUserIds;
     QHash<quint32, uint64_t> ssrcToUserIdMap;
 
+    // The codec behind each payload type this client offered, for video and for its RTX.
+    QHash<int, VideoCodec> videoPayloadTypes;
+    QHash<int, VideoCodec> rtxPayloadTypes;
+    // Remote video by its SSRC, and each RTX SSRC's primary.
+    std::unordered_map<quint32, RemoteVideo> remoteVideos;
+    QHash<quint32, quint32> rtxToPrimary;
+    VideoFrameHandler videoFrameHandler;
+    QTimer *videoTimer = nullptr;
+    QElapsedTimer videoClock;
+    qint64 videoReportedMs = 0;
+    int wantedPixelCount = 0;
+    bool videoWanted = true;
+    QByteArray sentVideoWants;
+    quint64 videoDecryptFailures = 0;
+
     static constexpr int KEEPALIVE_INTERVAL_MS = 10000;
+    static constexpr int VIDEO_TICK_MS = 20;
+    static constexpr int VIDEO_REPORT_INTERVAL_MS = 1000;
 };
 
 } // namespace Voice
 } // namespace Discord
 } // namespace Acheron
+
+Q_DECLARE_METATYPE(Acheron::Discord::Voice::VideoReceiveStats)

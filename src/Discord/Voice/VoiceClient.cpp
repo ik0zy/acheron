@@ -3,12 +3,17 @@
 #include "UdpTransport.hpp"
 #include "VoiceEncryption.hpp"
 #include "RtpPacket.hpp"
+#include "Rtcp.hpp"
 
 #include "DaveSession.hpp"
 
 #include "Core/Audio/IAudioBackend.hpp"
 #include "Core/Logging.hpp"
 
+#include <QUuid>
+#include <QtEndian>
+
+#include <algorithm>
 #include <array>
 
 namespace Acheron {
@@ -45,6 +50,21 @@ static QString formatDisplayableCode(const std::vector<uint8_t> &data, int bytes
 VoiceClient::VoiceClient(const ConnectionParams &params, QObject *parent)
     : QObject(parent), params(params)
 {
+    qRegisterMetaType<VideoReceiveStats>();
+
+    for (const Codec &codec : params.videoCodecs) {
+        const VideoCodec known = videoCodecFromName(codec.name);
+        if (known == VideoCodec::Unknown || !codec.decode.valueOr(false))
+            continue;
+        videoPayloadTypes.insert(codec.payloadType, known);
+        if (codec.rtxPayloadType.hasValue())
+            rtxPayloadTypes.insert(codec.rtxPayloadType.get(), known);
+    }
+}
+
+void VoiceClient::setVideoFrameHandler(VideoFrameHandler handler)
+{
+    videoFrameHandler = std::move(handler);
 }
 
 VoiceClient::~VoiceClient()
@@ -80,6 +100,7 @@ void VoiceClient::start()
     connect(gateway, &VoiceGateway::clientsConnected, this, &VoiceClient::onClientsConnect);
     connect(gateway, &VoiceGateway::clientDisconnected, this, &VoiceClient::onClientDisconnect);
     connect(gateway, &VoiceGateway::resumed, this, &VoiceClient::onGatewayResumed);
+    connect(gateway, &VoiceGateway::reconnecting, this, &VoiceClient::reconnecting);
 
     connect(gateway, &VoiceGateway::binaryPayloadReceived,
             this, [this](int opcode, const QByteArray &payload) {
@@ -162,6 +183,16 @@ void VoiceClient::cleanupTransport()
         keepaliveTimer = nullptr;
     }
 
+    if (videoTimer) {
+        videoTimer->stop();
+        delete videoTimer;
+        videoTimer = nullptr;
+    }
+    // The receivers hold packets from the transport's pool.
+    remoteVideos.clear();
+    rtxToPrimary.clear();
+    sentVideoWants.clear();
+
     encryption.reset();
 
     daveSession.reset();
@@ -227,6 +258,9 @@ void VoiceClient::onGatewayReady(const VoiceReady &data)
 
     setState(State::DiscoveringIP);
 
+    if (params.video)
+        gateway->sendVoiceBackendVersion();
+
     cleanupTransport();
 
     udpTransport = new UdpTransport(params.proxy, this);
@@ -260,6 +294,10 @@ void VoiceClient::onSessionDescription(const SessionDescription &desc)
     setState(State::Connected);
     emit connected();
 
+    if (!videoPayloadTypes.isEmpty())
+        startVideoTimer();
+    sendVideoWants();
+
     // send silence so discord sends us audio immediately
     sendSilence();
 
@@ -272,7 +310,7 @@ void VoiceClient::onSessionDescription(const SessionDescription &desc)
 
 void VoiceClient::sendAudio(const QByteArray &opusData)
 {
-    if (currentState != State::Connected || !encryption || !udpTransport)
+    if (currentState != State::Connected || !encryption || !udpTransport || !params.sendsAudio)
         return;
 
     // snap rtp timestamp back to wall clock after a period of silence
@@ -370,12 +408,306 @@ void VoiceClient::onPacket(PacketPool::Handle packet)
     if (!rtp)
         return;
 
-    if (rtp->header.payloadType != Codec::OPUS_PAYLOAD_TYPE) {
+    const int payloadType = rtp->header.payloadType;
+    if (payloadType == Codec::OPUS_PAYLOAD_TYPE) {
+        receiveAudio(*rtp, std::move(packet));
+        return;
+    }
+
+    if (auto video = videoPayloadTypes.constFind(payloadType); video != videoPayloadTypes.constEnd()) {
+        receiveVideo(*rtp, std::move(packet), video.value(), false);
+        return;
+    }
+    if (auto rtx = rtxPayloadTypes.constFind(payloadType); rtx != rtxPayloadTypes.constEnd()) {
+        receiveVideo(*rtp, std::move(packet), rtx.value(), true);
+        return;
+    }
+
+    unrouted.rtp++;
+}
+
+void VoiceClient::receiveVideo(const ParsedRtp &rtp, PacketPool::Handle packet, VideoCodec codec, bool retransmission)
+{
+    const RtpHeader &header = rtp.header;
+    if (!encryption || !encryption->open(*packet, rtp.clearSize))
+        return;
+
+    packet->dropFront(rtp.clearSize);
+    if (packet->size() < rtp.extensionSize)
+        return;
+    packet->dropFront(rtp.extensionSize);
+
+    if (header.padding) {
+        // The last byte counts the padding, itself included.
+        const int size = packet->size();
+        const int padding = size > 0 ? packet->data()[size - 1] : 0;
+        if (padding == 0 || padding > size)
+            return;
+        packet->resize(size - padding);
+    }
+
+    quint32 ssrc = header.ssrc;
+    uint16_t sequence = header.sequence;
+    if (retransmission) {
+        // RFC 4588: the original sequence number leads the payload. One without a payload is
+        // padding sent to probe the link.
+        auto primary = rtxToPrimary.constFind(ssrc);
+        if (primary == rtxToPrimary.constEnd() || packet->size() <= 2)
+            return;
+        ssrc = primary.value();
+        sequence = qFromBigEndian<uint16_t>(packet->data());
+        packet->dropFront(2);
+    }
+
+    auto it = remoteVideos.find(ssrc);
+    if (it == remoteVideos.end() || packet->size() == 0) {
         unrouted.rtp++;
         return;
     }
 
-    receiveAudio(*rtp, std::move(packet));
+    RemoteVideo &video = it->second;
+    if (!video.receiver || video.receiver->codec() != codec)
+        video.receiver = std::make_unique<VideoReceiver>(ssrc, codec);
+
+    video.receiver->insert(sequence, header.timestamp, header.marker, std::move(packet), videoClock.elapsed(), retransmission);
+    deliverVideoFrames(ssrc, video);
+}
+
+void VoiceClient::deliverVideoFrames(quint32 ssrc, RemoteVideo &video)
+{
+    std::vector<EncodedVideoFrame> frames = video.receiver->takeFrames();
+    const VideoCodec codec = video.receiver->codec();
+
+    for (EncodedVideoFrame &frame : frames) {
+        if (daveSession) {
+            if (daveSession->isDaveEnabled()) {
+                if (!daveDecryptVideo(ssrc, frame.data)) {
+                    // Later frames build on this one, so they are of no use either.
+                    videoDecryptFailures++;
+                    qCDebug(LogDave) << "Undecryptable" << describeFrame(codec, frame.data);
+                    video.receiver->requestKeyframe();
+                    return;
+                }
+            } else if (!daveSession->isDowngraded()) {
+                // Keys are still being agreed. A key frame is asked for once they are.
+                return;
+            }
+        }
+
+        prepareForDecoder(codec, frame.data);
+        if (videoFrameHandler)
+            videoFrameHandler(video.userId, codec, std::move(frame));
+    }
+}
+
+bool VoiceClient::daveDecryptVideo(quint32 ssrc, std::vector<uint8_t> &frame)
+{
+    auto *decryptor = daveSession->getOrCreateDecryptor(ssrc, ssrcToUserIdMap.value(ssrc, 0));
+
+    std::vector<uint8_t> plaintext(decryptor->GetMaxPlaintextByteSize(discord::dave::MediaType::Video, frame.size()));
+    size_t bytesWritten = 0;
+    const auto result = decryptor->Decrypt(discord::dave::MediaType::Video, discord::dave::ArrayView<const uint8_t>(frame.data(), frame.size()), discord::dave::ArrayView<uint8_t>(plaintext.data(), plaintext.size()), &bytesWritten);
+    if (result != discord::dave::IDecryptor::Success) {
+        qCDebug(LogDave) << "DAVE video decrypt failed: SSRC =" << ssrc << "result =" << static_cast<int>(result) << "frameSize =" << frame.size();
+        return false;
+    }
+
+    plaintext.resize(bytesWritten);
+    frame.swap(plaintext);
+    return true;
+}
+
+void VoiceClient::applyRemoteVideo(const ClientConnectData &data)
+{
+    if (videoPayloadTypes.isEmpty() || !data.userId.hasValue())
+        return;
+    const Core::Snowflake userId = data.userId.get();
+    if (!userId.isValid() || userId == params.userId)
+        return;
+
+    quint32 ssrc = 0;
+    quint32 rtxSsrc = 0;
+    int maxWidth = 0;
+    int maxHeight = 0;
+    int maxFramerate = 0;
+    if (data.videoSsrc.get() != 0) {
+        // The sender lists its layers; the first active one is the one to take.
+        if (data.streams.hasValue()) {
+            for (const StreamDescription &stream : data.streams.get()) {
+                if (!stream.ssrc.hasValue() || stream.ssrc.get() == 0 || !stream.active.valueOr(true))
+                    continue;
+                ssrc = stream.ssrc.get();
+                if (stream.rtxSsrc.hasValue())
+                    rtxSsrc = stream.rtxSsrc.get();
+                if (stream.maxResolution.hasValue()) {
+                    maxWidth = stream.maxResolution->width;
+                    maxHeight = stream.maxResolution->height;
+                }
+                maxFramerate = stream.maxFramerate.valueOr(0);
+                break;
+            }
+        }
+        if (ssrc == 0 && (!data.streams.hasValue() || data.streams->isEmpty()))
+            ssrc = data.videoSsrc;
+        if (ssrc != 0 && rtxSsrc == 0)
+            rtxSsrc = ssrc + 1;
+    }
+
+    auto existing = remoteVideos.find(ssrc);
+    const bool unchanged = ssrc != 0 && existing != remoteVideos.end() && existing->second.userId == userId && existing->second.rtxSsrc == rtxSsrc;
+    if (!unchanged) {
+        removeRemoteVideo(userId);
+        if (ssrc != 0) {
+            RemoteVideo video;
+            video.userId = userId;
+            video.rtxSsrc = rtxSsrc;
+            remoteVideos.emplace(ssrc, std::move(video));
+            rtxToPrimary.insert(rtxSsrc, ssrc);
+
+            ssrcToUserIdMap.insert(ssrc, userId);
+            if (daveSession)
+                daveSession->applyKeyRatchetForSsrc(ssrc, userId);
+        }
+    }
+
+    sendVideoWants();
+    emit remoteVideoChanged(userId, ssrc != 0, maxWidth, maxHeight, maxFramerate);
+}
+
+void VoiceClient::removeRemoteVideo(Core::Snowflake userId)
+{
+    for (auto it = remoteVideos.begin(); it != remoteVideos.end();) {
+        if (it->second.userId != userId) {
+            ++it;
+            continue;
+        }
+        rtxToPrimary.remove(it->second.rtxSsrc);
+        ssrcToUserIdMap.remove(it->first);
+        it = remoteVideos.erase(it);
+    }
+}
+
+void VoiceClient::setVideoWants(int pixelCount, bool wanted)
+{
+    wantedPixelCount = pixelCount;
+    videoWanted = wanted;
+    sendVideoWants();
+}
+
+void VoiceClient::sendVideoWants()
+{
+    if (currentState != State::Connected || !gateway || remoteVideos.empty())
+        return;
+
+    MediaSinkWants wants;
+    for (const auto &[ssrc, video] : remoteVideos) {
+        wants.bySsrc.insert(ssrc, videoWanted ? 100 : 0);
+        if (videoWanted)
+            wants.pixelCounts.insert(ssrc, wantedPixelCount);
+    }
+
+    const QByteArray serialized = wants.toJson().toBytes();
+    if (serialized == sentVideoWants)
+        return;
+    sentVideoWants = serialized;
+    gateway->sendMediaSinkWants(wants);
+}
+
+void VoiceClient::requestVideoKeyframe()
+{
+    for (auto &[ssrc, video] : remoteVideos) {
+        if (video.receiver)
+            video.receiver->requestKeyframe();
+    }
+}
+
+void VoiceClient::startVideoTimer()
+{
+    if (!videoClock.isValid())
+        videoClock.start();
+    videoReportedMs = videoClock.elapsed();
+
+    if (!videoTimer) {
+        videoTimer = new QTimer(this);
+        videoTimer->setTimerType(Qt::PreciseTimer);
+        connect(videoTimer, &QTimer::timeout, this, &VoiceClient::onVideoTick);
+    }
+    videoTimer->start(VIDEO_TICK_MS);
+}
+
+void VoiceClient::onVideoTick()
+{
+    if (currentState != State::Connected || !encryption || !udpTransport)
+        return;
+
+    const qint64 now = videoClock.elapsed();
+    const bool reportDue = now - videoReportedMs >= VIDEO_REPORT_INTERVAL_MS;
+
+    struct Pending
+    {
+        quint32 ssrc;
+        VideoReceiver::Feedback feedback;
+    };
+    std::vector<Pending> pending;
+    std::vector<ReceptionReport> reports;
+    VideoReceiveStats stats;
+
+    for (auto &[ssrc, video] : remoteVideos) {
+        if (!video.receiver)
+            continue;
+
+        VideoReceiver::Feedback feedback = video.receiver->poll(now);
+        if (!feedback.nacks.empty() || feedback.keyframeRequest)
+            pending.push_back({ ssrc, std::move(feedback) });
+
+        if (!reportDue)
+            continue;
+        const ReceptionReport report = video.receiver->receptionReport();
+        reports.push_back(report);
+        const VideoReceiver::Stats &counters = video.receiver->stats();
+        stats.codec = videoCodecName(video.receiver->codec());
+        stats.packets += counters.packets;
+        stats.bytes += counters.bytes;
+        stats.frames += counters.frames;
+        stats.keyframes += counters.keyframes;
+        stats.retransmitted += counters.retransmitted;
+        stats.nacked += counters.nacked;
+        stats.keyframeRequests += counters.keyframeRequests;
+        stats.lossFraction = std::max(stats.lossFraction, report.fractionLost / 256.0);
+    }
+
+    if (pending.empty() && !reportDue)
+        return;
+
+    // A compound packet opens with a report, so feedback sent between reports follows an empty one.
+    PacketPool::Handle packet = udpTransport->acquirePacket();
+    packet->resize(packet->tailroom() - VoiceEncryption::TRAILER_SIZE);
+    int size = writeReceiverReport(packet->bytes(), localSsrc, reports);
+    if (size < 0)
+        return;
+    for (const Pending &entry : pending) {
+        if (!entry.feedback.nacks.empty()) {
+            const int written = writeNack(packet->bytes().subspan(static_cast<size_t>(size)), localSsrc, entry.ssrc, entry.feedback.nacks);
+            if (written > 0)
+                size += written;
+        }
+        if (entry.feedback.keyframeRequest) {
+            const int written = writePli(packet->bytes().subspan(static_cast<size_t>(size)), localSsrc, entry.ssrc);
+            if (written > 0)
+                size += written;
+        }
+    }
+    packet->resize(size);
+
+    if (encryption->seal(*packet, RTCP_CLEAR_SIZE))
+        udpTransport->send(*packet);
+
+    if (reportDue) {
+        videoReportedMs = now;
+        stats.decryptFailures = videoDecryptFailures;
+        if (!remoteVideos.empty())
+            emit videoStatsUpdated(stats);
+    }
 }
 
 void VoiceClient::receiveAudio(const ParsedRtp &rtp, PacketPool::Handle packet)
@@ -520,6 +852,7 @@ void VoiceClient::onClientConnect(const ClientConnectData &data)
         if (daveSession)
             daveSession->addConnectedUser(uid);
     }
+    applyRemoteVideo(data);
     emit clientConnected(data);
 }
 
@@ -530,6 +863,11 @@ void VoiceClient::onClientDisconnect(Core::Snowflake uid)
 
     if (daveSession)
         daveSession->removeConnectedUser(uidStr);
+
+    const bool hadVideo = std::any_of(remoteVideos.begin(), remoteVideos.end(), [uid](const auto &entry) { return entry.second.userId == uid; });
+    removeRemoteVideo(uid);
+    if (hadVideo)
+        emit remoteVideoChanged(uid, false, 0, 0, 0);
 
     for (auto it = ssrcToUserIdMap.begin(); it != ssrcToUserIdMap.end(); ++it) {
         if (it.value() == static_cast<quint64>(uid)) {
@@ -576,7 +914,11 @@ void VoiceClient::onIpDiscovered(const QString &ip, int port)
     protocol.address = ip;
     protocol.port = port;
     protocol.mode = selectedMode;
-    protocol.codecs = { Codec::opus() };
+    QList<Codec> codecs = { Codec::opus() };
+    codecs.append(params.videoCodecs);
+    protocol.codecs = codecs;
+    if (params.video)
+        protocol.rtcConnectionId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     gateway->sendSelectProtocol(protocol);
 
     setState(State::WaitingForSession);
@@ -622,6 +964,8 @@ void VoiceClient::ensureDaveSession(uint16_t protocolVersion)
 
     connect(daveSession.get(), &DaveSession::daveStateChanged,
             this, [this](bool enabled) {
+                // Video dropped while the keys were being agreed has to start again.
+                requestVideoKeyframe();
                 if (enabled) {
                     auto auth = daveSession->lastEpochAuthenticator();
                     if (!auth.empty())

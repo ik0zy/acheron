@@ -1,0 +1,312 @@
+// Real video through the whole receive chain: frames encoded by ffmpeg are packetized, handed
+// to the receiver packet by packet, reassembled, and decoded. Which codecs run depends on the
+// encoders the linked ffmpeg was built with; a codec with no encoder is skipped.
+
+#include "Core/Media/VideoDecoder.hpp"
+#include "Discord/Voice/VideoDepacketizer.hpp"
+#include "Discord/Voice/VideoReceiver.hpp"
+#include "VideoRtpSupport.hpp"
+
+#include <QElapsedTimer>
+#include <QTest>
+#include <QThread>
+
+#include <atomic>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/opt.h>
+}
+
+using namespace Acheron;
+using namespace Acheron::Discord::Voice;
+using namespace VideoRtpSupport;
+
+namespace {
+
+constexpr int WIDTH = 320;
+constexpr int HEIGHT = 240;
+constexpr int FRAME_COUNT = 30;
+constexpr int KEYFRAME_INTERVAL = 10;
+constexpr uint32_t SSRC = 77;
+
+struct CodecCase
+{
+    VideoCodec codec;
+    AVCodecID id;
+    const char *encoder;
+};
+
+struct EncodedFrame
+{
+    Bytes data;
+    bool keyframe = false;
+    uint32_t timestamp = 0;
+};
+
+// A short clip of moving gradients, encoded with as little delay as the encoder allows.
+std::vector<EncodedFrame> encodeClip(const CodecCase &codecCase)
+{
+    std::vector<EncodedFrame> frames;
+
+    const AVCodec *encoder = avcodec_find_encoder_by_name(codecCase.encoder);
+    if (!encoder)
+        return frames;
+
+    AVCodecContext *context = avcodec_alloc_context3(encoder);
+    context->width = WIDTH;
+    context->height = HEIGHT;
+    context->pix_fmt = AV_PIX_FMT_YUV420P;
+    context->time_base = { 1, 30 };
+    context->framerate = { 30, 1 };
+    context->bit_rate = 400000;
+    context->gop_size = KEYFRAME_INTERVAL;
+    context->max_b_frames = 0;
+    av_opt_set(context, "deadline", "realtime", AV_OPT_SEARCH_CHILDREN);
+    av_opt_set_int(context, "lag-in-frames", 0, AV_OPT_SEARCH_CHILDREN);
+    av_opt_set_int(context, "auto-alt-ref", 0, AV_OPT_SEARCH_CHILDREN);
+    av_opt_set(context, "preset", "ultrafast", AV_OPT_SEARCH_CHILDREN);
+    av_opt_set(context, "usage", "realtime", AV_OPT_SEARCH_CHILDREN);
+    av_opt_set_int(context, "cpu-used", 8, AV_OPT_SEARCH_CHILDREN);
+    // Kvazaar reorders frames unless told not to, which no live sender does.
+    av_opt_set(context, "kvazaar-params", "gop=0,period=10", AV_OPT_SEARCH_CHILDREN);
+
+    if (avcodec_open2(context, encoder, nullptr) < 0) {
+        avcodec_free_context(&context);
+        return frames;
+    }
+
+    AVFrame *picture = av_frame_alloc();
+    picture->format = context->pix_fmt;
+    picture->width = WIDTH;
+    picture->height = HEIGHT;
+    av_frame_get_buffer(picture, 0);
+    AVPacket *packet = av_packet_alloc();
+
+    const auto drain = [&] {
+        while (avcodec_receive_packet(context, packet) >= 0) {
+            EncodedFrame frame;
+            frame.data.assign(packet->data, packet->data + packet->size);
+            frame.keyframe = packet->flags & AV_PKT_FLAG_KEY;
+            frame.timestamp = static_cast<uint32_t>(packet->pts * 3000);
+            frames.push_back(std::move(frame));
+            av_packet_unref(packet);
+        }
+    };
+
+    for (int index = 0; index < FRAME_COUNT; index++) {
+        av_frame_make_writable(picture);
+        for (int y = 0; y < HEIGHT; y++) {
+            for (int x = 0; x < WIDTH; x++)
+                picture->data[0][y * picture->linesize[0] + x] = static_cast<uint8_t>(x + y + index * 3);
+        }
+        for (int y = 0; y < HEIGHT / 2; y++) {
+            for (int x = 0; x < WIDTH / 2; x++) {
+                picture->data[1][y * picture->linesize[1] + x] = static_cast<uint8_t>(128 + y + index * 2);
+                picture->data[2][y * picture->linesize[2] + x] = static_cast<uint8_t>(64 + x + index * 5);
+            }
+        }
+        picture->pts = index;
+        if (avcodec_send_frame(context, picture) < 0)
+            break;
+        drain();
+    }
+    avcodec_send_frame(context, nullptr);
+    drain();
+
+    av_packet_free(&packet);
+    av_frame_free(&picture);
+    avcodec_free_context(&context);
+    return frames;
+}
+
+class CountingSink : public Core::Media::VideoFrameSink
+{
+public:
+    void present(const AVFrame *frame) override
+    {
+        width = frame->width;
+        height = frame->height;
+        frames++;
+    }
+
+    std::atomic<int> frames{ 0 };
+    std::atomic<int> width{ 0 };
+    std::atomic<int> height{ 0 };
+};
+
+struct Chain
+{
+    explicit Chain(VideoCodec codec)
+        : codec(codec), receiver(SSRC, codec), sink(std::make_shared<CountingSink>())
+    {
+        decoder.setSink(sink);
+        decoder.setKeyframeRequester([this] { keyframeRequests++; });
+    }
+
+    // Sends one encoded frame as RTP, leaving out the packets whose index `dropped` accepts.
+    void send(const CodecCase &codecCase, const EncodedFrame &frame, const std::function<bool(size_t)> &dropped = {})
+    {
+        const RtpPayloads packets = codec == VideoCodec::AV1 ? packetizeAv1ByHand(frame.data, frame.keyframe) : packetizeWithFfmpeg(codecCase.id, frame.data, frame.keyframe);
+        for (size_t i = 0; i < packets.payloads.size(); i++) {
+            const uint16_t number = sequence++;
+            if (dropped && dropped(i))
+                continue;
+            PacketPool::Handle packet = pool.acquire();
+            packet->append(packets.payloads[i]);
+            receiver.insert(number, frame.timestamp, packets.markers[i], std::move(packet), now);
+        }
+
+        for (EncodedVideoFrame &assembled : receiver.takeFrames()) {
+            prepareForDecoder(codec, assembled.data);
+            decoder.push(codec, std::move(assembled));
+            pushed++;
+        }
+    }
+
+    // Waits for the decoder to show `count` frames and returns how many it did show.
+    int waitForDecoded(int count)
+    {
+        QElapsedTimer timer;
+        timer.start();
+        while (sink->frames < count && timer.elapsed() < 5000)
+            QThread::msleep(5);
+        // Whatever is still in the decoder's queue gets its chance to fail.
+        QThread::msleep(50);
+        return sink->frames;
+    }
+
+    VideoCodec codec;
+    PacketPool pool;
+    VideoReceiver receiver;
+    std::shared_ptr<CountingSink> sink;
+    Core::Media::VideoDecoder decoder;
+    std::atomic<int> keyframeRequests{ 0 };
+    uint16_t sequence = 65500;
+    qint64 now = 0;
+    int pushed = 0;
+};
+
+} // namespace
+
+Q_DECLARE_METATYPE(CodecCase)
+
+class TestVideoDecode : public QObject
+{
+    Q_OBJECT
+private slots:
+    void decodableCodecsAreOffered();
+
+    void everyFrameDecodes_data() { codecCases(); }
+    void everyFrameDecodes();
+    void lossSkipsToTheNextKeyframe_data() { codecCases(); }
+    void lossSkipsToTheNextKeyframe();
+
+private:
+    static void codecCases();
+};
+
+void TestVideoDecode::codecCases()
+{
+    QTest::addColumn<CodecCase>("codecCase");
+    QTest::newRow("H264") << CodecCase{ VideoCodec::H264, AV_CODEC_ID_H264, "libopenh264" };
+    QTest::newRow("H265") << CodecCase{ VideoCodec::H265, AV_CODEC_ID_HEVC, "libkvazaar" };
+    QTest::newRow("VP8") << CodecCase{ VideoCodec::VP8, AV_CODEC_ID_VP8, "libvpx" };
+    QTest::newRow("AV1") << CodecCase{ VideoCodec::AV1, AV_CODEC_ID_AV1, "libaom-av1" };
+}
+
+void TestVideoDecode::decodableCodecsAreOffered()
+{
+    const QList<VideoCodec> decodable = Core::Media::decodableVideoCodecs();
+    const QList<Codec> offered = Core::Media::offeredVideoCodecs();
+    QVERIFY(decodable.contains(VideoCodec::H264));
+    QCOMPARE(offered.size(), decodable.size());
+
+    // Payload types follow the position in the list, as the official client assigns them.
+    for (int i = 0; i < offered.size(); i++) {
+        QCOMPARE(offered[i].name.get(), videoCodecName(decodable[i]));
+        QCOMPARE(offered[i].payloadType.get(), 101 + 2 * i);
+        QCOMPARE(offered[i].rtxPayloadType.get(), 102 + 2 * i);
+        QCOMPARE(offered[i].priority.get(), 1000 * (i + 1));
+        QCOMPARE(offered[i].decode.get(), true);
+        QCOMPARE(offered[i].encode.get(), false);
+    }
+
+    // The preference order is AV1, H265, H264, VP8, whichever of them are present.
+    QList<VideoCodec> expected;
+    for (VideoCodec codec : { VideoCodec::AV1, VideoCodec::H265, VideoCodec::H264, VideoCodec::VP8 }) {
+        if (decodable.contains(codec))
+            expected.append(codec);
+    }
+    QVERIFY(decodable == expected);
+}
+
+void TestVideoDecode::everyFrameDecodes()
+{
+    QFETCH(CodecCase, codecCase);
+    if (!Core::Media::decodableVideoCodecs().contains(codecCase.codec))
+        QSKIP("this ffmpeg cannot decode the codec");
+    const std::vector<EncodedFrame> clip = encodeClip(codecCase);
+    if (clip.empty())
+        QSKIP("this ffmpeg has no encoder for the codec");
+    QCOMPARE(clip.size(), size_t(FRAME_COUNT));
+
+    Chain chain(codecCase.codec);
+    for (const EncodedFrame &frame : clip)
+        chain.send(codecCase, frame);
+
+    QCOMPARE(chain.pushed, FRAME_COUNT);
+    const int shown = chain.waitForDecoded(FRAME_COUNT);
+    QCOMPARE(chain.decoder.stats().errors, quint64(0));
+    QCOMPARE(chain.decoder.stats().dropped, quint64(0));
+    QCOMPARE(chain.keyframeRequests.load(), 0);
+    QCOMPARE(shown, FRAME_COUNT);
+    QCOMPARE(chain.sink->width.load(), WIDTH);
+    QCOMPARE(chain.sink->height.load(), HEIGHT);
+}
+
+void TestVideoDecode::lossSkipsToTheNextKeyframe()
+{
+    QFETCH(CodecCase, codecCase);
+    if (!Core::Media::decodableVideoCodecs().contains(codecCase.codec))
+        QSKIP("this ffmpeg cannot decode the codec");
+    const std::vector<EncodedFrame> clip = encodeClip(codecCase);
+    if (clip.empty())
+        QSKIP("this ffmpeg has no encoder for the codec");
+
+    // The first packet of the fourth frame never arrives, and no retransmission comes.
+    constexpr int LOST_FRAME = 3;
+    Chain chain(codecCase.codec);
+    int expected = 0;
+    bool waitingForKeyframe = false;
+    for (int index = 0; index < static_cast<int>(clip.size()); index++) {
+        if (index == LOST_FRAME) {
+            chain.send(codecCase, clip[index], [](size_t packet) { return packet == 0; });
+            waitingForKeyframe = true;
+            continue;
+        }
+        if (index == LOST_FRAME + 2) {
+            // Long enough for the receiver to stop asking for the packet.
+            chain.now += VideoReceiver::NACK_GIVE_UP_MS + 1;
+            QVERIFY(chain.receiver.poll(chain.now).keyframeRequest);
+        }
+
+        if (clip[index].keyframe && index > LOST_FRAME + 2)
+            waitingForKeyframe = false;
+        if (!waitingForKeyframe)
+            expected++;
+        chain.send(codecCase, clip[index]);
+    }
+
+    // Everything from the loss up to the next key frame is withheld, so nothing the decoder
+    // was given depended on the missing frame.
+    QVERIFY(expected < static_cast<int>(clip.size()));
+    QCOMPARE(chain.pushed, expected);
+    const int shown = chain.waitForDecoded(expected);
+    QCOMPARE(chain.decoder.stats().errors, quint64(0));
+    QCOMPARE(chain.keyframeRequests.load(), 0);
+    QCOMPARE(shown, expected);
+}
+
+QTEST_GUILESS_MAIN(TestVideoDecode)
+#include "tst_VideoDecode.moc"

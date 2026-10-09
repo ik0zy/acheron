@@ -341,6 +341,9 @@ if(ENABLE_VOICE)
         src/Discord/Voice/RtpPacket.cpp
         src/Discord/Voice/VoiceEncryption.cpp
         src/Discord/Voice/DaveSession.cpp
+        src/Discord/Voice/VideoDepacketizer.cpp
+        src/Discord/Voice/VideoReceiver.cpp
+        src/Discord/Voice/Rtcp.cpp
         src/Core/Audio/VoiceManager.cpp
         src/Core/Audio/VoiceConnection.cpp
         src/Core/Audio/AudioPipeline.cpp
@@ -351,6 +354,17 @@ if(ENABLE_VOICE)
         src/Core/Audio/JitterBuffer.cpp
         src/Core/Audio/AudioMixer.cpp
         src/Core/Audio/NoiseSuppressor.cpp
+    )
+endif()
+
+# Watching video needs both the RTC connection and a decoder.
+if(ENABLE_VOICE AND TARGET ffmpeg)
+    list(APPEND PROJECT_SOURCES
+        src/Core/Media/VideoDecoder.cpp
+        src/Core/Streams/StreamSession.cpp
+        src/Core/Streams/StreamWatcher.cpp
+        src/UI/Video/VideoSurface.cpp
+        src/UI/StreamWindow.cpp
     )
 endif()
 
@@ -449,6 +463,28 @@ if(BUILD_TESTS)
         target_link_libraries(TestUdpTransport PRIVATE Qt::Core Qt::Network Qt::Test)
         target_include_directories(TestUdpTransport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME UdpTransportTests COMMAND TestUdpTransport)
+
+        if(TARGET ffmpeg)
+            qt_add_executable(TestRtpVideo tests/tst_RtpVideo.cpp src/Discord/Voice/RtpPacket.cpp
+                src/Discord/Voice/VideoDepacketizer.cpp src/Discord/Voice/VideoReceiver.cpp
+                src/Discord/Voice/Rtcp.cpp)
+            target_link_libraries(TestRtpVideo PRIVATE Qt::Core Qt::Test ffmpeg libdave MLSPP::mlspp)
+            target_include_directories(TestRtpVideo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            add_test(NAME RtpVideoTests COMMAND TestRtpVideo)
+
+            qt_add_executable(TestVideoDecode tests/tst_VideoDecode.cpp src/Core/Media/VideoDecoder.cpp
+                src/Core/Logging.cpp src/Core/OrderedJson.cpp src/Core/Snowflake.cpp
+                src/Discord/Voice/RtpPacket.cpp src/Discord/Voice/VideoDepacketizer.cpp
+                src/Discord/Voice/VideoReceiver.cpp src/Discord/Voice/Rtcp.cpp)
+            target_link_libraries(TestVideoDecode PRIVATE Qt::Core Qt::Network Qt::Test ffmpeg)
+            target_include_directories(TestVideoDecode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            add_test(NAME VideoDecodeTests COMMAND TestVideoDecode)
+
+            qt_add_executable(TestVideoSurface tests/tst_VideoSurface.cpp src/UI/Video/VideoSurface.cpp)
+            target_link_libraries(TestVideoSurface PRIVATE Qt::Core Qt::Gui Qt::Widgets Qt::Network Qt::Test ffmpeg)
+            target_include_directories(TestVideoSurface PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            add_test(NAME VideoSurfaceTests COMMAND TestVideoSurface)
+        endif()
     endif()
 
     qt_add_executable(TestEmojiGrid tests/tst_EmojiGrid.cpp
@@ -513,6 +549,9 @@ if (MSVC)
         if(TARGET TestRtp)
             list(APPEND _msvc_test_targets TestRtp TestUdpTransport)
         endif()
+        if(TARGET TestRtpVideo)
+            list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface)
+        endif()
         foreach(test_target ${_msvc_test_targets})
             target_link_options(${test_target} PRIVATE $<$<CONFIG:Debug>:/INCREMENTAL>)
             target_compile_options(${test_target} PRIVATE $<$<CONFIG:Debug>:/ZI> $<$<NOT:$<CONFIG:Debug>>:/Zi>)
@@ -570,6 +609,9 @@ endif()
 if(TARGET ffmpeg)
     target_link_libraries(${PROJECT_NAME} PRIVATE ffmpeg)
     target_compile_definitions(${PROJECT_NAME} PRIVATE ACHERON_HAVE_FFMPEG)
+endif()
+if(ENABLE_VOICE AND TARGET ffmpeg)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ACHERON_HAVE_STREAM_VIEW)
 endif()
 if(TARGET lottie)
     target_link_libraries(${PROJECT_NAME} PRIVATE lottie)

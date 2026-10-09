@@ -100,6 +100,12 @@ public:
     [[nodiscard]] QList<Snowflake> channelVoiceUsers(Snowflake channelId) const;
     [[nodiscard]] std::optional<Discord::VoiceState> voiceStateForUser(Snowflake userId) const;
 
+    // Mixes the audio of another RTC connection, such as a watched stream, into this voice
+    // connection's output under its own volume. `source` is any non-zero number unique to it.
+    void attachAudioSource(quint32 source, Discord::Voice::VoiceClient *client);
+    void detachAudioSource(quint32 source);
+    void setAudioSourceVolume(quint32 source, float volume);
+
     void setUserMuted(Snowflake userId, bool muted);
     [[nodiscard]] bool isUserMuted(Snowflake userId) const;
 

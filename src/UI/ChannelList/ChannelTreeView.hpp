@@ -40,6 +40,8 @@ signals:
     // A live participant's row has been hovered long enough for its stream thumbnail to be shown;
     // an invalid index means the hover ended.
     void liveParticipantHoverChanged(const QModelIndex &proxyIndex);
+    // A live participant's row was double-clicked, which is how the official client watches.
+    void watchStreamRequested(const QModelIndex &proxyIndex);
 
 protected:
     void contextMenuEvent(QContextMenuEvent *event) override;

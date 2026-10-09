@@ -277,10 +277,8 @@ void DaveSession::removeConnectedUser(const std::string &id)
 
     uint64_t uid = std::stoull(id);
     for (auto it = ssrcMap.constBegin(); it != ssrcMap.constEnd(); ++it) {
-        if (it.value() == uid) {
+        if (it.value() == uid)
             daveDecryptors.erase(it.key());
-            break;
-        }
     }
 }
 

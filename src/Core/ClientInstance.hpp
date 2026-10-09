@@ -37,6 +37,7 @@ class ForumManager;
 class CallStore;
 class StreamManager;
 class StreamPreviews;
+class StreamWatcher;
 
 class ClientInstance : public QObject
 {
@@ -66,6 +67,9 @@ public:
     [[nodiscard]] StreamPreviews *streamPreviews() const;
 #ifndef ACHERON_NO_VOICE
     [[nodiscard]] Audio::VoiceManager *voice() const;
+#endif
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    [[nodiscard]] StreamWatcher *streamWatcher() const;
 #endif
 
     [[nodiscard]] QList<Discord::Role> getRolesForGuild(Snowflake guildId);
@@ -208,6 +212,9 @@ private:
     StreamPreviews *streamPreviewCache;
 #ifndef ACHERON_NO_VOICE
     Audio::VoiceManager *voiceManager;
+#endif
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    StreamWatcher *streamWatch = nullptr;
 #endif
 
     Storage::RoleRepository roleRepo;

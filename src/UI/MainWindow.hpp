@@ -52,6 +52,7 @@ class TrayIcon;
 #ifndef ACHERON_NO_VOICE
 class VoiceStatusBar;
 class StreamPreviewPopup;
+class StreamWindow;
 #endif
 } // namespace UI
 } // namespace Acheron
@@ -133,6 +134,7 @@ private:
 #ifndef ACHERON_NO_VOICE
     void updateVoiceStatusLabel();
     void onLiveParticipantHoverChanged(const QModelIndex &proxyIndex);
+    void onWatchStreamRequested(const QModelIndex &proxyIndex);
 #endif
 
 private:
@@ -234,6 +236,8 @@ private:
 #ifndef ACHERON_NO_VOICE
     VoiceStatusBar *voiceStatusBar;
     StreamPreviewPopup *streamPreviewPopup = nullptr;
+    // Open stream viewers, by account id and stream key.
+    QHash<QString, StreamWindow *> streamWindows;
 #endif
     AccountsWindow *accountsWindow = nullptr;
     SettingsWindow *settingsWindow = nullptr;

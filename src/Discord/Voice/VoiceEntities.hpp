@@ -382,6 +382,12 @@ struct ConnectionParams
     // audio-only.
     std::optional<bool> video;
     QList<StreamDescription> streams;
+    // The video codecs SELECT_PROTOCOL offers after Opus, in preference order. Incoming video is
+    // told apart by the payload types given here.
+    QList<Codec> videoCodecs;
+    // A stream's viewer has no microphone on that connection and sends no audio at all, not
+    // even the silence a voice connection opens with.
+    bool sendsAudio = true;
 };
 
 struct VoiceResumeData : Core::JsonUtils::JsonObject

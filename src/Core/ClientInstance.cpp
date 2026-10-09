@@ -14,6 +14,9 @@
 #include "Calls/CallStore.hpp"
 #include "Streams/StreamManager.hpp"
 #include "Streams/StreamPreviews.hpp"
+#ifdef ACHERON_HAVE_STREAM_VIEW
+#include "Streams/StreamWatcher.hpp"
+#endif
 #include "Discord/Enums.hpp"
 #include "Storage/DatabaseManager.hpp"
 #include "Storage/GuildRepository.hpp"
@@ -98,6 +101,9 @@ ClientInstance::ClientInstance(const AccountInfo &info,
     connect(voiceManager, &Audio::VoiceManager::voiceConnected, this, &ClientInstance::onVoiceConnected);
     connect(voiceManager, &Audio::VoiceManager::voiceDisconnected, this, &ClientInstance::onVoiceDisconnected);
 #endif
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    streamWatch = new StreamWatcher(client, streamManager, voiceManager, info.id, info.proxy, this);
+#endif
 
     connect(client, &Discord::Client::stateChanged, this, &ClientInstance::stateChanged);
     connect(client, &Discord::Client::reconnecting, this, &ClientInstance::reconnecting);
@@ -110,6 +116,10 @@ ClientInstance::ClientInstance(const AccountInfo &info,
         voiceManager->setGatewaySessionId(gatewaySessionId);
 #endif
         callStore->reset();
+#ifdef ACHERON_HAVE_STREAM_VIEW
+        streamWatch->reset();
+        streamWatch->setGatewaySessionId(gatewaySessionId);
+#endif
         streamManager->reset();
         streamPreviewCache->clear();
         connectSelectedCall(true);
@@ -1446,6 +1456,11 @@ void ClientInstance::markCategoryAsRead(Snowflake guildId, Snowflake categoryId)
 
 ClientInstance::~ClientInstance()
 {
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    // Its sessions feed the voice manager's mixer, so they go before it does.
+    delete streamWatch;
+    streamWatch = nullptr;
+#endif
     Storage::DatabaseManager::instance().closeCacheDatabase(account.id);
 }
 
@@ -1536,6 +1551,13 @@ StreamPreviews *ClientInstance::streamPreviews() const
 {
     return streamPreviewCache;
 }
+
+#ifdef ACHERON_HAVE_STREAM_VIEW
+StreamWatcher *ClientInstance::streamWatcher() const
+{
+    return streamWatch;
+}
+#endif
 
 #ifndef ACHERON_NO_VOICE
 Audio::VoiceManager *ClientInstance::voice() const
