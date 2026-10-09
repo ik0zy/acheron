@@ -96,6 +96,7 @@ private slots:
     void clearSizeCoversCsrcsAndExtensionPreamble();
     void parseRejectsTruncatedHeaders_data();
     void parseRejectsTruncatedHeaders();
+    void paddingIsCountedByTheLastByte();
     void parseSurvivesTruncationFuzz();
 
     void writesFixedHeader();
@@ -248,6 +249,24 @@ void TestRtp::parseRejectsTruncatedHeaders_data()
     QTest::newRow("csrc list cut short") << (QByteArray(1, '\x83') + rest + QByteArray(8, 'c'));
     QTest::newRow("extension preamble missing") << (QByteArray(1, '\x90') + rest);
     QTest::newRow("extension preamble cut short") << (QByteArray(1, '\x90') + rest + QByteArray::fromHex("bede00"));
+}
+
+void TestRtp::paddingIsCountedByTheLastByte()
+{
+    // Discord fills the padding with the count; the standard only promises the last byte.
+    const std::vector<uint8_t> padded = { 0xAA, 0xBB, 0x03, 0x03, 0x03 };
+    QCOMPARE(rtpPaddingSize(padded), 3);
+    const std::vector<uint8_t> zeroFilled = { 0xAA, 0x00, 0x00, 0x00, 0x04 };
+    QCOMPARE(rtpPaddingSize(zeroFilled), 4);
+    const std::vector<uint8_t> allPadding = { 0x02, 0x02 };
+    QCOMPARE(rtpPaddingSize(allPadding), 2);
+
+    // A count of nothing, or of more than there is, is not padding.
+    const std::vector<uint8_t> zero = { 0xAA, 0x00 };
+    QCOMPARE(rtpPaddingSize(zero), -1);
+    const std::vector<uint8_t> tooLong = { 0xAA, 0x09 };
+    QCOMPARE(rtpPaddingSize(tooLong), -1);
+    QCOMPARE(rtpPaddingSize({}), -1);
 }
 
 void TestRtp::parseRejectsTruncatedHeaders()

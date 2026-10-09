@@ -46,6 +46,11 @@ struct ParsedRtp
 
 [[nodiscard]] std::optional<ParsedRtp> parseRtp(std::span<const uint8_t> packet);
 
+// How many bytes at the end of a payload are padding, for a packet whose header says it has
+// some: the last byte holds the count, itself included (RFC 3550, 5.1). -1 when the count
+// cannot be right.
+[[nodiscard]] int rtpPaddingSize(std::span<const uint8_t> payload);
+
 // Writes the fixed header, followed by the one-byte-form extension preamble when the header has
 // extensions. Returns the bytes written, or -1 when `out` is too small or the header has CSRCs.
 int writeRtpHeader(const RtpHeader &header, std::span<uint8_t> out, int extensionWords = 0);

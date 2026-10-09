@@ -438,12 +438,10 @@ void VoiceClient::receiveVideo(const ParsedRtp &rtp, PacketPool::Handle packet, 
     packet->dropFront(rtp.extensionSize);
 
     if (header.padding) {
-        // The last byte counts the padding, itself included.
-        const int size = packet->size();
-        const int padding = size > 0 ? packet->data()[size - 1] : 0;
-        if (padding == 0 || padding > size)
+        const int padding = rtpPaddingSize(packet->bytes());
+        if (padding < 0)
             return;
-        packet->resize(size - padding);
+        packet->resize(packet->size() - padding);
     }
 
     quint32 ssrc = header.ssrc;
@@ -738,6 +736,14 @@ void VoiceClient::receiveAudio(const ParsedRtp &rtp, PacketPool::Handle packet)
     if (packet->size() <= rtp.extensionSize)
         return;
     packet->dropFront(rtp.extensionSize);
+
+    // Stream audio arrives padded now and then; the padding is not part of the frame.
+    if (header.padding) {
+        const int padding = rtpPaddingSize(packet->bytes());
+        if (padding < 0 || padding == packet->size())
+            return;
+        packet->resize(packet->size() - padding);
+    }
 
     if (daveSession) {
         // https://daveprotocol.com/#silence-packets

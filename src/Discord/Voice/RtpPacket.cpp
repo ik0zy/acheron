@@ -70,6 +70,16 @@ std::optional<ParsedRtp> parseRtp(std::span<const uint8_t> packet)
     return parsed;
 }
 
+int rtpPaddingSize(std::span<const uint8_t> payload)
+{
+    if (payload.empty())
+        return -1;
+    const int padding = payload.back();
+    if (padding == 0 || padding > static_cast<int>(payload.size()))
+        return -1;
+    return padding;
+}
+
 int writeRtpHeader(const RtpHeader &header, std::span<uint8_t> out, int extensionWords)
 {
     const int size = RtpHeader::FIXED_SIZE + (header.extension ? RtpHeader::EXTENSION_PREAMBLE_SIZE : 0);
