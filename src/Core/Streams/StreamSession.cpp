@@ -139,6 +139,7 @@ void StreamSession::connectRtc()
     // The decoder outlives every call the client can still make: disconnectRtc() stops the
     // client before it frees the decoder.
     decoder->setKeyframeRequester([client] { QMetaObject::invokeMethod(client, &VoiceClient::requestVideoKeyframe); });
+    decoder->setCodecFailureHandler([client](Discord::Voice::VideoCodec codec) { QMetaObject::invokeMethod(client, [client, codec] { client->withdrawVideoCodec(codec); }); });
     client->setVideoFrameHandler([target = decoder.get()](Snowflake, Discord::Voice::VideoCodec codec, Discord::Voice::EncodedVideoFrame frame) {
         target->push(codec, std::move(frame));
     });

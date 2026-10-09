@@ -6,6 +6,7 @@
 
 #include "Discord/Voice/Rtcp.hpp"
 #include "Discord/Voice/RtpPacket.hpp"
+#include "Discord/Voice/TransportFeedback.hpp"
 #include "Discord/Voice/VideoDepacketizer.hpp"
 #include "Discord/Voice/VideoReceiver.hpp"
 #include "VideoRtpSupport.hpp"
@@ -212,6 +213,7 @@ private slots:
     void encryptedFramesSurviveTheReceiveChain();
 
     void keyframeKeepsWhatPrecedesItsParameterSets();
+    void pictureWithoutItsParameterSetsIsNotAStart();
     void nothingIsDeliveredBeforeAKeyframe();
     void framesComeOutInOrder();
     void reorderedPacketsAreHeld();
@@ -224,6 +226,12 @@ private slots:
     void receiverReportBytes();
     void nackBytes();
     void pliBytes();
+
+    void transportFeedbackForPacketsInARow();
+    void transportFeedbackMarksWhatDidNotArrive();
+    void transportFeedbackCarriesLongAndBackwardGaps();
+    void transportFeedbackReportsEachPacketOnce();
+    void transportFeedbackAcrossTheSequenceWrap();
 };
 
 void TestRtpVideo::codecNames()
@@ -437,6 +445,40 @@ void TestRtpVideo::keyframeKeepsWhatPrecedesItsParameterSets()
     QVERIFY(startsKeyframe(VideoCodec::H264, Bytes{ 0x18, 0x00, 0x02, 0x09, 0xF0, 0x00, 0x03, 0x67, 0x42, 0x00 }));
     QVERIFY(!startsKeyframe(VideoCodec::H264, Bytes{ 0x18, 0x00, 0x02, 0x09, 0xF0, 0x00, 0x03, 0x41, 0x80, 0x00 }));
     QVERIFY(startsKeyframe(VideoCodec::H265, Bytes{ 0x60, 0x01, 0x00, 0x03, 0x46, 0x01, 0x50, 0x00, 0x04, 0x40, 0x01, 0x0C, 0x01 }));
+}
+
+void TestRtpVideo::pictureWithoutItsParameterSetsIsNotAStart()
+{
+    const Bytes parameterSets = { 0x18, 0x00, 0x03, 0x67, 0x42, 0x00, 0x00, 0x02, 0x68, 0xCE };
+    const Bytes picture = { 0x65, 0x88, 0x84 };
+    const Bytes delta = { 0x41, 0x80, 0x11 };
+    const auto send = [](VideoReceiver &receiver, PacketPool &pool, uint16_t sequence, uint32_t timestamp, bool marker, const Bytes &bytes) {
+        PacketPool::Handle packet = pool.acquire();
+        packet->append(bytes);
+        receiver.insert(sequence, timestamp, marker, std::move(packet), 0);
+    };
+
+    // Subscribed in the middle of a key frame: its picture arrives, its parameter sets went
+    // by before. The frame would be incomplete, so it is not taken.
+    PacketPool pool;
+    VideoReceiver late(SSRC, VideoCodec::H264);
+    send(late, pool, 501, 6000, true, picture);
+    QVERIFY(late.takeFrames().empty());
+    QVERIFY(late.poll(0).keyframeRequest);
+
+    // The whole of the next key frame is.
+    send(late, pool, 510, 9000, false, parameterSets);
+    send(late, pool, 511, 9000, true, picture);
+    QCOMPARE(late.takeFrames().size(), size_t(1));
+
+    // A sender that puts no parameter sets in its key frames is still followed, because the
+    // packet before the picture shows where the frame begins.
+    VideoReceiver bare(SSRC, VideoCodec::H264);
+    send(bare, pool, 700, 3000, true, delta);
+    send(bare, pool, 701, 6000, true, picture);
+    const std::vector<EncodedVideoFrame> frames = bare.takeFrames();
+    QCOMPARE(frames.size(), size_t(1));
+    QVERIFY(frames[0].keyframe);
 }
 
 void TestRtpVideo::nothingIsDeliveredBeforeAKeyframe()
@@ -655,6 +697,95 @@ void TestRtpVideo::pliBytes()
     QCOMPARE(writePli(buffer, 0x01020304, 0x0A0B0C0D), 12);
     QCOMPARE(QByteArray(reinterpret_cast<const char *>(buffer), 12).toHex(), QByteArray("81ce0002010203040a0b0c0d"));
     QCOMPARE(writePli(std::span<uint8_t>(buffer, 11), 1, 2), -1);
+}
+
+
+void TestRtpVideo::transportFeedbackForPacketsInARow()
+{
+    uint8_t buffer[128];
+    TransportFeedback feedback;
+    QVERIFY(!feedback.hasPending());
+    QCOMPARE(feedback.write(buffer, 1, 2), 0);
+
+    // Three packets a millisecond apart, the first 2 ms after a 64 ms boundary: one run of
+    // "received", and deltas of 8, 4 and 4 quarter-milliseconds.
+    feedback.onPacket(100, 322000);
+    feedback.onPacket(101, 323000);
+    feedback.onPacket(102, 324000);
+    QVERIFY(feedback.hasPending());
+
+    const int size = feedback.write(buffer, 0x01020304, 0x0A0B0C0D);
+    QCOMPARE(size, 28);
+    QCOMPARE(QByteArray(reinterpret_cast<const char *>(buffer), size).toHex(), QByteArray("afcd0006010203040a0b0c0d006400030000050020030804040000" "03"));
+    QVERIFY(!feedback.hasPending());
+
+    // Twenty in a row are still a single run.
+    for (uint16_t i = 0; i < 20; i++)
+        feedback.onPacket(static_cast<uint16_t>(200 + i), 640000 + i * 250);
+    QCOMPARE(feedback.write(buffer, 1, 2), 44);
+    QCOMPARE(QByteArray(reinterpret_cast<const char *>(buffer) + 12, 10).toHex(), QByteArray("00c8001400000a012014"));
+}
+
+void TestRtpVideo::transportFeedbackMarksWhatDidNotArrive()
+{
+    uint8_t buffer[128];
+    TransportFeedback feedback;
+    feedback.onPacket(10, 640000);
+    feedback.onPacket(12, 641000);
+
+    // Received, missing, received: spelled out two bits each, and only two deltas.
+    const int size = feedback.write(buffer, 0x01020304, 0x0A0B0C0D);
+    QCOMPARE(size, 24);
+    QCOMPARE(QByteArray(reinterpret_cast<const char *>(buffer), size).toHex(), QByteArray("8fcd0005010203040a0b0c0d000a000300000a00d1000004"));
+}
+
+void TestRtpVideo::transportFeedbackCarriesLongAndBackwardGaps()
+{
+    uint8_t buffer[128];
+    TransportFeedback feedback;
+    // The second packet is 100 ms behind the first, the third arrived before the second.
+    feedback.onPacket(1, 0);
+    feedback.onPacket(2, 100000);
+    feedback.onPacket(3, 99000);
+
+    const int size = feedback.write(buffer, 1, 2);
+    QCOMPARE(size, 28);
+    // Small, large, large; then 0, +400 and -4 quarter-milliseconds.
+    QCOMPARE(QByteArray(reinterpret_cast<const char *>(buffer) + 12, 16).toHex(), QByteArray("0001000300000000da00000190fffc01"));
+}
+
+void TestRtpVideo::transportFeedbackReportsEachPacketOnce()
+{
+    uint8_t buffer[128];
+    TransportFeedback feedback;
+    feedback.onPacket(5, 64000);
+    QCOMPARE(feedback.write(buffer, 1, 2), 24);
+    QCOMPARE(buffer[19], uint8_t(0));
+
+    // The next report starts at the next packet and counts up.
+    feedback.onPacket(6, 128000);
+    feedback.onPacket(7, 128250);
+    QCOMPARE(feedback.write(buffer, 1, 2), 24);
+    QCOMPARE(QByteArray(reinterpret_cast<const char *>(buffer) + 12, 12).toHex(), QByteArray("000600020000020120020001"));
+    QCOMPARE(feedback.write(buffer, 1, 2), 0);
+
+    // With no room nothing is written and nothing is forgotten.
+    feedback.onPacket(8, 192000);
+    QCOMPARE(feedback.write(std::span<uint8_t>(buffer, 20), 1, 2), -1);
+    QVERIFY(feedback.hasPending());
+    QCOMPARE(feedback.write(buffer, 1, 2), 24);
+}
+
+void TestRtpVideo::transportFeedbackAcrossTheSequenceWrap()
+{
+    uint8_t buffer[128];
+    TransportFeedback feedback;
+    feedback.onPacket(65535, 64000);
+    feedback.onPacket(0, 64250);
+    feedback.onPacket(1, 64500);
+
+    QCOMPARE(feedback.write(buffer, 1, 2), 28);
+    QCOMPARE(QByteArray(reinterpret_cast<const char *>(buffer) + 12, 4).toHex(), QByteArray("ffff0003"));
 }
 
 QTEST_GUILESS_MAIN(TestRtpVideo)

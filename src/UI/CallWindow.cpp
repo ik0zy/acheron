@@ -36,6 +36,13 @@ QString streamTileId(Snowflake userId)
     return QStringLiteral("stream:%1").arg(static_cast<quint64>(userId));
 }
 
+QString drawingName(const VideoSurface *surface)
+{
+    if (!surface->drawsWithGpu())
+        return CallWindow::tr("software");
+    return surface->drawsFromCard() ? CallWindow::tr("graphics card, no copy") : CallWindow::tr("graphics card");
+}
+
 QString userTileId(Snowflake userId)
 {
     return QStringLiteral("user:%1").arg(static_cast<quint64>(userId));
@@ -505,6 +512,7 @@ void CallWindow::refreshStats()
             lines << tr("Frames: %1 decoded, %2 dropped, %3 errors").arg(stats.decoder.decoded).arg(stats.decoder.dropped).arg(stats.decoder.errors);
             if (stats.network.decryptFailures != 0)
                 lines << tr("Decrypt failures: %1").arg(stats.network.decryptFailures);
+            lines << tr("Drawing: %1").arg(drawingName(it->surface));
         } else if (!it->stream && it->camera && video) {
             const Core::Media::VideoDecoder::Stats stats = video->decoderStats(it->userId);
             if (!stats.decoderName.isEmpty()) {
@@ -512,6 +520,7 @@ void CallWindow::refreshStats()
                 lines << tr("Resolution: %1x%2").arg(stats.width).arg(stats.height);
                 lines << tr("Decode time: %1 ms").arg(stats.averageDecodeMs, 0, 'f', 2);
                 lines << tr("Frames: %1 decoded, %2 dropped, %3 errors").arg(stats.decoded).arg(stats.dropped).arg(stats.errors);
+                lines << tr("Drawing: %1").arg(drawingName(it->surface));
             }
         }
         it->surface->setStatsText(lines.join(QLatin1Char('\n')));

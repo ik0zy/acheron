@@ -137,8 +137,8 @@ public:
 
 struct Chain
 {
-    explicit Chain(VideoCodec codec)
-        : codec(codec), receiver(SSRC, codec), sink(std::make_shared<CountingSink>())
+    explicit Chain(VideoCodec codec, bool allowHardware = false)
+        : codec(codec), receiver(SSRC, codec), sink(std::make_shared<CountingSink>()), decoder(allowHardware)
     {
         decoder.setSink(sink);
         decoder.setKeyframeRequester([this] { keyframeRequests++; });
@@ -201,6 +201,8 @@ private slots:
     void everyFrameDecodes();
     void lossSkipsToTheNextKeyframe_data() { codecCases(); }
     void lossSkipsToTheNextKeyframe();
+    void hardwareDecodesOrGivesWayToSoftware_data() { codecCases(); }
+    void hardwareDecodesOrGivesWayToSoftware();
 
 private:
     static void codecCases();
@@ -306,6 +308,43 @@ void TestVideoDecode::lossSkipsToTheNextKeyframe()
     QCOMPARE(chain.decoder.stats().errors, quint64(0));
     QCOMPARE(chain.keyframeRequests.load(), 0);
     QCOMPARE(shown, expected);
+}
+
+void TestVideoDecode::hardwareDecodesOrGivesWayToSoftware()
+{
+    QFETCH(CodecCase, codecCase);
+    if (!Core::Media::decodableVideoCodecs().contains(codecCase.codec))
+        QSKIP("this ffmpeg cannot decode the codec");
+    // Twice over, so that a stream the graphics card turns down is seen to restart in software.
+    std::vector<EncodedFrame> clip = encodeClip(codecCase);
+    if (clip.empty())
+        QSKIP("this ffmpeg has no encoder for the codec");
+    const size_t once = clip.size();
+    for (size_t i = 0; i < once; i++) {
+        EncodedFrame again = clip[i];
+        again.timestamp += static_cast<uint32_t>(once) * 3000;
+        clip.push_back(std::move(again));
+    }
+
+    Chain chain(codecCase.codec, true);
+    for (const EncodedFrame &frame : clip)
+        chain.send(codecCase, frame);
+    chain.waitForDecoded(static_cast<int>(clip.size()));
+
+    const Core::Media::VideoDecoder::Stats stats = chain.decoder.stats();
+    qInfo() << "decoder:" << stats.decoderName << "decoded" << stats.decoded << "errors" << stats.errors;
+    QVERIFY(!stats.decoderName.isEmpty());
+    QCOMPARE(chain.sink->width.load(), WIDTH);
+    QCOMPARE(chain.sink->height.load(), HEIGHT);
+    if (stats.hardware) {
+        // The graphics card took it: nothing may have gone wrong on the way.
+        QCOMPARE(stats.errors, quint64(0));
+        QCOMPARE(chain.sink->frames.load(), static_cast<int>(clip.size()));
+    } else {
+        // Software, either from the start or after the hardware gave up early on.
+        QVERIFY(stats.errors <= 1);
+        QVERIFY(chain.sink->frames.load() >= FRAME_COUNT);
+    }
 }
 
 QTEST_GUILESS_MAIN(TestVideoDecode)

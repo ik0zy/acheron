@@ -228,9 +228,11 @@ void CallVideo::replan()
             const quint64 key = static_cast<quint64>(it.key());
             if (decoders.count(key))
                 continue;
-            auto decoder = std::make_shared<Media::VideoDecoder>();
+            // A camera is at most 720p, which one thread decodes with room to spare.
+            auto decoder = std::make_shared<Media::VideoDecoder>(Media::hardwareDecodingEnabled(), 1);
             decoder->setSink(tiles.value(it.key()).sink);
             decoder->setKeyframeRequester([target = client] { QMetaObject::invokeMethod(target, &VoiceClient::requestVideoKeyframe); });
+            decoder->setCodecFailureHandler([target = client](Discord::Voice::VideoCodec codec) { QMetaObject::invokeMethod(target, [target, codec] { target->withdrawVideoCodec(codec); }); });
             decoders.emplace(key, std::move(decoder));
         }
     }

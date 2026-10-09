@@ -77,6 +77,13 @@ find_package(Qt${QT_VERSION_MAJOR}
         LinguistTools
 )
 find_package(Qt${QT_VERSION_MAJOR} COMPONENTS ZlibPrivate QUIET)
+# The video surface draws through OpenGL where it can. Qt 6 keeps that in modules of its own;
+# in Qt 5 it is part of Gui and Widgets.
+set(QT_OPENGL_LIBRARIES "")
+if(QT_VERSION_MAJOR GREATER_EQUAL 6)
+    find_package(Qt6 REQUIRED COMPONENTS OpenGL OpenGLWidgets)
+    set(QT_OPENGL_LIBRARIES Qt6::OpenGL Qt6::OpenGLWidgets)
+endif()
 qt_standard_project_setup(I18N_TRANSLATED_LANGUAGES en)
 
 # If Qt::ZlibPrivate is not available, create a QtZlib compatibility include
@@ -345,6 +352,7 @@ if(ENABLE_VOICE)
         src/Discord/Voice/VideoReceiver.cpp
         src/Discord/Voice/Rtcp.cpp
         src/Discord/Voice/SinkWants.cpp
+        src/Discord/Voice/TransportFeedback.cpp
         src/Core/Audio/VoiceManager.cpp
         src/Core/Audio/VoiceConnection.cpp
         src/Core/Audio/AudioPipeline.cpp
@@ -369,6 +377,9 @@ if(ENABLE_VOICE AND TARGET ffmpeg)
         src/UI/Video/VideoSurface.cpp
         src/UI/CallWindow.cpp
     )
+    if(WIN32)
+        list(APPEND PROJECT_SOURCES src/UI/Video/D3D11GlBridge.cpp)
+    endif()
 endif()
 
 if(ENABLE_VOICE OR TARGET ffmpeg)
@@ -476,7 +487,7 @@ if(BUILD_TESTS)
         if(TARGET ffmpeg)
             qt_add_executable(TestRtpVideo tests/tst_RtpVideo.cpp src/Discord/Voice/RtpPacket.cpp
                 src/Discord/Voice/VideoDepacketizer.cpp src/Discord/Voice/VideoReceiver.cpp
-                src/Discord/Voice/Rtcp.cpp)
+                src/Discord/Voice/Rtcp.cpp src/Discord/Voice/TransportFeedback.cpp)
             target_link_libraries(TestRtpVideo PRIVATE Qt::Core Qt::Test ffmpeg libdave MLSPP::mlspp)
             target_include_directories(TestRtpVideo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
             add_test(NAME RtpVideoTests COMMAND TestRtpVideo)
@@ -490,7 +501,10 @@ if(BUILD_TESTS)
             add_test(NAME VideoDecodeTests COMMAND TestVideoDecode)
 
             qt_add_executable(TestVideoSurface tests/tst_VideoSurface.cpp src/UI/Video/VideoSurface.cpp)
-            target_link_libraries(TestVideoSurface PRIVATE Qt::Core Qt::Gui Qt::Widgets Qt::Network Qt::Test ffmpeg)
+            if(WIN32)
+                target_sources(TestVideoSurface PRIVATE src/UI/Video/D3D11GlBridge.cpp)
+            endif()
+            target_link_libraries(TestVideoSurface PRIVATE Qt::Core Qt::Gui Qt::Widgets Qt::Network Qt::Test ffmpeg ${QT_OPENGL_LIBRARIES})
             target_include_directories(TestVideoSurface PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
             add_test(NAME VideoSurfaceTests COMMAND TestVideoSurface)
         endif()
@@ -621,6 +635,7 @@ if(TARGET ffmpeg)
 endif()
 if(ENABLE_VOICE AND TARGET ffmpeg)
     target_compile_definitions(${PROJECT_NAME} PRIVATE ACHERON_HAVE_STREAM_VIEW)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${QT_OPENGL_LIBRARIES})
 endif()
 if(TARGET lottie)
     target_link_libraries(${PROJECT_NAME} PRIVATE lottie)

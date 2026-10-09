@@ -3,14 +3,19 @@
 #include "Core/Logging.hpp"
 
 #include <QElapsedTimer>
+#include <QSettings>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <map>
 #include <span>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 }
 
 namespace Acheron {
@@ -20,6 +25,28 @@ namespace Media {
 namespace {
 
 using Discord::Voice::VideoCodec;
+
+const char *const HARDWARE_DECODE_KEY = "video/hardware_decode";
+
+// Hardware devices in the order they are tried. Direct3D 11 does not decode video before
+// Windows 8, which is what DXVA2 is there for.
+#if defined(Q_OS_WIN)
+constexpr std::array HARDWARE_DEVICES = { AV_HWDEVICE_TYPE_D3D11VA, AV_HWDEVICE_TYPE_DXVA2 };
+#elif defined(Q_OS_MACOS)
+constexpr std::array HARDWARE_DEVICES = { AV_HWDEVICE_TYPE_VIDEOTOOLBOX };
+#else
+constexpr std::array HARDWARE_DEVICES = { AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_CUDA };
+#endif
+
+// How often each codec's hardware decoder has failed to get going. After a second time, later
+// decoders do not try it; once could have been a damaged stream.
+constexpr int HARDWARE_FAILURES_TOLERATED = 1;
+std::array<std::atomic<int>, 5> hardwareFailures = {};
+
+std::atomic<int> &hardwareFailuresOf(VideoCodec codec)
+{
+    return hardwareFailures[static_cast<size_t>(codec)];
+}
 
 // ffmpeg's own AV1 decoder only works through a hardware accelerator, so software decoding
 // needs one of the wrapped libraries.
@@ -55,7 +82,52 @@ const AVCodec *findSoftwareDecoder(VideoCodec codec)
     return nullptr;
 }
 
-AVCodecContext *openDecoder(const AVCodec *decoder)
+// The decoders that can be handed a hardware device are ffmpeg's own.
+const AVCodec *findHardwareCapableDecoder(VideoCodec codec)
+{
+    switch (codec) {
+    case VideoCodec::AV1:
+        return avcodec_find_decoder_by_name("av1");
+    case VideoCodec::H265:
+        return avcodec_find_decoder_by_name("hevc");
+    case VideoCodec::H264:
+        return avcodec_find_decoder_by_name("h264");
+    case VideoCodec::VP8:
+        return avcodec_find_decoder_by_name("vp8");
+    case VideoCodec::Unknown:
+        break;
+    }
+    return nullptr;
+}
+
+AVPixelFormat hardwareFormat(const AVCodec *decoder, AVHWDeviceType type)
+{
+    for (int i = 0;; i++) {
+        const AVCodecHWConfig *config = avcodec_get_hw_config(decoder, i);
+        if (!config)
+            return AV_PIX_FMT_NONE;
+        if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) && config->device_type == type)
+            return config->pix_fmt;
+    }
+}
+
+// Takes the hardware format when the decoder offers it for this stream, and otherwise the
+// first software one, which the caller notices and answers by reopening in software.
+AVPixelFormat chooseFormat(AVCodecContext *context, const AVPixelFormat *formats)
+{
+    const int wanted = *static_cast<const int *>(context->opaque);
+    const AVPixelFormat *software = nullptr;
+    for (const AVPixelFormat *format = formats; *format != AV_PIX_FMT_NONE; format++) {
+        if (*format == wanted)
+            return *format;
+        const AVPixFmtDescriptor *description = av_pix_fmt_desc_get(*format);
+        if (!software && description && !(description->flags & AV_PIX_FMT_FLAG_HWACCEL))
+            software = format;
+    }
+    return software ? *software : AV_PIX_FMT_NONE;
+}
+
+AVCodecContext *openSoftwareDecoder(const AVCodec *decoder, int threads = 1)
 {
     AVCodecContext *context = avcodec_alloc_context3(decoder);
     if (!context)
@@ -64,7 +136,7 @@ AVCodecContext *openDecoder(const AVCodec *decoder)
     // Frame threading holds back one frame per thread, which a live stream cannot afford.
     context->flags |= AV_CODEC_FLAG_LOW_DELAY;
     context->thread_type = FF_THREAD_SLICE;
-    context->thread_count = static_cast<int>(std::clamp(std::thread::hardware_concurrency(), 1u, 4u));
+    context->thread_count = std::clamp(threads, 1, static_cast<int>(std::max(1u, std::thread::hardware_concurrency())));
     av_opt_set_int(context, "max_frame_delay", 1, AV_OPT_SEARCH_CHILDREN);
 
     if (avcodec_open2(context, decoder, nullptr) < 0) {
@@ -74,19 +146,83 @@ AVCodecContext *openDecoder(const AVCodec *decoder)
     return context;
 }
 
+bool softwareDecoderOpens(VideoCodec codec)
+{
+    const AVCodec *decoder = findSoftwareDecoder(codec);
+    AVCodecContext *context = decoder ? openSoftwareDecoder(decoder) : nullptr;
+    if (!context)
+        return false;
+    avcodec_free_context(&context);
+    return true;
+}
+
+// One device of each kind serves every decoder: a device of its own for each would cost
+// graphics memory per stream and a noticeable pause whenever a stream starts. Returns a new
+// reference, or null when the machine has no such device.
+AVBufferRef *sharedHardwareDevice(AVHWDeviceType type)
+{
+    struct Devices
+    {
+        ~Devices()
+        {
+            for (auto &[kind, device] : byType)
+                av_buffer_unref(&device);
+        }
+        std::mutex mutex;
+        std::map<AVHWDeviceType, AVBufferRef *> byType;
+    };
+    static Devices devices;
+
+    std::lock_guard lock(devices.mutex);
+    auto it = devices.byType.find(type);
+    if (it == devices.byType.end()) {
+        AVBufferRef *device = nullptr;
+        if (av_hwdevice_ctx_create(&device, type, nullptr, nullptr, 0) < 0)
+            device = nullptr;
+        it = devices.byType.emplace(type, device).first;
+    }
+    return it->second ? av_buffer_ref(it->second) : nullptr;
+}
+
+// Whether some hardware device on this machine says it decodes the codec. It may still turn
+// a particular stream down.
+bool hardwareDecoderExists(VideoCodec codec)
+{
+    const AVCodec *decoder = findHardwareCapableDecoder(codec);
+    if (!decoder)
+        return false;
+
+    for (const AVHWDeviceType type : HARDWARE_DEVICES) {
+        if (hardwareFormat(decoder, type) == AV_PIX_FMT_NONE)
+            continue;
+        AVBufferRef *device = sharedHardwareDevice(type);
+        if (!device)
+            continue;
+        av_buffer_unref(&device);
+        return true;
+    }
+    return false;
+}
+
 } // namespace
+
+bool hardwareDecodingEnabled()
+{
+    return QSettings().value(HARDWARE_DECODE_KEY, true).toBool();
+}
+
+void setHardwareDecodingEnabled(bool enabled)
+{
+    QSettings().setValue(HARDWARE_DECODE_KEY, enabled);
+}
 
 QList<Discord::Voice::VideoCodec> decodableVideoCodecs()
 {
     static const QList<VideoCodec> codecs = [] {
         QList<VideoCodec> found;
         for (VideoCodec codec : { VideoCodec::AV1, VideoCodec::H265, VideoCodec::H264, VideoCodec::VP8 }) {
-            const AVCodec *decoder = findSoftwareDecoder(codec);
-            AVCodecContext *context = decoder ? openDecoder(decoder) : nullptr;
-            if (!context)
-                continue;
-            avcodec_free_context(&context);
-            found.append(codec);
+            if (softwareDecoderOpens(codec) || (hardwareDecodingEnabled() && hardwareDecoderExists(codec)))
+                found.append(codec);
         }
         return found;
     }();
@@ -113,8 +249,8 @@ QList<Discord::Voice::Codec> offeredVideoCodecs()
     return offered;
 }
 
-VideoDecoder::VideoDecoder()
-    : thread([this] { run(); })
+VideoDecoder::VideoDecoder(bool allowHardware, int softwareThreads)
+    : hardwareAllowed(allowHardware), softwareThreads(softwareThreads), thread([this] { run(); })
 {
 }
 
@@ -138,6 +274,12 @@ void VideoDecoder::setKeyframeRequester(std::function<void()> requester)
 {
     std::lock_guard lock(mutex);
     keyframeRequester = std::move(requester);
+}
+
+void VideoDecoder::setCodecFailureHandler(std::function<void(Discord::Voice::VideoCodec)> handler)
+{
+    std::lock_guard lock(mutex);
+    codecFailureHandler = std::move(handler);
 }
 
 VideoDecoder::Stats VideoDecoder::stats() const
@@ -170,6 +312,7 @@ void VideoDecoder::push(Discord::Voice::VideoCodec codec, Discord::Voice::Encode
 void VideoDecoder::run()
 {
     decoded = av_frame_alloc();
+    downloaded = av_frame_alloc();
 
     for (;;) {
         Queued queued;
@@ -186,37 +329,105 @@ void VideoDecoder::run()
 
     close();
     av_frame_free(&decoded);
+    av_frame_free(&downloaded);
 }
 
 bool VideoDecoder::open(Discord::Voice::VideoCodec codec)
 {
     close();
 
-    const AVCodec *decoder = findSoftwareDecoder(codec);
-    context = decoder ? openDecoder(decoder) : nullptr;
-    if (!context) {
+    const bool tryHardware = hardwareAllowed && !hardwareRuledOut && hardwareFailuresOf(codec) <= HARDWARE_FAILURES_TOLERATED;
+    if (!(tryHardware && openHardware(codec)) && !openSoftware(codec)) {
         qCWarning(LogVideo) << "No decoder could be opened for" << Discord::Voice::videoCodecName(codec);
         return false;
     }
 
     openCodec = codec;
     awaitingKeyframe = true;
-
-    std::lock_guard lock(mutex);
-    counters.decoderName = QString::fromUtf8(decoder->name);
+    framesSinceOpen = 0;
+    describeDecoder();
     return true;
+}
+
+bool VideoDecoder::openHardware(Discord::Voice::VideoCodec codec)
+{
+    const AVCodec *decoder = findHardwareCapableDecoder(codec);
+    if (!decoder)
+        return false;
+
+    for (const AVHWDeviceType type : HARDWARE_DEVICES) {
+        const AVPixelFormat format = hardwareFormat(decoder, type);
+        if (format == AV_PIX_FMT_NONE)
+            continue;
+
+        AVBufferRef *device = sharedHardwareDevice(type);
+        if (!device)
+            continue;
+
+        AVCodecContext *candidate = avcodec_alloc_context3(decoder);
+        hardwarePixelFormat = format;
+        candidate->opaque = &hardwarePixelFormat;
+        candidate->get_format = chooseFormat;
+        candidate->hw_device_ctx = av_buffer_ref(device);
+        candidate->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        candidate->thread_count = 1;
+        candidate->extra_hw_frames = EXTRA_HARDWARE_FRAMES;
+        if (avcodec_open2(candidate, decoder, nullptr) < 0) {
+            avcodec_free_context(&candidate);
+            av_buffer_unref(&device);
+            continue;
+        }
+
+        context = candidate;
+        hardwareDevice = device;
+        hardwareName = av_hwdevice_get_type_name(type);
+        return true;
+    }
+
+    hardwarePixelFormat = -1;
+    return false;
+}
+
+bool VideoDecoder::openSoftware(Discord::Voice::VideoCodec codec)
+{
+    const AVCodec *decoder = findSoftwareDecoder(codec);
+    context = decoder ? openSoftwareDecoder(decoder, softwareThreads) : nullptr;
+    return context != nullptr;
 }
 
 void VideoDecoder::close()
 {
     avcodec_free_context(&context);
+    av_buffer_unref(&hardwareDevice);
+    hardwarePixelFormat = -1;
+    hardwareName = nullptr;
     openCodec = Discord::Voice::VideoCodec::Unknown;
+}
+
+void VideoDecoder::describeDecoder()
+{
+    QString name = context ? QString::fromUtf8(context->codec->name) : QString();
+    if (hardwareDevice && hardwareName)
+        name += QStringLiteral(" (%1)").arg(QString::fromUtf8(hardwareName));
+
+    std::lock_guard lock(mutex);
+    counters.decoderName = name;
+    counters.hardware = hardwareDevice != nullptr;
 }
 
 void VideoDecoder::fail()
 {
-    if (context)
+    // A hardware decoder that cannot get going is not tried again here; one that has been
+    // working is only resynchronised.
+    if (hardwareDevice && framesSinceOpen < HARDWARE_TRIAL_FRAMES) {
+        const Discord::Voice::VideoCodec codec = openCodec;
+        qCWarning(LogVideo) << "Hardware decoding of" << Discord::Voice::videoCodecName(codec) << "through" << hardwareName << "failed; using software";
+        hardwareRuledOut = true;
+        hardwareFailuresOf(codec)++;
+        open(codec);
+    } else if (context) {
         avcodec_flush_buffers(context);
+    }
     awaitingKeyframe = true;
 
     std::function<void()> requester;
@@ -231,8 +442,16 @@ void VideoDecoder::fail()
 
 void VideoDecoder::decode(Queued &queued)
 {
-    if (queued.codec != openCodec && !open(queued.codec))
+    if (queued.codec != openCodec && !open(queued.codec)) {
+        std::function<void(Discord::Voice::VideoCodec)> handler;
+        {
+            std::lock_guard lock(mutex);
+            handler = codecFailureHandler;
+        }
+        if (handler)
+            handler(queued.codec);
         return;
+    }
 
     if (awaitingKeyframe && !queued.frame.keyframe) {
         std::lock_guard lock(mutex);
@@ -277,14 +496,36 @@ void VideoDecoder::decode(Queued &queued)
             return;
         }
 
+        const AVFrame *output = decoded;
+        if (hardwareDevice) {
+            // A decoder that turned the hardware format down for this stream is decoding in
+            // software with none of a software decoder's threads, so it is replaced.
+            bool failed = decoded->format != hardwarePixelFormat;
+            // The picture is on the graphics card. It is brought into memory unless whoever
+            // shows it can take it from there.
+            if (!failed && !(sink && sink->acceptsHardwareFrames(decoded->format))) {
+                av_frame_unref(downloaded);
+                failed = av_hwframe_transfer_data(downloaded, decoded, 0) < 0;
+                av_frame_copy_props(downloaded, decoded);
+                output = downloaded;
+            }
+            if (failed) {
+                av_frame_unref(decoded);
+                framesSinceOpen = 0;
+                fail();
+                return;
+            }
+        }
+
         if (sink)
-            sink->present(decoded);
+            sink->present(output);
+        framesSinceOpen++;
 
         {
             std::lock_guard lock(mutex);
             counters.decoded++;
-            counters.width = decoded->width;
-            counters.height = decoded->height;
+            counters.width = output->width;
+            counters.height = output->height;
             const double elapsedMs = static_cast<double>(timer.nsecsElapsed()) / 1e6;
             counters.averageDecodeMs += (elapsedMs - counters.averageDecodeMs) / 30.0;
         }

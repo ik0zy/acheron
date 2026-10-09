@@ -1,7 +1,12 @@
 #include "AudioPage.hpp"
 
 #include "Core/Audio/AudioBackends.hpp"
+#ifdef ACHERON_HAVE_STREAM_VIEW
+#include "Core/Media/VideoDecoder.hpp"
+#include "UI/Video/VideoSurface.hpp"
+#endif
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -37,6 +42,24 @@ AudioPage::AudioPage(QWidget *parent)
         noteFont.setPointSize(noteFont.pointSize() - 1);
     note->setFont(noteFont);
     layout->addWidget(note);
+
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    // Both fall back by themselves when the machine cannot do it; these are for turning them
+    // off when it can but should not.
+    auto *hardwareDecode = new QCheckBox(tr("Decode video with the graphics card"), this);
+    hardwareDecode->setChecked(Core::Media::hardwareDecodingEnabled());
+    layout->addWidget(hardwareDecode);
+    connect(hardwareDecode, &QCheckBox::toggled, this, [](bool enabled) { Core::Media::setHardwareDecodingEnabled(enabled); });
+
+    auto *gpuDrawing = new QCheckBox(tr("Draw video with the graphics card"), this);
+    gpuDrawing->setChecked(VideoSurface::gpuDrawingEnabled());
+    layout->addWidget(gpuDrawing);
+    connect(gpuDrawing, &QCheckBox::toggled, this, [](bool enabled) { VideoSurface::setGpuDrawingEnabled(enabled); });
+
+    auto *videoNote = new QLabel(tr("Video settings apply to streams and cameras opened afterwards."), this);
+    videoNote->setFont(noteFont);
+    layout->addWidget(videoNote);
+#endif
 
     layout->addStretch(1);
 

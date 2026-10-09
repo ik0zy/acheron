@@ -508,6 +508,32 @@ bool startsKeyframe(VideoCodec codec, std::span<const uint8_t> payload)
     return false;
 }
 
+bool startsWithParameterSets(VideoCodec codec, std::span<const uint8_t> payload)
+{
+    switch (codec) {
+    case VideoCodec::H264: {
+        if (payload.empty())
+            return false;
+        const uint8_t type = payload[0] & H264_TYPE_MASK;
+        // An aggregate that reached startsKeyframe() by way of its parameter sets counts too.
+        return type == H264_SPS || (type == H264_STAP_A && h264StartsKeyframe(payload));
+    }
+    case VideoCodec::H265: {
+        if (payload.size() < 3)
+            return false;
+        const uint8_t type = h265Type(payload[0]);
+        return type == H265_VPS || type == H265_SPS || (type == H265_AP && h265StartsKeyframe(payload));
+    }
+    case VideoCodec::VP8:
+    case VideoCodec::AV1:
+        // These formats mark the first packet of a key frame itself.
+        return startsKeyframe(codec, payload);
+    case VideoCodec::Unknown:
+        break;
+    }
+    return false;
+}
+
 bool assembleFrame(VideoCodec codec, std::span<const std::span<const uint8_t>> payloads, std::vector<uint8_t> &frame)
 {
     frame.clear();

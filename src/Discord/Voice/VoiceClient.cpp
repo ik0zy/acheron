@@ -195,6 +195,7 @@ void VoiceClient::cleanupTransport()
     remoteLayers.clear();
     deliveredSsrcs.clear();
     sentVideoWants.clear();
+    transportFeedback = TransportFeedback();
 
     encryption.reset();
 
@@ -438,6 +439,13 @@ void VoiceClient::receiveVideo(const ParsedRtp &rtp, PacketPool::Handle packet, 
     packet->dropFront(rtp.clearSize);
     if (packet->size() < rtp.extensionSize)
         return;
+    // Every packet the server numbered is reported back to it, wanted or not, since the
+    // numbering is about the connection and not about any one stream.
+    const std::span<const uint8_t> transportSequence = findRtpExtension(packet->bytes().first(static_cast<size_t>(rtp.extensionSize)), TRANSPORT_SEQUENCE_EXTENSION);
+    if (transportSequence.size() == 2) {
+        transportFeedback.onPacket(qFromBigEndian<uint16_t>(transportSequence.data()), videoClock.nsecsElapsed() / 1000);
+        transportMediaSsrc = header.ssrc;
+    }
     packet->dropFront(rtp.extensionSize);
 
     if (header.padding) {
@@ -677,6 +685,24 @@ void VoiceClient::requestVideoKeyframe()
     }
 }
 
+void VoiceClient::withdrawVideoCodec(VideoCodec codec)
+{
+    bool changed = false;
+    for (Codec &offered : params.videoCodecs) {
+        if (videoCodecFromName(offered.name) != codec || !offered.decode.valueOr(false))
+            continue;
+        offered.decode = false;
+        changed = true;
+    }
+    if (!changed || !gateway || currentState != State::Connected)
+        return;
+
+    qCWarning(LogVoice) << "Withdrawing" << videoCodecName(codec) << "from the codecs this client decodes";
+    QList<Codec> codecs = { Codec::opus() };
+    codecs.append(params.videoCodecs);
+    gateway->sendSessionUpdate(codecs);
+}
+
 void VoiceClient::startVideoTimer()
 {
     if (!videoClock.isValid())
@@ -732,7 +758,8 @@ void VoiceClient::onVideoTick()
         stats.lossFraction = std::max(stats.lossFraction, report.fractionLost / 256.0);
     }
 
-    if (pending.empty() && reports.empty()) {
+    const bool transportDue = transportFeedback.hasPending() && now - transportReportedMs >= TRANSPORT_FEEDBACK_INTERVAL_MS;
+    if (pending.empty() && reports.empty() && !transportDue) {
         if (reportDue)
             videoReportedMs = now;
         return;
@@ -744,6 +771,17 @@ void VoiceClient::onVideoTick()
     int size = writeReceiverReport(packet->bytes(), localSsrc, reports);
     if (size < 0)
         return;
+    if (transportDue) {
+        transportReportedMs = now;
+        // One packet covers a bounded span; after a long gap it takes more than one.
+        for (int i = 0; i < 4 && transportFeedback.hasPending(); i++) {
+            const int written = transportFeedback.write(packet->bytes().subspan(static_cast<size_t>(size)), localSsrc, transportMediaSsrc);
+            if (written <= 0)
+                break;
+            size += written;
+        }
+    }
+
     for (const Pending &entry : pending) {
         if (!entry.feedback.nacks.empty()) {
             const int written = writeNack(packet->bytes().subspan(static_cast<size_t>(size)), localSsrc, entry.ssrc, entry.feedback.nacks);

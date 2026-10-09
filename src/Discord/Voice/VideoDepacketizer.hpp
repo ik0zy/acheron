@@ -27,6 +27,10 @@ enum class VideoCodec {
 // such as an access unit delimiter, ahead of it.
 [[nodiscard]] bool startsKeyframe(VideoCodec codec, std::span<const uint8_t> payload);
 
+// Whether such a payload begins with the key frame's parameter sets, as opposed to its picture.
+// A packet that only starts the picture may have had parameter sets in packets before it.
+[[nodiscard]] bool startsWithParameterSets(VideoCodec codec, std::span<const uint8_t> payload);
+
 // A one-line account of an assembled frame for the log: its units, and the end-to-end
 // encryption trailer if it has one.
 [[nodiscard]] QString describeFrame(VideoCodec codec, std::span<const uint8_t> frame);

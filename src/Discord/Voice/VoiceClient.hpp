@@ -20,6 +20,7 @@
 #include "PacketBuffer.hpp"
 #include "RtpPacket.hpp"
 #include "SinkWants.hpp"
+#include "TransportFeedback.hpp"
 #include "VideoReceiver.hpp"
 #include "VoiceEnums.hpp"
 #include "VoiceEntities.hpp"
@@ -100,6 +101,10 @@ public:
 
     // A frame handed out could not be decoded; ask every sender to start over.
     void requestVideoKeyframe();
+
+    // No decoder here can handle the codec after all: tell the server, so that it has senders
+    // use another.
+    void withdrawVideoCodec(VideoCodec codec);
 
 signals:
     void stateChanged(State newState);
@@ -225,9 +230,18 @@ private:
     QByteArray sentVideoWants;
     quint64 videoDecryptFailures = 0;
 
+    // Which packets arrived and when, for the server's estimate of what this connection can
+    // carry. Without it the server holds every stream at a low bitrate.
+    TransportFeedback transportFeedback;
+    qint64 transportReportedMs = 0;
+    quint32 transportMediaSsrc = 0;
+
     static constexpr int KEEPALIVE_INTERVAL_MS = 10000;
     static constexpr int VIDEO_TICK_MS = 20;
     static constexpr int VIDEO_REPORT_INTERVAL_MS = 1000;
+    static constexpr int TRANSPORT_FEEDBACK_INTERVAL_MS = 100;
+    // The header extension that carries a packet's transport-wide sequence number.
+    static constexpr uint8_t TRANSPORT_SEQUENCE_EXTENSION = 5;
 };
 
 } // namespace Voice

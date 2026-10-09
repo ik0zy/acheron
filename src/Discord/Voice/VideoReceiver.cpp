@@ -85,13 +85,19 @@ void VideoReceiver::insert(uint16_t sequence, uint32_t timestamp, bool marker, P
         counters.retransmitted++;
     }
 
-    if (keyframeWanted && startsKeyframe(videoCodec, payload->bytes())) {
+    // The frame begins at its first packet, which may come before this one: senders put
+    // delimiters and the like ahead of the parameter sets.
+    qint64 frameStart = unwrapped;
+    for (auto earlier = held.find(frameStart - 1); earlier != held.end() && earlier->second.timestamp == timestamp; earlier = held.find(frameStart - 1))
+        frameStart--;
+    // A packet that starts the picture but brings no parameter sets is only taken as the
+    // start when the packet before it is here to show that nothing of the frame was missed.
+    // Right after subscribing, the parameter sets may have gone by already.
+    const bool startKnown = startsWithParameterSets(videoCodec, payload->bytes()) || held.count(frameStart - 1);
+
+    if (keyframeWanted && startKnown && startsKeyframe(videoCodec, payload->bytes())) {
         keyframeWanted = false;
-        // The frame begins at its first packet, which may come before this one: senders put
-        // delimiters and the like ahead of the parameter sets.
-        nextSequence = unwrapped;
-        for (auto earlier = held.find(nextSequence - 1); earlier != held.end() && earlier->second.timestamp == timestamp; earlier = held.find(nextSequence - 1))
-            nextSequence--;
+        nextSequence = frameStart;
         held.erase(held.begin(), held.lower_bound(nextSequence));
         // Losses were not tracked while waiting, so note what is absent behind this packet.
         missing.clear();
