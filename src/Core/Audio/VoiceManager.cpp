@@ -3,6 +3,10 @@
 #include "VoiceConnection.hpp"
 
 #include "Core/Logging.hpp"
+#ifdef ACHERON_HAVE_STREAM_VIEW
+#include "Core/Media/VideoDecoder.hpp"
+#include "Core/Video/CallVideo.hpp"
+#endif
 
 #ifdef Q_OS_WIN
 #include <objbase.h>
@@ -15,6 +19,9 @@ namespace Audio {
 VoiceManager::VoiceManager(Snowflake accountId, const ProxyConfig &proxy, QObject *parent)
     : QObject(parent), accountId(accountId), proxy(proxy)
 {
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    callVideo = new CallVideo(this);
+#endif
 }
 
 VoiceManager::~VoiceManager()
@@ -535,9 +542,25 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
     params.userId = accountId;
     params.sessionId = voiceSessionId;
     params.proxy = proxy;
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    // Declares what the official client declares for a camera, though nothing is sent yet:
+    // without it the server does not forward other people's video.
+    params.video = true;
+    for (const int quality : { 100, 50 }) {
+        Discord::Voice::StreamDescription layer;
+        layer.type = QStringLiteral("video");
+        layer.rid = QString::number(quality);
+        layer.quality = quality;
+        params.streams.append(layer);
+    }
+    params.videoCodecs = Media::offeredVideoCodecs();
+#endif
 
     voiceConnection = new VoiceConnection(params, this);
     voiceClient = voiceConnection->client();
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    callVideo->attach(voiceClient);
+#endif
     audioPipeline = new AudioPipeline;
 
 #ifdef Q_OS_WIN
@@ -697,6 +720,10 @@ void VoiceManager::stopVoiceThread()
         emit participantsCleared();
 
     voiceConnection->stop([ap = audioPipeline]() { ap->stop(); });
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    // Only now can no more frames arrive for its decoders.
+    callVideo->detach();
+#endif
 
     delete audioPipeline;
     audioPipeline = nullptr;

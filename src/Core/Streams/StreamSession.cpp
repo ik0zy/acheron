@@ -129,6 +129,7 @@ void StreamSession::connectRtc()
     params.streams = { screen };
     params.videoCodecs = Media::offeredVideoCodecs();
     params.sendsAudio = false;
+    params.streamContext = true;
 
     connection = new Audio::VoiceConnection(params, this);
     VoiceClient *client = connection->client();

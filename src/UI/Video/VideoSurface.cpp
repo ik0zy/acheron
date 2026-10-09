@@ -210,6 +210,14 @@ void VideoSurface::setStatsText(const QString &text)
     update();
 }
 
+void VideoSurface::setCaption(const QString &text)
+{
+    if (text == captionText)
+        return;
+    captionText = text;
+    update();
+}
+
 void VideoSurface::clear()
 {
     frameSink->forget();
@@ -293,6 +301,14 @@ void VideoSurface::paintEvent(QPaintEvent *)
         painter.setFont(font());
         const QRect detailArea = rect().adjusted(16, rect().height() / 2 + 6, -16, 0);
         painter.drawText(detailArea, Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap, messageDetail);
+    }
+
+    if (!captionText.isEmpty()) {
+        painter.setFont(font());
+        const QRect bounds = painter.boundingRect(rect().adjusted(8, 8, -8, -8), Qt::AlignLeft | Qt::AlignBottom, captionText);
+        painter.fillRect(bounds.adjusted(-4, -2, 4, 2), QColor(0, 0, 0, 170));
+        painter.setPen(Qt::white);
+        painter.drawText(bounds, Qt::AlignLeft | Qt::AlignBottom, captionText);
     }
 
     if (!statsText.isEmpty()) {

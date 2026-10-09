@@ -51,6 +51,7 @@ VoiceClient::VoiceClient(const ConnectionParams &params, QObject *parent)
     : QObject(parent), params(params)
 {
     qRegisterMetaType<VideoReceiveStats>();
+    qRegisterMetaType<QList<VideoLayer>>();
 
     for (const Codec &codec : params.videoCodecs) {
         const VideoCodec known = videoCodecFromName(codec.name);
@@ -191,6 +192,8 @@ void VoiceClient::cleanupTransport()
     // The receivers hold packets from the transport's pool.
     remoteVideos.clear();
     rtxToPrimary.clear();
+    remoteLayers.clear();
+    deliveredSsrcs.clear();
     sentVideoWants.clear();
 
     encryption.reset();
@@ -462,6 +465,8 @@ void VoiceClient::receiveVideo(const ParsedRtp &rtp, PacketPool::Handle packet, 
         unrouted.rtp++;
         return;
     }
+    if (!deliveredSsrcs.contains(ssrc))
+        return;
 
     RemoteVideo &video = it->second;
     if (!video.receiver || video.receiver->codec() != codec)
@@ -523,53 +528,71 @@ void VoiceClient::applyRemoteVideo(const ClientConnectData &data)
     if (!userId.isValid() || userId == params.userId)
         return;
 
-    quint32 ssrc = 0;
-    quint32 rtxSsrc = 0;
+    // A user's video is on while the announcement names a video SSRC; each entry of `streams`
+    // is then one encoding of it. An announcement with no entries means a single encoding.
+    QList<VideoLayer> layers;
+    QList<VideoLayer> flaggedInactive;
     int maxWidth = 0;
     int maxHeight = 0;
     int maxFramerate = 0;
     if (data.videoSsrc.get() != 0) {
-        // The sender lists its layers; the first active one is the one to take.
         if (data.streams.hasValue()) {
             for (const StreamDescription &stream : data.streams.get()) {
-                if (!stream.ssrc.hasValue() || stream.ssrc.get() == 0 || !stream.active.valueOr(true))
+                if (!stream.ssrc.hasValue() || stream.ssrc.get() == 0)
                     continue;
-                ssrc = stream.ssrc.get();
-                if (stream.rtxSsrc.hasValue())
-                    rtxSsrc = stream.rtxSsrc.get();
-                if (stream.maxResolution.hasValue()) {
-                    maxWidth = stream.maxResolution->width;
-                    maxHeight = stream.maxResolution->height;
+                VideoLayer layer;
+                layer.ssrc = stream.ssrc.get();
+                layer.rtxSsrc = stream.rtxSsrc.hasValue() && stream.rtxSsrc.get() != 0 ? stream.rtxSsrc.get() : layer.ssrc + 1;
+                layer.quality = stream.quality.valueOr(100);
+                if (!stream.active.valueOr(true)) {
+                    flaggedInactive.append(layer);
+                    continue;
                 }
-                maxFramerate = stream.maxFramerate.valueOr(0);
-                break;
+                layers.append(layer);
+
+                if (layer.quality == 100 || maxWidth == 0) {
+                    if (stream.maxResolution.hasValue()) {
+                        maxWidth = stream.maxResolution->width;
+                        maxHeight = stream.maxResolution->height;
+                    }
+                    maxFramerate = stream.maxFramerate.valueOr(0);
+                }
             }
         }
-        if (ssrc == 0 && (!data.streams.hasValue() || data.streams->isEmpty()))
-            ssrc = data.videoSsrc;
-        if (ssrc != 0 && rtxSsrc == 0)
-            rtxSsrc = ssrc + 1;
-    }
-
-    auto existing = remoteVideos.find(ssrc);
-    const bool unchanged = ssrc != 0 && existing != remoteVideos.end() && existing->second.userId == userId && existing->second.rtxSsrc == rtxSsrc;
-    if (!unchanged) {
-        removeRemoteVideo(userId);
-        if (ssrc != 0) {
-            RemoteVideo video;
-            video.userId = userId;
-            video.rtxSsrc = rtxSsrc;
-            remoteVideos.emplace(ssrc, std::move(video));
-            rtxToPrimary.insert(rtxSsrc, ssrc);
-
-            ssrcToUserIdMap.insert(ssrc, userId);
-            if (daveSession)
-                daveSession->applyKeyRatchetForSsrc(ssrc, userId);
+        // On a voice connection the official client goes by the video SSRC alone and ignores
+        // each entry's own flag, so entries all flagged inactive still count there.
+        if (layers.isEmpty() && !params.streamContext)
+            layers = flaggedInactive;
+        if (layers.isEmpty() && (!data.streams.hasValue() || data.streams->isEmpty())) {
+            VideoLayer layer;
+            layer.ssrc = data.videoSsrc;
+            layer.rtxSsrc = layer.ssrc + 1;
+            layers.append(layer);
         }
     }
 
-    sendVideoWants();
-    emit remoteVideoChanged(userId, ssrc != 0, maxWidth, maxHeight, maxFramerate);
+    if (remoteLayers.value(userId) != layers) {
+        removeRemoteVideo(userId);
+        for (const VideoLayer &layer : layers) {
+            RemoteVideo video;
+            video.userId = userId;
+            video.rtxSsrc = layer.rtxSsrc;
+            remoteVideos.emplace(layer.ssrc, std::move(video));
+            rtxToPrimary.insert(layer.rtxSsrc, layer.ssrc);
+
+            ssrcToUserIdMap.insert(layer.ssrc, userId);
+            if (daveSession)
+                daveSession->applyKeyRatchetForSsrc(layer.ssrc, userId);
+        }
+        if (!layers.isEmpty())
+            remoteLayers.insert(userId, layers);
+    }
+
+    // On a voice connection whoever shows the video decides what is wanted, and is told here.
+    if (!explicitVideoPlan && params.streamContext)
+        planSingleSenders();
+    emit remoteVideoLayersChanged(userId, layers);
+    emit remoteVideoChanged(userId, !layers.isEmpty(), maxWidth, maxHeight, maxFramerate);
 }
 
 void VoiceClient::removeRemoteVideo(Core::Snowflake userId)
@@ -581,34 +604,69 @@ void VoiceClient::removeRemoteVideo(Core::Snowflake userId)
         }
         rtxToPrimary.remove(it->second.rtxSsrc);
         ssrcToUserIdMap.remove(it->first);
+        deliveredSsrcs.remove(it->first);
         it = remoteVideos.erase(it);
     }
+    remoteLayers.remove(userId);
 }
 
 void VoiceClient::setVideoWants(int pixelCount, bool wanted)
 {
+    explicitVideoPlan = false;
     wantedPixelCount = pixelCount;
     videoWanted = wanted;
+    planSingleSenders();
+}
+
+// The plan for a stream connection, where the only sender is the broadcaster: its first
+// encoding at full quality, sized to the surface, or nothing while the surface is not shown.
+void VoiceClient::planSingleSenders()
+{
+    plannedWants = MediaSinkWants();
+    deliveredSsrcs.clear();
+    for (auto it = remoteLayers.constBegin(); it != remoteLayers.constEnd(); ++it) {
+        const quint32 ssrc = it.value().first().ssrc;
+        plannedWants.bySsrc.insert(ssrc, videoWanted ? 100 : 0);
+        if (videoWanted) {
+            plannedWants.pixelCounts.insert(ssrc, wantedPixelCount);
+            deliveredSsrcs.insert(ssrc);
+        }
+    }
+    applyVideoPlan();
+}
+
+void VoiceClient::setVideoPlan(const MediaSinkWants &wants, const QSet<quint32> &deliver)
+{
+    explicitVideoPlan = true;
+    plannedWants = wants;
+    deliveredSsrcs = deliver;
+    applyVideoPlan();
+}
+
+void VoiceClient::applyVideoPlan()
+{
+    // An encoding no longer taken starts from a key frame if it is taken again.
+    for (auto &[ssrc, video] : remoteVideos) {
+        if (!deliveredSsrcs.contains(ssrc))
+            video.receiver.reset();
+    }
     sendVideoWants();
 }
 
 void VoiceClient::sendVideoWants()
 {
-    if (currentState != State::Connected || !gateway || remoteVideos.empty())
+    if (currentState != State::Connected || !gateway || videoPayloadTypes.isEmpty())
+        return;
+    // A stream's viewer has nothing to say until the broadcaster's video is announced, and a
+    // voice connection nothing until it has been given a plan.
+    if (!explicitVideoPlan && (!params.streamContext || remoteLayers.isEmpty()))
         return;
 
-    MediaSinkWants wants;
-    for (const auto &[ssrc, video] : remoteVideos) {
-        wants.bySsrc.insert(ssrc, videoWanted ? 100 : 0);
-        if (videoWanted)
-            wants.pixelCounts.insert(ssrc, wantedPixelCount);
-    }
-
-    const QByteArray serialized = wants.toJson().toBytes();
+    const QByteArray serialized = plannedWants.toJson().toBytes();
     if (serialized == sentVideoWants)
         return;
     sentVideoWants = serialized;
-    gateway->sendMediaSinkWants(wants);
+    gateway->sendMediaSinkWants(plannedWants);
 }
 
 void VoiceClient::requestVideoKeyframe()
@@ -674,8 +732,11 @@ void VoiceClient::onVideoTick()
         stats.lossFraction = std::max(stats.lossFraction, report.fractionLost / 256.0);
     }
 
-    if (pending.empty() && !reportDue)
+    if (pending.empty() && reports.empty()) {
+        if (reportDue)
+            videoReportedMs = now;
         return;
+    }
 
     // A compound packet opens with a report, so feedback sent between reports follows an empty one.
     PacketPool::Handle packet = udpTransport->acquirePacket();
@@ -870,10 +931,12 @@ void VoiceClient::onClientDisconnect(Core::Snowflake uid)
     if (daveSession)
         daveSession->removeConnectedUser(uidStr);
 
-    const bool hadVideo = std::any_of(remoteVideos.begin(), remoteVideos.end(), [uid](const auto &entry) { return entry.second.userId == uid; });
+    const bool hadVideo = remoteLayers.contains(uid);
     removeRemoteVideo(uid);
-    if (hadVideo)
+    if (hadVideo) {
+        emit remoteVideoLayersChanged(uid, {});
         emit remoteVideoChanged(uid, false, 0, 0, 0);
+    }
 
     for (auto it = ssrcToUserIdMap.begin(); it != ssrcToUserIdMap.end(); ++it) {
         if (it.value() == static_cast<quint64>(uid)) {

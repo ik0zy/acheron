@@ -388,6 +388,9 @@ struct ConnectionParams
     // A stream's viewer has no microphone on that connection and sends no audio at all, not
     // even the silence a voice connection opens with.
     bool sendsAudio = true;
+    // A Go Live stream's connection rather than a voice channel's. The same messages mean
+    // slightly different things on the two.
+    bool streamContext = false;
 };
 
 struct VoiceResumeData : Core::JsonUtils::JsonObject

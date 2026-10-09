@@ -42,6 +42,8 @@ signals:
     void liveParticipantHoverChanged(const QModelIndex &proxyIndex);
     // A live participant's row was double-clicked, which is how the official client watches.
     void watchStreamRequested(const QModelIndex &proxyIndex);
+    // The same for a participant with their camera on.
+    void showCallVideoRequested(const QModelIndex &proxyIndex);
 
 protected:
     void contextMenuEvent(QContextMenuEvent *event) override;

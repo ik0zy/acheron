@@ -26,6 +26,8 @@ public:
     // the corner. Empty strings clear them.
     void setMessage(const QString &title, const QString &detail = {});
     void setStatsText(const QString &text);
+    // A short label in the bottom corner, such as whose video this is.
+    void setCaption(const QString &text);
 
     // Forgets the picture, so that a stream which is over does not leave its last frame up.
     void clear();
@@ -53,6 +55,7 @@ private:
     QString messageTitle;
     QString messageDetail;
     QString statsText;
+    QString captionText;
 };
 
 } // namespace UI

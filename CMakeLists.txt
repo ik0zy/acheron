@@ -344,6 +344,7 @@ if(ENABLE_VOICE)
         src/Discord/Voice/VideoDepacketizer.cpp
         src/Discord/Voice/VideoReceiver.cpp
         src/Discord/Voice/Rtcp.cpp
+        src/Discord/Voice/SinkWants.cpp
         src/Core/Audio/VoiceManager.cpp
         src/Core/Audio/VoiceConnection.cpp
         src/Core/Audio/AudioPipeline.cpp
@@ -363,8 +364,11 @@ if(ENABLE_VOICE AND TARGET ffmpeg)
         src/Core/Media/VideoDecoder.cpp
         src/Core/Streams/StreamSession.cpp
         src/Core/Streams/StreamWatcher.cpp
+        src/Core/Video/CallVideo.cpp
+        src/Core/Video/TileVisibility.cpp
         src/UI/Video/VideoSurface.cpp
         src/UI/StreamWindow.cpp
+        src/UI/CallVideoWindow.cpp
     )
 endif()
 
@@ -464,6 +468,12 @@ if(BUILD_TESTS)
         target_include_directories(TestUdpTransport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME UdpTransportTests COMMAND TestUdpTransport)
 
+        qt_add_executable(TestSinkWants tests/tst_SinkWants.cpp src/Discord/Voice/SinkWants.cpp
+            src/Core/Video/TileVisibility.cpp src/Core/OrderedJson.cpp src/Core/Snowflake.cpp)
+        target_link_libraries(TestSinkWants PRIVATE Qt::Core Qt::Network Qt::Test)
+        target_include_directories(TestSinkWants PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME SinkWantsTests COMMAND TestSinkWants)
+
         if(TARGET ffmpeg)
             qt_add_executable(TestRtpVideo tests/tst_RtpVideo.cpp src/Discord/Voice/RtpPacket.cpp
                 src/Discord/Voice/VideoDepacketizer.cpp src/Discord/Voice/VideoReceiver.cpp
@@ -547,7 +557,7 @@ if (MSVC)
             list(APPEND _msvc_test_targets TestApng TestClips)
         endif()
         if(TARGET TestRtp)
-            list(APPEND _msvc_test_targets TestRtp TestUdpTransport)
+            list(APPEND _msvc_test_targets TestRtp TestUdpTransport TestSinkWants)
         endif()
         if(TARGET TestRtpVideo)
             list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface)

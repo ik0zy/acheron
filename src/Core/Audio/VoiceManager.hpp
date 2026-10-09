@@ -21,6 +21,9 @@
 
 namespace Acheron {
 namespace Core {
+
+class CallVideo;
+
 namespace Audio {
 
 class AudioPipeline;
@@ -105,6 +108,11 @@ public:
     void attachAudioSource(quint32 source, Discord::Voice::VoiceClient *client);
     void detachAudioSource(quint32 source);
     void setAudioSourceVolume(quint32 source, float volume);
+
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    // The cameras of the call this account is in.
+    [[nodiscard]] CallVideo *video() const { return callVideo; }
+#endif
 
     void setUserMuted(Snowflake userId, bool muted);
     [[nodiscard]] bool isUserMuted(Snowflake userId) const;
@@ -195,6 +203,7 @@ private:
     VoiceConnection *voiceConnection = nullptr;
     Discord::Voice::VoiceClient *voiceClient = nullptr;
     AudioPipeline *audioPipeline = nullptr;
+    CallVideo *callVideo = nullptr;
     unsigned int voiceGeneration = 0;
 
     mutable std::unique_ptr<IAudioBackend> audioBackend;

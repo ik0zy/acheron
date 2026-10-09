@@ -135,6 +135,7 @@ private:
     void updateVoiceStatusLabel();
     void onLiveParticipantHoverChanged(const QModelIndex &proxyIndex);
     void onWatchStreamRequested(const QModelIndex &proxyIndex);
+    void onShowCallVideoRequested(const QModelIndex &proxyIndex);
 #endif
 
 private:
@@ -238,6 +239,8 @@ private:
     StreamPreviewPopup *streamPreviewPopup = nullptr;
     // Open stream viewers, by account id and stream key.
     QHash<QString, StreamWindow *> streamWindows;
+    // The camera view of each account's call, by account id.
+    QHash<quint64, QPointer<QWidget>> callVideoWindows;
 #endif
     AccountsWindow *accountsWindow = nullptr;
     SettingsWindow *settingsWindow = nullptr;

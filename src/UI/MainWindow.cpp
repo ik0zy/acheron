@@ -58,6 +58,7 @@
 #include "StreamPreviewPopup.hpp"
 #ifdef ACHERON_HAVE_STREAM_VIEW
 #include "StreamWindow.hpp"
+#include "CallVideoWindow.hpp"
 #include "Core/Streams/StreamWatcher.hpp"
 #endif
 #include "Core/Streams/StreamPreviews.hpp"
@@ -1177,6 +1178,39 @@ void MainWindow::onWatchStreamRequested(const QModelIndex &proxyIndex)
 #endif
 }
 
+void MainWindow::onShowCallVideoRequested(const QModelIndex &proxyIndex)
+{
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    auto *node = channelTreeModel->nodeFromIndex(channelFilterProxy->mapToSource(proxyIndex));
+    if (!node || node->type != ChannelNode::Type::VoiceParticipant || !node->parent)
+        return;
+
+    ChannelNode *accountNode = channelTreeModel->getAccountNodeFor(node);
+    Core::ClientInstance *instance = accountNode ? session->client(accountNode->id) : nullptr;
+    // Cameras are only received by someone in the call.
+    if (!instance || instance->voiceChannelId() != node->parent->id)
+        return;
+
+    const quint64 accountId = static_cast<quint64>(instance->accountId());
+    if (QWidget *open = callVideoWindows.value(accountId)) {
+        open->raise();
+        open->activateWindow();
+        return;
+    }
+
+    ChannelNode *guildNode = ChannelTreeModel::findGuildNode(node);
+    const Snowflake guildId = guildNode ? guildNode->id : Snowflake::Invalid;
+    auto names = [instance = QPointer<ClientInstance>(instance), guildId](Snowflake userId) {
+        return instance ? instance->users()->getDisplayName(userId, guildId) : QString();
+    };
+    auto *window = new CallVideoWindow(instance->voice()->video(), names, node->parent->name);
+    callVideoWindows.insert(accountId, window);
+    window->show();
+#else
+    Q_UNUSED(proxyIndex);
+#endif
+}
+
 void MainWindow::onLiveParticipantHoverChanged(const QModelIndex &proxyIndex)
 {
 #ifndef ACHERON_NO_VOICE
@@ -1651,6 +1685,7 @@ void MainWindow::setupUi()
 
     connect(channelTree, &ChannelTreeView::liveParticipantHoverChanged, this, &MainWindow::onLiveParticipantHoverChanged);
     connect(channelTree, &ChannelTreeView::watchStreamRequested, this, &MainWindow::onWatchStreamRequested);
+    connect(channelTree, &ChannelTreeView::showCallVideoRequested, this, &MainWindow::onShowCallVideoRequested);
 
     connect(channelTree, &ChannelTreeView::openInNewTabRequested, this,
             [this](const QModelIndex &proxyIndex) {

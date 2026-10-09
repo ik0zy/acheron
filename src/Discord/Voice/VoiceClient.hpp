@@ -3,6 +3,7 @@
 #include <QElapsedTimer>
 #include <QHash>
 #include <QObject>
+#include <QSet>
 #include <QTimer>
 
 #include <atomic>
@@ -18,6 +19,7 @@
 #include "Core/Snowflake.hpp"
 #include "PacketBuffer.hpp"
 #include "RtpPacket.hpp"
+#include "SinkWants.hpp"
 #include "VideoReceiver.hpp"
 #include "VoiceEnums.hpp"
 #include "VoiceEntities.hpp"
@@ -89,8 +91,12 @@ public:
     void setVideoFrameHandler(VideoFrameHandler handler);
 
     // How much of the remote video is wanted: the size it is being shown at, in pixels, or
-    // nothing at all while it is not shown.
+    // nothing at all while it is not shown. This is all a stream's viewer has to say.
     void setVideoWants(int pixelCount, bool wanted);
+
+    // The full form, for a call with several senders: what to tell the server, and which
+    // SSRCs to receive and hand on. Everything else that arrives is discarded.
+    void setVideoPlan(const MediaSinkWants &wants, const QSet<quint32> &deliver);
 
     // A frame handed out could not be decoded; ask every sender to start over.
     void requestVideoKeyframe();
@@ -105,6 +111,8 @@ signals:
     // A user's video started, changed or (inactive) stopped. The size and rate are the most the
     // sender says it will send, and are zero when it does not say.
     void remoteVideoChanged(Acheron::Core::Snowflake userId, bool active, int maxWidth, int maxHeight, int maxFramerate);
+    // The encodings a user's video now comes in; none when it has stopped.
+    void remoteVideoLayersChanged(Acheron::Core::Snowflake userId, const QList<Acheron::Discord::Voice::VideoLayer> &layers);
     void videoStatsUpdated(const Acheron::Discord::Voice::VideoReceiveStats &stats);
 
     void speakingReceived(const SpeakingData &data);
@@ -152,6 +160,8 @@ private:
     bool daveDecryptVideo(quint32 ssrc, std::vector<uint8_t> &frame);
     void applyRemoteVideo(const ClientConnectData &data);
     void removeRemoteVideo(Core::Snowflake userId);
+    void planSingleSenders();
+    void applyVideoPlan();
     void startVideoTimer();
     void onVideoTick();
     void sendVideoWants();
@@ -201,6 +211,11 @@ private:
     // Remote video by its SSRC, and each RTX SSRC's primary.
     std::unordered_map<quint32, RemoteVideo> remoteVideos;
     QHash<quint32, quint32> rtxToPrimary;
+    QHash<Core::Snowflake, QList<VideoLayer>> remoteLayers;
+    // What the server is asked for, and the SSRCs whose video is received and handed on.
+    MediaSinkWants plannedWants;
+    QSet<quint32> deliveredSsrcs;
+    bool explicitVideoPlan = false;
     VideoFrameHandler videoFrameHandler;
     QTimer *videoTimer = nullptr;
     QElapsedTimer videoClock;

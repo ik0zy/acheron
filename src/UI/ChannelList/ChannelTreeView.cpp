@@ -165,6 +165,11 @@ void ChannelTreeView::mouseDoubleClickEvent(QMouseEvent *event)
         event->accept();
         return;
     }
+    if (event->button() == Qt::LeftButton && proxyIndex.isValid() && static_cast<ChannelNode::Type>(proxyIndex.data(ChannelTreeModel::TypeRole).toInt()) == ChannelNode::Type::VoiceParticipant && proxyIndex.data(ChannelTreeModel::IsVoiceVideoRole).toBool()) {
+        emit showCallVideoRequested(proxyIndex);
+        event->accept();
+        return;
+    }
 
     handleMouseEventForExpansion(event);
     event->accept(); // shut up
