@@ -609,12 +609,15 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
     // guard new connections (against eg channel moves)
     unsigned int gen = voiceGeneration;
 
-    connect(voiceClient, &Discord::Voice::VoiceClient::clientConnected,
-            this, [this, gen](const Discord::Voice::ClientConnectData &data) {
-                if (gen != voiceGeneration)
+    // Who is in the call is who has a voice state in the channel, and besides them anyone the
+    // voice server has connected whose voice state has not arrived (the official client's
+    // RTCConnectionDesyncStore, 584569.js).
+    connect(voiceClient, &Discord::Voice::VoiceClient::clientReachedServer,
+            this, [this, gen](Snowflake userId) {
+                if (gen != voiceGeneration || !userId.isValid() || userId == accountId)
                     return;
-                Snowflake userId = data.userId;
-                if (!userId.isValid() || userId == accountId || participants.contains(userId))
+                populateParticipantsFromCache();
+                if (participants.contains(userId))
                     return;
                 VoiceParticipant p;
                 p.userId = userId;
@@ -626,10 +629,22 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
             this, [this, gen](Snowflake userId) {
                 if (gen != voiceGeneration)
                     return;
-                if (participants.remove(userId)) {
-                    if (audioPipeline)
-                        QMetaObject::invokeMethod(audioPipeline, [p = audioPipeline, userId]() { p->removeUser(userId); });
+                if (audioPipeline)
+                    QMetaObject::invokeMethod(audioPipeline, [p = audioPipeline, userId]() { p->removeUser(userId); });
+
+                // Someone who moves to another of their devices drops off the voice server and
+                // comes back, while their voice state stays in the channel throughout. Leaving
+                // the server only takes away someone who was listed without a voice state.
+                const auto voiceState = knownVoiceStates.constFind(userId);
+                const bool stillInChannel = voiceState != knownVoiceStates.constEnd() && !voiceState->channelId.isNull() && voiceState->channelId.get() == channelId;
+                auto participant = participants.find(userId);
+                if (participant == participants.end())
+                    return;
+                if (!stillInChannel) {
+                    participants.erase(participant);
                     emit participantLeft(userId);
+                } else if (std::exchange(participant->speaking, false)) {
+                    emit participantSpeakingChanged(userId, false);
                 }
             });
 

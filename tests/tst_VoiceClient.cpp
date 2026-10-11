@@ -405,6 +405,7 @@ private slots:
     void initTestCase() { QVERIFY(VoiceEncryption::initialize()); }
 
     void connectsAndSaysWhatItCanReceive();
+    void usersTheServerNamesAreAnnounced();
     void framesReachTheHandlerUnderTheirSender();
     void aLostPacketIsAskedForAndTakenFromTheRetransmission();
     void aKeyframeRequestGoesToThatSenderAlone();
@@ -431,6 +432,27 @@ void TestVoiceClient::connectsAndSaysWhatItCanReceive()
     QCOMPARE(codecs[1].toObject()["payload_type"].toInt(), VIDEO_PAYLOAD_TYPE);
     QCOMPARE(codecs[1].toObject()["rtx_payload_type"].toInt(), RTX_PAYLOAD_TYPE);
     QCOMPARE(selectProtocol[0]["data"].toObject()["mode"].toString(), encryptionModeToString(EncryptionMode::AEAD_XCHACHA20_POLY1305_RTPSIZE));
+}
+
+void TestVoiceClient::usersTheServerNamesAreAnnounced()
+{
+    Call call;
+    QTRY_VERIFY(call.isUp());
+
+    QList<quint64> reached;
+    QList<quint64> left;
+    QObject::connect(call.client.get(), &VoiceClient::clientReachedServer, call.client.get(), [&reached](Core::Snowflake userId) { reached.append(static_cast<quint64>(userId)); });
+    QObject::connect(call.client.get(), &VoiceClient::clientDisconnected, call.client.get(), [&left](Core::Snowflake userId) { left.append(static_cast<quint64>(userId)); });
+
+    // Bob moves from one device to another: off the server, then on it again, by id alone.
+    constexpr int CLIENTS_CONNECT = 11;
+    constexpr int CLIENT_DISCONNECT = 13;
+    call.server.send(CLIENTS_CONNECT, QJsonObject{ { "user_ids", QJsonArray{ QString::number(ALICE), QString::number(BOB) } } });
+    call.server.send(CLIENT_DISCONNECT, QJsonObject{ { "user_id", QString::number(BOB) } });
+    call.server.send(CLIENTS_CONNECT, QJsonObject{ { "user_ids", QJsonArray{ QString::number(BOB) } } });
+
+    QTRY_COMPARE(reached, (QList<quint64>{ ALICE, BOB, BOB }));
+    QCOMPARE(left, QList<quint64>{ BOB });
 }
 
 void TestVoiceClient::framesReachTheHandlerUnderTheirSender()

@@ -1006,6 +1006,7 @@ void VoiceClient::onClientsConnect(const QStringList &userIds)
         connectedUserIds.insert(uid);
         if (daveSession)
             daveSession->addConnectedUser(uid);
+        emit clientReachedServer(Core::Snowflake(id.toULongLong()));
     }
 }
 

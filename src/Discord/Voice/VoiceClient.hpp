@@ -126,6 +126,9 @@ signals:
 
     void speakingReceived(const SpeakingData &data);
     void clientConnected(const ClientConnectData &data);
+    // The voice server says this user is connected to it, whatever the main gateway has said
+    // of their voice state.
+    void clientReachedServer(Core::Snowflake userId);
     void clientDisconnected(Core::Snowflake userId);
 
     void audioReceived(quint32 ssrc, uint16_t sequence, uint32_t timestamp, const QByteArray &opusData);
