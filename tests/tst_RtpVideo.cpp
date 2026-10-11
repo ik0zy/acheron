@@ -226,6 +226,7 @@ private slots:
     void receptionReportCountsLoss();
 
     void receivedRtcpIsRead();
+    void reportsOnWhatThisClientSendsAreRead();
     void receiverReportBytes();
     void nackBytes();
     void pliBytes();
@@ -722,6 +723,29 @@ void TestRtpVideo::receivedRtcpIsRead()
     QVERIFY(!parseRtcp(bytes("81cc00050000008a31534944010203")).hasInboundEstimate);
     QVERIFY(parseRtcp(bytes("80c800ff0000008aee73cd847cbccc93")).senderReports.empty());
     QVERIFY(parseRtcp({}).senderReports.empty());
+}
+
+void TestRtpVideo::reportsOnWhatThisClientSendsAreRead()
+{
+    ReceptionReport sent;
+    sent.ssrc = 7713;
+    sent.fractionLost = 64;
+    sent.cumulativeLost = -3;
+    sent.highestSequence = 0x00010457;
+    sent.jitter = 12;
+
+    uint8_t packet[64];
+    const ReceptionReport reports[] = { sent };
+    const int size = writeReceiverReport(packet, 99, reports);
+    QVERIFY(size > 0);
+
+    const ReceivedRtcp received = parseRtcp({ packet, static_cast<size_t>(size) });
+    QCOMPARE(received.receptionReports.size(), size_t(1));
+    QCOMPARE(received.receptionReports[0].ssrc, sent.ssrc);
+    QCOMPARE(received.receptionReports[0].fractionLost, sent.fractionLost);
+    QCOMPARE(received.receptionReports[0].cumulativeLost, sent.cumulativeLost);
+    QCOMPARE(received.receptionReports[0].highestSequence, sent.highestSequence);
+    QCOMPARE(received.receptionReports[0].jitter, sent.jitter);
 }
 
 void TestRtpVideo::receiverReportBytes()

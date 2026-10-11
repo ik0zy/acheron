@@ -464,6 +464,12 @@ void VoiceClient::receiveRtcp(PacketPool::Handle packet)
         for (const ReceivedRtcp::SenderReport &report : received.senderReports)
             senderReports.insert(report.ssrc, { report.compactNtp, now });
     }
+    for (const ReceptionReport &report : received.receptionReports) {
+        // Whether what this client sends is arriving is otherwise only known to the people
+        // who cannot hear it.
+        if (report.ssrc == localSsrc)
+            qCDebug(LogVoice) << "Server's report on our audio: has up to sequence" << (report.highestSequence & 0xFFFF) << "of" << static_cast<uint16_t>(rtpSequence - 1) << "sent, lost in all" << report.cumulativeLost << "lost lately" << report.fractionLost / 256.0;
+    }
     if (received.hasInboundEstimate) {
         if (received.inboundBitsPerSecond != serverEstimateBps)
             qCDebug(LogVoice) << "Server's estimate of the way here:" << received.inboundBitsPerSecond << "bps, loss" << received.inboundLoss;

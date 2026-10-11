@@ -42,6 +42,9 @@ struct ReceivedRtcp
     };
     std::vector<SenderReport> senderReports;
 
+    // What the server says it has received of the streams this client sends.
+    std::vector<ReceptionReport> receptionReports;
+
     // The server's own estimate of what the way to this client carries, in bits per second,
     // and the share of packets it sees lost on it, 0 to 1. Discord sends this in an
     // application-defined packet; the official client only keeps the number for its statistics.

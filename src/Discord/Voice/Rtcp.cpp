@@ -68,8 +68,29 @@ int writeReceiverReport(std::span<uint8_t> out, uint32_t senderSsrc, std::span<c
     return size;
 }
 
+static void readReportBlocks(const uint8_t *packet, size_t size, size_t blocksAt, std::vector<ReceptionReport> &reports)
+{
+    const int count = packet[0] & 0x1F;
+    for (int i = 0; i < count && blocksAt + REPORT_BLOCK_SIZE <= size; i++, blocksAt += REPORT_BLOCK_SIZE) {
+        const uint8_t *p = packet + blocksAt;
+        ReceptionReport report;
+        report.ssrc = qFromBigEndian<uint32_t>(p);
+        report.fractionLost = p[4];
+        // A 24-bit signed number.
+        report.cumulativeLost = static_cast<int32_t>((static_cast<uint32_t>(p[5]) << 24) | (static_cast<uint32_t>(p[6]) << 16) | (static_cast<uint32_t>(p[7]) << 8)) >> 8;
+        report.highestSequence = qFromBigEndian<uint32_t>(p + 8);
+        report.jitter = qFromBigEndian<uint32_t>(p + 12);
+        report.lastSenderReport = qFromBigEndian<uint32_t>(p + 16);
+        report.delaySinceLastSenderReport = qFromBigEndian<uint32_t>(p + 20);
+        reports.push_back(report);
+    }
+}
+
 ReceivedRtcp parseRtcp(std::span<const uint8_t> compound)
 {
+    constexpr size_t SENDER_REPORT_BLOCKS_AT = 28;
+    constexpr size_t RECEIVER_REPORT_BLOCKS_AT = 8;
+
     ReceivedRtcp received;
     while (compound.size() >= HEADER_SIZE) {
         const uint8_t *p = compound.data();
@@ -81,6 +102,9 @@ ReceivedRtcp parseRtcp(std::span<const uint8_t> compound)
             const uint32_t seconds = qFromBigEndian<uint32_t>(p + 8);
             const uint32_t fraction = qFromBigEndian<uint32_t>(p + 12);
             received.senderReports.push_back({ qFromBigEndian<uint32_t>(p + 4), (seconds << 16) | (fraction >> 16) });
+            readReportBlocks(p, size, SENDER_REPORT_BLOCKS_AT, received.receptionReports);
+        } else if (p[1] == TYPE_RECEIVER_REPORT) {
+            readReportBlocks(p, size, RECEIVER_REPORT_BLOCKS_AT, received.receptionReports);
         } else if (p[1] == TYPE_APPLICATION && size >= INBOUND_ESTIMATE_SIZE && std::equal(p + 8, p + 12, INBOUND_ESTIMATE_NAME)) {
             // The rate is an 18-bit mantissa under a 6-bit exponent, as in REMB.
             const uint32_t rate = (static_cast<uint32_t>(p[20]) << 16) | (static_cast<uint32_t>(p[21]) << 8) | p[22];
