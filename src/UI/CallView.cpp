@@ -678,6 +678,8 @@ void CallView::refreshStats()
             lines << tr("Frame rate: %1 fps").arg(stats.framesPerSecond, 0, 'f', 1);
             lines << tr("Bitrate: %1 kbps").arg(stats.bitrateKbps, 0, 'f', 0);
             lines << tr("Decode time: %1 ms").arg(stats.decoder.averageDecodeMs, 0, 'f', 2);
+            if (stats.pixelShareAskedFor < 1)
+                lines << tr("Decoder behind: asking for %1% of the picture").arg(qRound(stats.pixelShareAskedFor * 100));
             lines << tr("Loss: %1%").arg(stats.network.lossFraction * 100.0, 0, 'f', 1);
             if (stats.network.serverEstimateBps != 0)
                 lines << tr("Server estimate: %1 kbps, %2% loss").arg(stats.network.serverEstimateBps / 1000).arg(stats.network.serverLossFraction * 100.0, 0, 'f', 1);

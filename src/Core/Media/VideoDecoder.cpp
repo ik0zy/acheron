@@ -286,7 +286,10 @@ void VideoDecoder::setCodecFailureHandler(std::function<void(Discord::Voice::Vid
 VideoDecoder::Stats VideoDecoder::stats() const
 {
     std::lock_guard lock(mutex);
-    return counters;
+    Stats now = counters;
+    if (!queue.empty())
+        now.backlogMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - queue.front().queuedAt).count());
+    return now;
 }
 
 void VideoDecoder::push(Discord::Voice::VideoCodec codec, Discord::Voice::EncodedVideoFrame frame)
@@ -300,6 +303,7 @@ void VideoDecoder::push(Discord::Voice::VideoCodec codec, Discord::Voice::Encode
         if (tooOld || static_cast<int>(queue.size()) >= MAX_QUEUED_FRAMES) {
             // Too far behind to catch up frame by frame.
             counters.dropped += queue.size();
+            counters.queuesDiscarded++;
             queue.clear();
             queueWasDiscarded = true;
             overflowed = true;

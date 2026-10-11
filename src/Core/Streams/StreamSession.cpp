@@ -4,6 +4,8 @@
 #include "Core/Audio/VoiceManager.hpp"
 #include "Core/Logging.hpp"
 
+#include <algorithm>
+
 namespace Acheron {
 namespace Core {
 
@@ -155,6 +157,9 @@ void StreamSession::connectRtc()
     statsClock.invalidate();
     statsBytes = 0;
     statsDecoded = 0;
+    demand = {};
+    demandClock.start();
+    fullPicturePixels = 0;
 
     if (!connection->start()) {
         disconnectRtc();
@@ -239,6 +244,13 @@ void StreamSession::onVideoStats(const Discord::Voice::VideoReceiveStats &stats)
     statsBytes = stats.bytes;
     statsDecoded = latestStats.decoder.decoded;
 
+    fullPicturePixels = std::max({ fullPicturePixels, static_cast<qint64>(latestStats.decoder.width) * latestStats.decoder.height, static_cast<qint64>(announcedSize.width()) * announcedSize.height() });
+    if (demand.observe(latestStats.decoder.backlogMs, latestStats.decoder.queuesDiscarded, demandClock.elapsed())) {
+        qCInfo(LogVoice) << "Stream" << streamKey.toString() << "decoder backlog" << latestStats.decoder.backlogMs << "ms; now asking for" << demand.pixelShare() << "of the picture";
+        pushWants();
+    }
+    latestStats.pixelShareAskedFor = demand.pixelShare();
+
     emit statsChanged();
 }
 
@@ -271,7 +283,7 @@ void StreamSession::pushWants()
     if (!connection || !rtcConnected)
         return;
 
-    const int pixels = surfacePixels;
+    const int pixels = demand.pixelsToAskFor(surfacePixels, fullPicturePixels);
     const bool wanted = surfaceVisible;
     VoiceClient *client = connection->client();
     QMetaObject::invokeMethod(client, [client, pixels, wanted] { client->setVideoWants(pixels, wanted); });

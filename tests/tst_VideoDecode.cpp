@@ -449,10 +449,12 @@ void TestVideoDecode::aQueueThatHasWaitedTooLongIsDiscarded()
     QTest::qWait(Core::Media::VideoDecoder::MAX_QUEUE_AGE_MS / 2);
     decoder.push(vp8.codec, forDecoder(vp8.codec, clip[1]));
     QCOMPARE(keyframeRequests.load(), 0);
+    QVERIFY(decoder.stats().backlogMs >= Core::Media::VideoDecoder::MAX_QUEUE_AGE_MS / 2);
     QTest::qWait(Core::Media::VideoDecoder::MAX_QUEUE_AGE_MS / 2 + 100);
     decoder.push(vp8.codec, forDecoder(vp8.codec, clip[1]));
     QCOMPARE(keyframeRequests.load(), 1);
     QCOMPARE(decoder.stats().dropped, quint64(2));
+    QCOMPARE(decoder.stats().queuesDiscarded, quint64(1));
 
     sink->openGate();
     QTest::qWait(200);

@@ -7,6 +7,7 @@
 
 #include <memory>
 
+#include "Core/Media/DecodeDemand.hpp"
 #include "Core/Media/VideoDecoder.hpp"
 #include "Core/ProxyConfig.hpp"
 #include "Core/Snowflake.hpp"
@@ -46,6 +47,9 @@ public:
         Media::VideoDecoder::Stats decoder;
         double bitrateKbps = 0;
         double framesPerSecond = 0;
+        // The share of the picture the sender is asked for; less than all of it while the
+        // decoder cannot keep up.
+        double pixelShareAskedFor = 1;
     };
 
     StreamSession(const Discord::StreamKey &key, Snowflake accountId, const QString &gatewaySessionId, const ProxyConfig &proxy, Audio::VoiceManager *voice, quint32 audioSource, QObject *parent = nullptr);
@@ -127,6 +131,12 @@ private:
     int surfacePixels = 0;
     bool surfaceVisible = false;
     float audioVolume = 1.0f;
+
+    Media::DecodeDemand demand;
+    QElapsedTimer demandClock;
+    // The largest the picture has been on this connection. What arrives gets smaller once
+    // less is asked for, so the size of the moment is no measure of the whole picture.
+    qint64 fullPicturePixels = 0;
 
     Stats latestStats;
     QElapsedTimer statsClock;

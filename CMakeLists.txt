@@ -369,6 +369,7 @@ endif()
 # Watching video needs both the RTC connection and a decoder.
 if(ENABLE_VOICE AND TARGET ffmpeg)
     list(APPEND PROJECT_SOURCES
+        src/Core/Media/DecodeDemand.cpp
         src/Core/Media/VideoDecoder.cpp
         src/Core/Streams/StreamSession.cpp
         src/Core/Streams/StreamWatcher.cpp
@@ -457,6 +458,11 @@ if(BUILD_TESTS)
     target_link_libraries(TestStreams PRIVATE Qt::Core Qt::Gui Qt::Network Qt::Test)
     target_include_directories(TestStreams PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME StreamTests COMMAND TestStreams)
+
+    qt_add_executable(TestDecodeDemand tests/tst_DecodeDemand.cpp src/Core/Media/DecodeDemand.cpp)
+    target_link_libraries(TestDecodeDemand PRIVATE Qt::Core Qt::Test)
+    target_include_directories(TestDecodeDemand PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME DecodeDemandTests COMMAND TestDecodeDemand)
 
     qt_add_executable(TestCalls tests/tst_Calls.cpp src/Core/Calls/CallStore.cpp
         src/Core/OrderedJson.cpp src/Core/Snowflake.cpp)
@@ -579,7 +585,7 @@ if (MSVC)
     endif()
 
     if(BUILD_TESTS)
-        set(_msvc_test_targets TestMarkdown TestUnicodeEmoji TestOrderedJson TestFrecency TestProto TestProxy TestEmojiGrid TestCdnUrls TestEmbeds TestFavoriteGifs TestVoicePayloads TestStreams TestCalls)
+        set(_msvc_test_targets TestMarkdown TestUnicodeEmoji TestOrderedJson TestFrecency TestProto TestProxy TestEmojiGrid TestCdnUrls TestEmbeds TestFavoriteGifs TestVoicePayloads TestStreams TestCalls TestDecodeDemand)
         if(TARGET TestApng)
             list(APPEND _msvc_test_targets TestApng TestClips)
         endif()

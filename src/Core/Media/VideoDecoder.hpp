@@ -73,6 +73,9 @@ public:
         quint64 decoded = 0;
         quint64 dropped = 0;
         quint64 errors = 0;
+        quint64 queuesDiscarded = 0;
+        // How long the oldest frame still waiting to be decoded has waited.
+        int backlogMs = 0;
         double averageDecodeMs = 0;
         bool hardware = false;
     };
