@@ -220,9 +220,12 @@ private slots:
     void lostPacketIsRequestedAndAccepted();
     void unrepairedLossWaitsForAKeyframe();
     void sequenceNumbersWrap();
+    void aStrayPacketDoesNotRestartTheStream();
+    void aSenderThatRestartsItsNumberingIsFollowed();
     void undecodableOutputAsksForAKeyframe();
     void receptionReportCountsLoss();
 
+    void receivedRtcpIsRead();
     void receiverReportBytes();
     void nackBytes();
     void pliBytes();
@@ -611,6 +614,41 @@ void TestRtpVideo::sequenceNumbersWrap()
     QCOMPARE(feed.receiver.poll(feed.now).nacks, std::vector<uint16_t>{ static_cast<uint16_t>(base + 16) });
 }
 
+void TestRtpVideo::aStrayPacketDoesNotRestartTheStream()
+{
+    Feed feed;
+    feed.sendFrame(0, 20000, true);
+    feed.sendFrame(1, 20000, false);
+    QCOMPARE(feed.receiver.takeFrames().size(), size_t(2));
+
+    // A long-delayed duplicate from far behind.
+    feed.send(100, 0, true, true, false);
+    QCOMPARE(feed.receiver.stats().strays, quint64(1));
+    QCOMPARE(feed.receiver.stats().resyncs, quint64(0));
+
+    feed.sendFrame(2, 20000, false);
+    QCOMPARE(feed.receiver.takeFrames().size(), size_t(1));
+    QVERIFY(!feed.receiver.poll(feed.now).keyframeRequest);
+}
+
+void TestRtpVideo::aSenderThatRestartsItsNumberingIsFollowed()
+{
+    Feed feed;
+    feed.sendFrame(0, 20000, true);
+    QCOMPARE(feed.receiver.takeFrames().size(), size_t(1));
+
+    // The first packet of the new numbering could be a stray; the one after it shows it is not.
+    feed.sendFrame(1, 100, false);
+    QCOMPARE(feed.receiver.stats().strays, quint64(1));
+    QCOMPARE(feed.receiver.stats().resyncs, quint64(1));
+    QVERIFY(feed.receiver.takeFrames().empty());
+    QVERIFY(feed.receiver.poll(feed.now).keyframeRequest);
+
+    feed.sendFrame(2, 100, true);
+    feed.sendFrame(3, 100, false);
+    QCOMPARE(feed.receiver.takeFrames().size(), size_t(2));
+}
+
 void TestRtpVideo::undecodableOutputAsksForAKeyframe()
 {
     Feed feed;
@@ -651,6 +689,39 @@ void TestRtpVideo::receptionReportCountsLoss()
     report = feed.receiver.receptionReport();
     QCOMPARE(report.cumulativeLost, 2);
     QCOMPARE(int(report.fractionLost), 256 / 4);
+}
+
+void TestRtpVideo::receivedRtcpIsRead()
+{
+    const auto bytes = [](const char *hex) {
+        const QByteArray raw = QByteArray::fromHex(hex);
+        return Bytes(raw.begin(), raw.end());
+    };
+
+    // A sender report as the server sends one: the NTP time is ee73cd84.7cbccc93.
+    ReceivedRtcp received = parseRtcp(bytes("80c800060000008aee73cd847cbccc930512806400000053000129f0"));
+    QCOMPARE(received.senderReports.size(), size_t(1));
+    QCOMPARE(received.senderReports[0].ssrc, 0x8Au);
+    QCOMPARE(received.senderReports[0].compactNtp, 0xCD847CBCu);
+    QVERIFY(!received.hasInboundEstimate);
+
+    // A receiver report with Discord's estimate behind it: mantissa 0x22560 under exponent 6.
+    received = parseRtcp(bytes("81c90007000003b1000003b100000000000000000000003b0000000000000000" "81cc00050000008a3153494401020304050607081a256000"));
+    QVERIFY(received.senderReports.empty());
+    QVERIFY(received.hasInboundEstimate);
+    QCOMPARE(received.inboundBitsPerSecond, quint64(9000960));
+    QCOMPARE(received.inboundLoss, 0.0);
+
+    // Exponent 7, and a quarter of the packets lost.
+    received = parseRtcp(bytes("81cc00050000008a3153494401020304050607081efaf040"));
+    QCOMPARE(received.inboundBitsPerSecond, quint64(24999936));
+    QCOMPARE(received.inboundLoss, 0.25);
+
+    // Another application packet, a cut-off one, and one that claims more than there is.
+    QVERIFY(!parseRtcp(bytes("81cc00050000008a5853494401020304050607081efaf040")).hasInboundEstimate);
+    QVERIFY(!parseRtcp(bytes("81cc00050000008a31534944010203")).hasInboundEstimate);
+    QVERIFY(parseRtcp(bytes("80c800ff0000008aee73cd847cbccc93")).senderReports.empty());
+    QVERIFY(parseRtcp({}).senderReports.empty());
 }
 
 void TestRtpVideo::receiverReportBytes()

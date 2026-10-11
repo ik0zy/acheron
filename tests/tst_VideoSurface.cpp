@@ -4,8 +4,10 @@
 
 #include "UI/Video/VideoSurface.hpp"
 
+#include <QGuiApplication>
 #include <QImage>
 #include <QSignalSpy>
+#include <QWindow>
 #include <QTest>
 
 #ifdef Q_OS_WIN
@@ -95,7 +97,14 @@ void present(VideoSurface &surface, AVFrame *frame)
 
 QImage shot(VideoSurface &surface)
 {
-    return surface.grab().toImage().convertToFormat(QImage::Format_RGB32);
+    // With the graphics card the picture is in a window of its own, which is up a moment
+    // after the surface is.
+    QImage image = surface.snapshot();
+    for (int i = 0; i < 200 && image.isNull(); i++) {
+        QTest::qWait(10);
+        image = surface.snapshot();
+    }
+    return image.convertToFormat(QImage::Format_RGB32);
 }
 
 bool isNear(QRgb pixel, int red, int green, int blue)
@@ -116,12 +125,14 @@ private slots:
     void coloursFollowTheVideoStandard();
     void frameOnTheGraphicsCardIsDrawnFromThere();
     void manySurfacesDrawFromTheGraphicsCard();
+    void pictureSurvivesAMoveToAnotherWindow();
+    void clickAndDoubleClickAreReported();
     void geometryIsReported();
     void resizeRedrawsTheLastFrame();
     void clearForgetsThePicture();
     void messagesDoNotDisturbThePicture();
     void avatarStandsInUntilThereIsAPicture();
-    void speakingRingAndLiveMarkerAreDrawn();
+    void speakingRingIsDrawn();
     void statisticsAreLeftOffASmallTile();
 };
 
@@ -231,10 +242,11 @@ void TestVideoSurface::frameOnTheGraphicsCardIsDrawnFromThere()
     QVERIFY(isNear(image.pixel(image.width() / 2, 0), 255, 0, 0));
 
     // The overlays go over it as over any picture.
-    surface.setLive(true);
+    surface.setSpeaking(true);
     image = shot(surface);
     QVERIFY(isNear(image.pixel(image.width() / 2, middle), 255, 0, 0));
-    surface.setLive(false);
+    QVERIFY(!isNear(image.pixel(1, middle), 0, 0, 0));
+    surface.setSpeaking(false);
 
     // A frame in memory after that is uploaded as before.
     present(surface, solidFrame(640, 360, 235, 128, 128));
@@ -265,7 +277,8 @@ void TestVideoSurface::manySurfacesDrawFromTheGraphicsCard()
     }
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    window.grab();
+    for (VideoSurface *surface : surfaces)
+        shot(*surface);
     if (!surfaces.first()->sink()->acceptsHardwareFrames(AV_PIX_FMT_D3D11))
         QSKIP("This surface cannot draw a Direct3D picture where it is");
 
@@ -279,10 +292,9 @@ void TestVideoSurface::manySurfacesDrawFromTheGraphicsCard()
     for (VideoSurface *surface : surfaces)
         QTRY_VERIFY(surface->drawsFromCard());
 
-    const QImage image = window.grab().toImage().convertToFormat(QImage::Format_RGB32);
-    const qreal ratio = image.devicePixelRatio();
     for (int i = 0; i < COUNT; i++) {
-        const QRgb pixel = image.pixel(qRound((i * 160 + 80) * ratio), image.height() / 2);
+        const QImage image = shot(*surfaces[i]);
+        const QRgb pixel = image.pixel(image.width() / 2, image.height() / 2);
         QVERIFY2(isNear(pixel, 255, i % 2 == 0 ? 255 : 0, i % 2 == 0 ? 255 : 0), qPrintable(QStringLiteral("surface %1").arg(i)));
     }
 
@@ -290,10 +302,99 @@ void TestVideoSurface::manySurfacesDrawFromTheGraphicsCard()
     surfaces[1]->hide();
     present(*surfaces[1], solidFrameOnCard(640, 360, 235, 128, 128));
     surfaces[1]->show();
-    QTRY_VERIFY(isNear(window.grab().toImage().convertToFormat(QImage::Format_RGB32).pixel(qRound(240 * ratio), image.height() / 2), 255, 255, 255));
+    QTRY_VERIFY(isNear(shot(*surfaces[1]).pixel(40, 40), 255, 255, 255));
 #else
     QSKIP("Direct3D 11 only");
 #endif
+}
+
+void TestVideoSurface::pictureSurvivesAMoveToAnotherWindow()
+{
+    // As when a tile is popped out of the call view and put back: the surface gets a new
+    // window, and with the graphics card a new context, but keeps what it was showing.
+    QWidget first;
+    first.resize(320, 180);
+    auto *surface = new VideoSurface(&first);
+    surface->setGeometry(0, 0, 320, 180);
+    first.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&first));
+    present(*surface, solidFrame(640, 360, 235, 128, 128));
+    QImage image = shot(*surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 255, 255, 255));
+
+    QWidget second;
+    second.resize(320, 180);
+    surface->setParent(&second);
+    surface->setGeometry(0, 0, 320, 180);
+    surface->show();
+    second.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&second));
+    image = shot(*surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 255, 255, 255));
+
+    // And a new frame is drawn there as it would have been.
+    present(*surface, solidFrame(1280, 720, 63, 102, 240));
+    image = shot(*surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 255, 0, 0));
+
+#ifdef HAVE_D3D11VA
+    if (surface->sink()->acceptsHardwareFrames(AV_PIX_FMT_D3D11)) {
+        if (AVFrame *frame = solidFrameOnCard(640, 360, 235, 128, 128)) {
+            present(*surface, frame);
+            QTRY_VERIFY(surface->drawsFromCard());
+
+            // Back to the first window with a picture from the card up.
+            surface->setParent(&first);
+            surface->setGeometry(0, 0, 320, 180);
+            surface->show();
+            QTRY_VERIFY(isNear(shot(*surface).pixel(160, 90), 255, 255, 255));
+        }
+    }
+#endif
+}
+
+void TestVideoSurface::clickAndDoubleClickAreReported()
+{
+    VideoSurface surface;
+    surface.resize(320, 180);
+    surface.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&surface));
+
+    QSignalSpy clicks(&surface, &VideoSurface::clicked);
+    QSignalSpy doubleClicks(&surface, &VideoSurface::doubleClicked);
+    QTest::mouseClick(&surface, Qt::LeftButton, {}, QPoint(100, 60));
+    QCOMPARE(clicks.count(), 1);
+    QTest::mouseClick(&surface, Qt::RightButton, {}, QPoint(100, 60));
+    QCOMPARE(clicks.count(), 1);
+    QTest::mouseDClick(&surface, Qt::LeftButton, {}, QPoint(100, 60));
+    QCOMPARE(doubleClicks.count(), 1);
+
+    if (!surface.drawsWithGpu())
+        return;
+
+    // With the graphics card the picture is a window over the surface, which gets the mouse
+    // first and has to hand it on.
+    shot(surface);
+    QWindow *layer = nullptr;
+    const QWindowList windows = QGuiApplication::allWindows();
+    for (QWindow *window : windows) {
+        if (window->parent() == surface.windowHandle())
+            layer = window;
+    }
+    QVERIFY(layer);
+
+    surface.setContextMenuPolicy(Qt::CustomContextMenu);
+    QSignalSpy menus(&surface, &QWidget::customContextMenuRequested);
+    const int clicksBefore = clicks.count();
+    QTest::mouseClick(layer, Qt::LeftButton, {}, QPoint(100, 60));
+    QCOMPARE(clicks.count(), clicksBefore + 1);
+    QCOMPARE(menus.count(), 0);
+    QTest::mouseClick(layer, Qt::RightButton, {}, QPoint(100, 60));
+    QCOMPARE(clicks.count(), clicksBefore + 1);
+    QCOMPARE(menus.count(), 1);
+    QCOMPARE(menus.first().first().toPoint(), QPoint(100, 60));
+    QTest::mouseDClick(layer, Qt::LeftButton, {}, QPoint(100, 60));
+    QCOMPARE(doubleClicks.count(), 2);
 }
 
 void TestVideoSurface::geometryIsReported()
@@ -404,7 +505,7 @@ void TestVideoSurface::avatarStandsInUntilThereIsAPicture()
     QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 0, 200, 0));
 }
 
-void TestVideoSurface::speakingRingAndLiveMarkerAreDrawn()
+void TestVideoSurface::speakingRingIsDrawn()
 {
     VideoSurface surface;
     surface.resize(320, 180);
@@ -420,16 +521,8 @@ void TestVideoSurface::speakingRingAndLiveMarkerAreDrawn()
     QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 0, 0, 0));
 
     surface.setSpeaking(false);
-    surface.setLive(true);
     image = shot(surface);
     QVERIFY(isNear(image.pixel(1, image.height() / 2), 0, 0, 0));
-    // Somewhere in the top right corner there is now red.
-    bool red = false;
-    for (int x = image.width() - 60; x < image.width() - 8 && !red; x++) {
-        for (int y = 8; y < 30 && !red; y++)
-            red = qRed(image.pixel(x, y)) > 200 && qGreen(image.pixel(x, y)) < 110;
-    }
-    QVERIFY(red);
 }
 
 void TestVideoSurface::statisticsAreLeftOffASmallTile()
@@ -443,7 +536,6 @@ void TestVideoSurface::statisticsAreLeftOffASmallTile()
     present(large, solidFrame(640, 360, 235, 128, 128));
     large.setStatsText(stats);
     large.setCaption(QStringLiteral("caption text"));
-    large.setLive(true);
     QImage image = shot(large);
     // Inside the backing but clear of the text, which is itself white.
     QVERIFY(!isNear(image.pixel(5, 5), 255, 255, 255));

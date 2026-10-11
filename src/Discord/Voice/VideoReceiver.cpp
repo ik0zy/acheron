@@ -53,8 +53,18 @@ void VideoReceiver::insert(uint16_t sequence, uint32_t timestamp, bool marker, P
     counters.packets++;
     counters.bytes += static_cast<quint64>(payload->size());
 
-    if (highestSequence >= 0 && std::abs(unwrapped - highestSequence) > MAX_SEQUENCE_JUMP) {
-        // The sender restarted its numbering; nothing held relates to what comes next.
+    const bool farFromExpected = highestSequence >= 0 && std::abs(unwrapped - highestSequence) > MAX_SEQUENCE_JUMP;
+    const bool continuesNewNumbering = farFromExpected && sequenceAfterFarPacket == sequence;
+    sequenceAfterFarPacket = farFromExpected && !continuesNewNumbering ? std::optional<uint16_t>(static_cast<uint16_t>(sequence + 1)) : std::nullopt;
+    if (farFromExpected && !continuesNewNumbering) {
+        // RFC 3550, A.1: one such packet is a stray, a long-delayed duplicate say. Only a
+        // second one following on from it shows that the sender restarted its numbering.
+        counters.strays++;
+        return;
+    }
+
+    if (continuesNewNumbering) {
+        // Nothing held relates to what comes next.
         resync();
         highestSequence = -1;
         baseSequence = -1;

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <map>
 #include <span>
+#include <utility>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -38,8 +39,8 @@ constexpr std::array HARDWARE_DEVICES = { AV_HWDEVICE_TYPE_VIDEOTOOLBOX };
 constexpr std::array HARDWARE_DEVICES = { AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_CUDA };
 #endif
 
-// How often each codec's hardware decoder has failed to get going. After a second time, later
-// decoders do not try it; once could have been a damaged stream.
+// How often each codec's hardware decoder has failed to get going on a frame that software
+// then decoded. After a second time, later decoders do not try it.
 constexpr int HARDWARE_FAILURES_TOLERATED = 1;
 std::array<std::atomic<int>, 5> hardwareFailures = {};
 
@@ -294,14 +295,17 @@ void VideoDecoder::push(Discord::Voice::VideoCodec codec, Discord::Voice::Encode
     std::function<void()> requester;
     {
         std::lock_guard lock(mutex);
-        if (static_cast<int>(queue.size()) >= MAX_QUEUED_FRAMES) {
+        const auto now = std::chrono::steady_clock::now();
+        const bool tooOld = !queue.empty() && now - queue.front().queuedAt > std::chrono::milliseconds(MAX_QUEUE_AGE_MS);
+        if (tooOld || static_cast<int>(queue.size()) >= MAX_QUEUED_FRAMES) {
             // Too far behind to catch up frame by frame.
             counters.dropped += queue.size();
             queue.clear();
+            queueWasDiscarded = true;
             overflowed = true;
             requester = keyframeRequester;
         }
-        queue.push_back({ codec, std::move(frame) });
+        queue.push_back({ codec, std::move(frame), now });
     }
     wake.notify_one();
 
@@ -316,6 +320,7 @@ void VideoDecoder::run()
 
     for (;;) {
         Queued queued;
+        bool framesWereSkipped = false;
         {
             std::unique_lock lock(mutex);
             wake.wait(lock, [this] { return stopping || !queue.empty(); });
@@ -323,7 +328,10 @@ void VideoDecoder::run()
                 break;
             queued = std::move(queue.front());
             queue.pop_front();
+            framesWereSkipped = std::exchange(queueWasDiscarded, false);
         }
+        if (framesWereSkipped)
+            startOverAtNextKeyframe();
         decode(queued);
     }
 
@@ -415,19 +423,15 @@ void VideoDecoder::describeDecoder()
     counters.hardware = hardwareDevice != nullptr;
 }
 
-void VideoDecoder::fail()
+void VideoDecoder::startOverAtNextKeyframe()
 {
-    // A hardware decoder that cannot get going is not tried again here; one that has been
-    // working is only resynchronised.
-    if (hardwareDevice && framesSinceOpen < HARDWARE_TRIAL_FRAMES) {
-        const Discord::Voice::VideoCodec codec = openCodec;
-        qCWarning(LogVideo) << "Hardware decoding of" << Discord::Voice::videoCodecName(codec) << "through" << hardwareName << "failed; using software";
-        hardwareRuledOut = true;
-        hardwareFailuresOf(codec)++;
-        open(codec);
-    } else if (context) {
+    if (context)
         avcodec_flush_buffers(context);
-    }
+    awaitingKeyframe = true;
+}
+
+void VideoDecoder::reportUndecodableFrame()
+{
     awaitingKeyframe = true;
 
     std::function<void()> requester;
@@ -459,26 +463,51 @@ void VideoDecoder::decode(Queued &queued)
         return;
     }
 
+    const int size = static_cast<int>(queued.frame.data.size());
+    queued.frame.data.resize(queued.frame.data.size() + AV_INPUT_BUFFER_PADDING_SIZE, 0);
+    if (decodeWithOpenDecoder(queued.frame, size))
+        return;
+
+    const bool hardwareOnTrial = hardwareDevice && framesSinceOpen < HARDWARE_TRIAL_FRAMES;
+    if (!hardwareOnTrial) {
+        startOverAtNextKeyframe();
+        reportUndecodableFrame();
+        return;
+    }
+
+    const Discord::Voice::VideoCodec codec = openCodec;
+    const QString hardware = QString::fromUtf8(hardwareName);
+    hardwareRuledOut = true;
+    if (open(codec) && queued.frame.keyframe) {
+        if (decodeWithOpenDecoder(queued.frame, size)) {
+            qCWarning(LogVideo) << "Hardware decoding of" << Discord::Voice::videoCodecName(codec) << "through" << hardware << "failed on a frame software decodes; using software";
+            hardwareFailuresOf(codec)++;
+            return;
+        }
+        // Software cannot decode the frame either, so the stream was at fault and not the
+        // hardware, which gets the next key frame.
+        hardwareRuledOut = false;
+        close();
+    }
+    reportUndecodableFrame();
+}
+
+bool VideoDecoder::decodeWithOpenDecoder(const Discord::Voice::EncodedVideoFrame &paddedFrame, int size)
+{
     QElapsedTimer timer;
     timer.start();
 
-    std::vector<uint8_t> &data = queued.frame.data;
-    const int size = static_cast<int>(data.size());
-    data.resize(data.size() + AV_INPUT_BUFFER_PADDING_SIZE, 0);
-
     AVPacket *packet = av_packet_alloc();
-    packet->data = data.data();
+    packet->data = const_cast<uint8_t *>(paddedFrame.data.data());
     packet->size = size;
-    packet->pts = queued.frame.rtpTimestamp;
-    if (queued.frame.keyframe)
+    packet->pts = paddedFrame.rtpTimestamp;
+    if (paddedFrame.keyframe)
         packet->flags |= AV_PKT_FLAG_KEY;
 
     const int sent = avcodec_send_packet(context, packet);
     av_packet_free(&packet);
-    if (sent < 0) {
-        fail();
-        return;
-    }
+    if (sent < 0)
+        return false;
     awaitingKeyframe = false;
 
     std::shared_ptr<VideoFrameSink> sink;
@@ -490,11 +519,9 @@ void VideoDecoder::decode(Queued &queued)
     for (;;) {
         const int received = avcodec_receive_frame(context, decoded);
         if (received == AVERROR(EAGAIN) || received == AVERROR_EOF)
-            break;
-        if (received < 0) {
-            fail();
-            return;
-        }
+            return true;
+        if (received < 0)
+            return false;
 
         const AVFrame *output = decoded;
         if (hardwareDevice) {
@@ -512,8 +539,7 @@ void VideoDecoder::decode(Queued &queued)
             if (failed) {
                 av_frame_unref(decoded);
                 framesSinceOpen = 0;
-                fail();
-                return;
+                return false;
             }
         }
 

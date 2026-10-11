@@ -13,9 +13,9 @@ StreamWatcher::StreamWatcher(Discord::Client *client, StreamManager *streams, Au
     connect(streams, &StreamManager::streamEnded, this, &StreamWatcher::onStreamEnded);
     connect(voice, &Audio::VoiceManager::voiceStateChanged, this, &StreamWatcher::onVoiceStateChanged);
     connect(voice, &Audio::VoiceManager::voiceDisconnected, this, &StreamWatcher::stopAll);
-    connect(voice, &Audio::VoiceManager::voiceConnected, this, &StreamWatcher::autoWatch);
-    connect(voice, &Audio::VoiceManager::participantJoined, this, &StreamWatcher::autoWatch);
-    connect(voice, &Audio::VoiceManager::participantUpdated, this, &StreamWatcher::autoWatch);
+    connect(voice, &Audio::VoiceManager::voiceConnected, this, &StreamWatcher::onVoiceConnected);
+    connect(voice, &Audio::VoiceManager::participantJoined, this, &StreamWatcher::onParticipantChanged);
+    connect(voice, &Audio::VoiceManager::participantUpdated, this, &StreamWatcher::onParticipantChanged);
 }
 
 void StreamWatcher::watchWhenConnected(const Discord::StreamKey &key)
@@ -27,27 +27,48 @@ void StreamWatcher::watchWhenConnected(const Discord::StreamKey &key)
     pendingWatch = key;
 }
 
-// In a private call the official client watches a stream without being asked, when the call
-// is joined and when someone in it goes live.
-void StreamWatcher::autoWatch()
+// In a private call the official client watches a stream without being asked: the first live
+// one when the call is joined, and afterwards whichever participant's voice state last arrived
+// saying they are live, in place of the one being watched (130553.js).
+void StreamWatcher::onVoiceConnected()
 {
-    if (!voice->isConnected() || voice->currentGuildId().isValid())
-        return;
+    lastAutoWatched.clear();
 
-    const Snowflake channelId = voice->currentChannelId();
     const QList<Audio::VoiceParticipant> participants = voice->currentParticipants();
     for (const Audio::VoiceParticipant &participant : participants) {
-        if (participant.userId == accountId)
+        const QString streamKey = Discord::StreamKey::forChannel(Snowflake::Invalid, voice->currentChannelId(), participant.userId).toString();
+        if (participant.userId == accountId || !participant.selfStream || fullStreams.contains(streamKey))
             continue;
-        const Discord::StreamKey key = Discord::StreamKey::forChannel(Snowflake::Invalid, channelId, participant.userId);
-        const QString streamKey = key.toString();
-        if (!participant.selfStream) {
-            fullStreams.remove(streamKey);
-            continue;
-        }
-        if (!sessions.contains(streamKey) && !fullStreams.contains(streamKey))
-            watch(key);
+        autoWatchStreamOf(participant.userId);
+        return;
     }
+}
+
+void StreamWatcher::onParticipantChanged(Snowflake userId)
+{
+    const Audio::VoiceParticipant *participant = voice->participant(userId);
+    if (!participant || userId == accountId)
+        return;
+
+    if (participant->selfStream)
+        autoWatchStreamOf(userId);
+    else
+        fullStreams.remove(Discord::StreamKey::forChannel(Snowflake::Invalid, voice->currentChannelId(), userId).toString());
+}
+
+void StreamWatcher::autoWatchStreamOf(Snowflake userId)
+{
+    const bool inPrivateCall = voice->isConnected() && !voice->currentGuildId().isValid();
+    if (!inPrivateCall)
+        return;
+
+    const Discord::StreamKey key = Discord::StreamKey::forChannel(Snowflake::Invalid, voice->currentChannelId(), userId);
+    const QString streamKey = key.toString();
+    if (sessions.contains(streamKey) || streamKey == lastAutoWatched || fullStreams.contains(streamKey))
+        return;
+
+    lastAutoWatched = streamKey;
+    watch(key);
 }
 
 void StreamWatcher::setGatewaySessionId(const QString &sessionId)

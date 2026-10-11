@@ -586,6 +586,9 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
     voiceConnection->adopt(backend());
 
     connect(voiceClient, &Discord::Voice::VoiceClient::audioReceived, audioPipeline, &AudioPipeline::onAudioReceived);
+    const QList<quint32> attachedSources = audioSources.keys();
+    for (quint32 source : attachedSources)
+        feedAudioSourceToPipeline(source);
 
     connect(audioPipeline, &AudioPipeline::encodedAudioReady, voiceClient, &Discord::Voice::VoiceClient::sendAudio);
 
@@ -685,23 +688,38 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
 
 void VoiceManager::attachAudioSource(quint32 source, Discord::Voice::VoiceClient *client)
 {
-    if (!audioPipeline)
+    audioSources[source].client = client;
+    feedAudioSourceToPipeline(source);
+}
+
+void VoiceManager::feedAudioSourceToPipeline(quint32 source)
+{
+    const AudioSource attached = audioSources.value(source);
+    if (!audioPipeline || !attached.client)
         return;
 
-    connect(client, &Discord::Voice::VoiceClient::audioReceived, audioPipeline,
+    connect(attached.client, &Discord::Voice::VoiceClient::audioReceived, audioPipeline,
             [ap = audioPipeline, source](quint32 ssrc, uint16_t sequence, uint32_t timestamp, const QByteArray &opusData) {
                 ap->onSourceAudioReceived(source, ssrc, sequence, timestamp, opusData);
             });
+    QMetaObject::invokeMethod(audioPipeline, [p = audioPipeline, source, volume = attached.volume]() { p->setSourceVolume(source, volume); });
 }
 
 void VoiceManager::detachAudioSource(quint32 source)
 {
-    if (audioPipeline)
-        QMetaObject::invokeMethod(audioPipeline, [p = audioPipeline, source]() { p->removeSource(source); });
+    const AudioSource detached = audioSources.take(source);
+    if (!audioPipeline)
+        return;
+    if (detached.client)
+        QObject::disconnect(detached.client, &Discord::Voice::VoiceClient::audioReceived, audioPipeline, nullptr);
+    QMetaObject::invokeMethod(audioPipeline, [p = audioPipeline, source]() { p->removeSource(source); });
 }
 
 void VoiceManager::setAudioSourceVolume(quint32 source, float volume)
 {
+    const auto attached = audioSources.find(source);
+    if (attached != audioSources.end())
+        attached->volume = volume;
     if (audioPipeline)
         QMetaObject::invokeMethod(audioPipeline, [p = audioPipeline, source, volume]() { p->setSourceVolume(source, volume); });
 }

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <vector>
 
 #include "PacketBuffer.hpp"
@@ -43,6 +44,7 @@ public:
         quint64 keyframes = 0;
         quint64 retransmitted = 0;
         quint64 duplicates = 0;
+        quint64 strays = 0;
         quint64 nacked = 0;
         quint64 keyframeRequests = 0;
         quint64 resyncs = 0;
@@ -105,6 +107,9 @@ private:
     // The next sequence number a frame may start at; -1 while waiting for a key frame.
     qint64 nextSequence = -1;
     qint64 highestSequence = -1;
+    // The number a packet from far outside the expected range would be followed by, were it
+    // the first of a sender's new numbering and not a stray.
+    std::optional<uint16_t> sequenceAfterFarPacket;
     bool keyframeWanted = true;
     qint64 keyframeRequestedMs = -1;
 

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <utility>
 
 namespace Acheron {
 namespace Discord {
@@ -196,6 +197,9 @@ void VoiceClient::cleanupTransport()
     deliveredSsrcs.clear();
     sentVideoWants.clear();
     transportFeedback = TransportFeedback();
+    senderReports.clear();
+    serverEstimateBps = 0;
+    serverLossFraction = 0;
 
     encryption.reset();
 
@@ -400,7 +404,7 @@ void VoiceClient::onPacket(PacketPool::Handle packet)
 {
     switch (classifyPacket(packet->bytes())) {
     case PacketKind::Rtcp:
-        unrouted.rtcp++;
+        receiveRtcp(std::move(packet));
         return;
     case PacketKind::Unknown:
         return;
@@ -427,7 +431,45 @@ void VoiceClient::onPacket(PacketPool::Handle packet)
         return;
     }
 
+    // Nothing this client plays, but the server numbers these too: it tries the link with
+    // padding under a payload type of its own, and a packet not reported counts as lost.
+    if (encryption && encryption->open(*packet, rtp->clearSize)) {
+        packet->dropFront(rtp->clearSize);
+        if (packet->size() >= rtp->extensionSize)
+            noteTransportSequence(packet->bytes().first(static_cast<size_t>(rtp->extensionSize)));
+    }
     unrouted.rtp++;
+}
+
+void VoiceClient::noteTransportSequence(std::span<const uint8_t> extensions)
+{
+    // Only while feedback is going out; otherwise the record would grow without end.
+    if (!videoTimer || !videoTimer->isActive())
+        return;
+    const std::span<const uint8_t> sequence = findRtpExtension(extensions, TRANSPORT_SEQUENCE_EXTENSION);
+    if (sequence.size() == 2)
+        transportFeedback.onPacket(qFromBigEndian<uint16_t>(sequence.data()), videoClock.nsecsElapsed() / 1000);
+}
+
+void VoiceClient::receiveRtcp(PacketPool::Handle packet)
+{
+    if (!encryption || !encryption->open(*packet, RTCP_CLEAR_SIZE)) {
+        unrouted.rtcp++;
+        return;
+    }
+
+    const ReceivedRtcp received = parseRtcp(packet->bytes());
+    if (videoClock.isValid()) {
+        const qint64 now = videoClock.nsecsElapsed() / 1000;
+        for (const ReceivedRtcp::SenderReport &report : received.senderReports)
+            senderReports.insert(report.ssrc, { report.compactNtp, now });
+    }
+    if (received.hasInboundEstimate) {
+        if (received.inboundBitsPerSecond != serverEstimateBps)
+            qCDebug(LogVoice) << "Server's estimate of the way here:" << received.inboundBitsPerSecond << "bps, loss" << received.inboundLoss;
+        serverEstimateBps = received.inboundBitsPerSecond;
+        serverLossFraction = received.inboundLoss;
+    }
 }
 
 void VoiceClient::receiveVideo(const ParsedRtp &rtp, PacketPool::Handle packet, VideoCodec codec, bool retransmission)
@@ -441,11 +483,8 @@ void VoiceClient::receiveVideo(const ParsedRtp &rtp, PacketPool::Handle packet, 
         return;
     // Every packet the server numbered is reported back to it, wanted or not, since the
     // numbering is about the connection and not about any one stream.
-    const std::span<const uint8_t> transportSequence = findRtpExtension(packet->bytes().first(static_cast<size_t>(rtp.extensionSize)), TRANSPORT_SEQUENCE_EXTENSION);
-    if (transportSequence.size() == 2) {
-        transportFeedback.onPacket(qFromBigEndian<uint16_t>(transportSequence.data()), videoClock.nsecsElapsed() / 1000);
-        transportMediaSsrc = header.ssrc;
-    }
+    noteTransportSequence(packet->bytes().first(static_cast<size_t>(rtp.extensionSize)));
+    transportMediaSsrc = header.ssrc;
     packet->dropFront(rtp.extensionSize);
 
     if (header.padding) {
@@ -501,6 +540,7 @@ void VoiceClient::deliverVideoFrames(quint32 ssrc, RemoteVideo &video)
                 }
             } else if (!daveSession->isDowngraded()) {
                 // Keys are still being agreed. A key frame is asked for once they are.
+                videoDroppedAwaitingDaveKeys = true;
                 return;
             }
         }
@@ -677,7 +717,15 @@ void VoiceClient::sendVideoWants()
     gateway->sendMediaSinkWants(plannedWants);
 }
 
-void VoiceClient::requestVideoKeyframe()
+void VoiceClient::requestVideoKeyframeFrom(Core::Snowflake userId)
+{
+    for (auto &[ssrc, video] : remoteVideos) {
+        if (video.receiver && video.userId == userId)
+            video.receiver->requestKeyframe();
+    }
+}
+
+void VoiceClient::requestVideoKeyframeFromEveryone()
 {
     for (auto &[ssrc, video] : remoteVideos) {
         if (video.receiver)
@@ -744,7 +792,12 @@ void VoiceClient::onVideoTick()
 
         if (!reportDue)
             continue;
-        const ReceptionReport report = video.receiver->receptionReport();
+        ReceptionReport report = video.receiver->receptionReport();
+        if (const auto heard = senderReports.constFind(ssrc); heard != senderReports.constEnd()) {
+            // The delay is in units of 1/65536 of a second.
+            report.lastSenderReport = heard->compactNtp;
+            report.delaySinceLastSenderReport = static_cast<quint32>((videoClock.nsecsElapsed() / 1000 - heard->arrivalUs) * 65536 / 1000000);
+        }
         reports.push_back(report);
         const VideoReceiver::Stats &counters = video.receiver->stats();
         stats.codec = videoCodecName(video.receiver->codec());
@@ -802,6 +855,8 @@ void VoiceClient::onVideoTick()
     if (reportDue) {
         videoReportedMs = now;
         stats.decryptFailures = videoDecryptFailures;
+        stats.serverEstimateBps = serverEstimateBps;
+        stats.serverLossFraction = serverLossFraction;
         if (!remoteVideos.empty())
             emit videoStatsUpdated(stats);
     }
@@ -834,6 +889,7 @@ void VoiceClient::receiveAudio(const ParsedRtp &rtp, PacketPool::Handle packet)
     packet->dropFront(rtp.clearSize);
     if (packet->size() <= rtp.extensionSize)
         return;
+    noteTransportSequence(packet->bytes().first(static_cast<size_t>(rtp.extensionSize)));
     packet->dropFront(rtp.extensionSize);
 
     // Stream audio arrives padded now and then; the padding is not part of the frame.
@@ -1071,8 +1127,8 @@ void VoiceClient::ensureDaveSession(uint16_t protocolVersion)
 
     connect(daveSession.get(), &DaveSession::daveStateChanged,
             this, [this](bool enabled) {
-                // Video dropped while the keys were being agreed has to start again.
-                requestVideoKeyframe();
+                if (std::exchange(videoDroppedAwaitingDaveKeys, false))
+                    requestVideoKeyframeFromEveryone();
                 if (enabled) {
                     auto auth = daveSession->lastEpochAuthenticator();
                     if (!auth.empty())

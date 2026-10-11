@@ -59,6 +59,7 @@ public:
 
 signals:
     void sendersChanged();
+    void videoDisabledChanged(Snowflake userId);
 
 private slots:
     void onLayersChanged(Snowflake userId, const QList<Discord::Voice::VideoLayer> &layers);

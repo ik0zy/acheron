@@ -12,6 +12,8 @@
 #include <QThread>
 
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -135,6 +137,44 @@ public:
     std::atomic<int> height{ 0 };
 };
 
+// Holds the decoder's thread in present() until the gate is opened.
+class GatedSink : public Core::Media::VideoFrameSink
+{
+public:
+    void present(const AVFrame *) override
+    {
+        frames++;
+        std::unique_lock lock(mutex);
+        opened.wait(lock, [this] { return open; });
+    }
+
+    void openGate()
+    {
+        {
+            std::lock_guard lock(mutex);
+            open = true;
+        }
+        opened.notify_all();
+    }
+
+    std::atomic<int> frames{ 0 };
+
+private:
+    std::mutex mutex;
+    std::condition_variable opened;
+    bool open = false;
+};
+
+EncodedVideoFrame forDecoder(VideoCodec codec, const EncodedFrame &frame)
+{
+    EncodedVideoFrame encoded;
+    encoded.data = frame.data;
+    encoded.rtpTimestamp = frame.timestamp;
+    encoded.keyframe = frame.keyframe;
+    prepareForDecoder(codec, encoded.data);
+    return encoded;
+}
+
 struct Chain
 {
     explicit Chain(VideoCodec codec, bool allowHardware = false)
@@ -203,6 +243,9 @@ private slots:
     void lossSkipsToTheNextKeyframe();
     void hardwareDecodesOrGivesWayToSoftware_data() { codecCases(); }
     void hardwareDecodesOrGivesWayToSoftware();
+    void aDiscardedQueueStartsOverAtAKeyframe();
+    void aQueueThatHasWaitedTooLongIsDiscarded();
+    void aDamagedStreamIsNotHeldAgainstTheHardware();
 
 private:
     static void codecCases();
@@ -345,6 +388,119 @@ void TestVideoDecode::hardwareDecodesOrGivesWayToSoftware()
         QVERIFY(stats.errors <= 1);
         QVERIFY(chain.sink->frames.load() >= FRAME_COUNT);
     }
+}
+
+void TestVideoDecode::aDiscardedQueueStartsOverAtAKeyframe()
+{
+    const CodecCase vp8{ VideoCodec::VP8, AV_CODEC_ID_VP8, "libvpx" };
+    if (!Core::Media::decodableVideoCodecs().contains(vp8.codec))
+        QSKIP("this ffmpeg cannot decode the codec");
+    const std::vector<EncodedFrame> clip = encodeClip(vp8);
+    if (clip.empty())
+        QSKIP("this ffmpeg has no encoder for the codec");
+    QVERIFY(clip[0].keyframe && !clip[1].keyframe && clip[KEYFRAME_INTERVAL].keyframe);
+
+    auto sink = std::make_shared<GatedSink>();
+    std::atomic<int> keyframeRequests{ 0 };
+    Core::Media::VideoDecoder decoder(false);
+    decoder.setSink(sink);
+    decoder.setKeyframeRequester([&keyframeRequests] { keyframeRequests++; });
+
+    decoder.push(vp8.codec, forDecoder(vp8.codec, clip[0]));
+    QTRY_COMPARE(sink->frames.load(), 1);
+
+    // With its thread held in the sink the decoder falls behind by more than its queue holds,
+    // so the queue is thrown away and what arrives next has nothing to build on.
+    constexpr int ARRIVING_AFTER_THE_DISCARD = 5;
+    for (int i = 0; i < Core::Media::VideoDecoder::MAX_QUEUED_FRAMES + ARRIVING_AFTER_THE_DISCARD; i++)
+        decoder.push(vp8.codec, forDecoder(vp8.codec, clip[1]));
+    QCOMPARE(keyframeRequests.load(), 1);
+
+    sink->openGate();
+    QTest::qWait(300);
+    QCOMPARE(sink->frames.load(), 1);
+    QCOMPARE(decoder.stats().errors, quint64(0));
+
+    decoder.push(vp8.codec, forDecoder(vp8.codec, clip[KEYFRAME_INTERVAL]));
+    decoder.push(vp8.codec, forDecoder(vp8.codec, clip[KEYFRAME_INTERVAL + 1]));
+    QTRY_COMPARE(sink->frames.load(), 3);
+}
+
+void TestVideoDecode::aQueueThatHasWaitedTooLongIsDiscarded()
+{
+    const CodecCase vp8{ VideoCodec::VP8, AV_CODEC_ID_VP8, "libvpx" };
+    if (!Core::Media::decodableVideoCodecs().contains(vp8.codec))
+        QSKIP("this ffmpeg cannot decode the codec");
+    const std::vector<EncodedFrame> clip = encodeClip(vp8);
+    if (clip.empty())
+        QSKIP("this ffmpeg has no encoder for the codec");
+
+    auto sink = std::make_shared<GatedSink>();
+    std::atomic<int> keyframeRequests{ 0 };
+    Core::Media::VideoDecoder decoder(false);
+    decoder.setSink(sink);
+    decoder.setKeyframeRequester([&keyframeRequests] { keyframeRequests++; });
+
+    decoder.push(vp8.codec, forDecoder(vp8.codec, clip[0]));
+    QTRY_COMPARE(sink->frames.load(), 1);
+
+    // A slow stream never fills the queue, but what waits in it is as far behind all the same.
+    decoder.push(vp8.codec, forDecoder(vp8.codec, clip[1]));
+    QTest::qWait(Core::Media::VideoDecoder::MAX_QUEUE_AGE_MS / 2);
+    decoder.push(vp8.codec, forDecoder(vp8.codec, clip[1]));
+    QCOMPARE(keyframeRequests.load(), 0);
+    QTest::qWait(Core::Media::VideoDecoder::MAX_QUEUE_AGE_MS / 2 + 100);
+    decoder.push(vp8.codec, forDecoder(vp8.codec, clip[1]));
+    QCOMPARE(keyframeRequests.load(), 1);
+    QCOMPARE(decoder.stats().dropped, quint64(2));
+
+    sink->openGate();
+    QTest::qWait(200);
+    QCOMPARE(sink->frames.load(), 1);
+}
+
+void TestVideoDecode::aDamagedStreamIsNotHeldAgainstTheHardware()
+{
+    const CodecCase h264{ VideoCodec::H264, AV_CODEC_ID_H264, "libopenh264" };
+    const std::vector<EncodedFrame> clip = encodeClip(h264);
+    if (clip.empty())
+        QSKIP("this ffmpeg has no encoder for the codec");
+
+    struct Outcome
+    {
+        bool hardware = false;
+        quint64 errors = 0;
+        int shown = 0;
+    };
+    const auto decodeClip = [&](int damagedKeyframesFirst) {
+        Chain chain(h264.codec, true);
+        for (int i = 0; i < damagedKeyframesFirst; i++) {
+            // An IDR slice with nothing to say what picture it belongs to.
+            EncodedVideoFrame damaged;
+            damaged.data = { 0, 0, 0, 1, 0x65, 0xB8, 0x00, 0x04, 0x00, 0x00, 0x03, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+            damaged.keyframe = true;
+            chain.decoder.push(h264.codec, std::move(damaged));
+        }
+        for (const EncodedFrame &frame : clip)
+            chain.send(h264, frame);
+        Outcome outcome;
+        outcome.shown = chain.waitForDecoded(static_cast<int>(clip.size()));
+        outcome.hardware = chain.decoder.stats().hardware;
+        outcome.errors = chain.decoder.stats().errors;
+        return outcome;
+    };
+
+    if (!decodeClip(0).hardware)
+        QSKIP("no hardware H264 decoder on this machine");
+
+    // More damaged starts than failures are tolerated before hardware is given up on.
+    for (int attempt = 0; attempt < 3; attempt++) {
+        const Outcome outcome = decodeClip(1);
+        QCOMPARE(outcome.errors, quint64(1));
+        QVERIFY(outcome.hardware);
+        QCOMPARE(outcome.shown, static_cast<int>(clip.size()));
+    }
+    QVERIFY(decodeClip(0).hardware);
 }
 
 QTEST_GUILESS_MAIN(TestVideoDecode)

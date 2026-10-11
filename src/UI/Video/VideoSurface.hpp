@@ -47,8 +47,6 @@ public:
     void setPlaceholder(const QPixmap &avatar);
     // A ring around the tile while the person is speaking.
     void setSpeaking(bool speaking);
-    // The red LIVE marker of someone who is streaming.
-    void setLive(bool live);
 
     // Sends geometryChanged again, for a listener that was not there the first time.
     void announceGeometry();
@@ -56,9 +54,14 @@ public:
     // Forgets the picture, so that a stream which is over does not leave its last frame up.
     void clear();
 
+    // What the surface is showing, picture and everything over it. With the graphics card
+    // the picture is in a window of its own, which grab() does not see. Null until shown.
+    [[nodiscard]] QImage snapshot();
+
 signals:
     // The area the picture covers, in device pixels, and whether any of it is on screen.
     void geometryChanged(int pixelCount, bool visible);
+    void clicked();
     void doubleClicked();
 
 protected:
@@ -67,6 +70,7 @@ protected:
     void showEvent(QShowEvent *event) override;
     void hideEvent(QHideEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
+    void mouseReleaseEvent(QMouseEvent *event) override;
 
 private:
     class Sink;
@@ -81,6 +85,7 @@ private:
 
     std::shared_ptr<Sink> frameSink;
     GlLayer *glLayer = nullptr;
+    QWidget *glContainer = nullptr;
     QTimer rescaleTimer;
     QString messageTitle;
     QString messageDetail;
@@ -88,7 +93,6 @@ private:
     QString captionText;
     QPixmap placeholder;
     bool speaking = false;
-    bool live = false;
     int reportedPixels = -1;
     bool reportedVisible = false;
 };

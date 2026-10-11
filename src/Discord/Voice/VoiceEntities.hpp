@@ -371,6 +371,8 @@ struct VoiceIdentifyData : Core::JsonUtils::JsonObject
 struct ConnectionParams
 {
     QString endpoint;
+    // Discord's voice gateways are only reached over TLS. A test's stand-in server is not.
+    QString gatewayScheme = QStringLiteral("wss");
     QString token;
     Core::Snowflake serverId;
     Core::Snowflake channelId;

@@ -81,8 +81,8 @@ find_package(Qt${QT_VERSION_MAJOR} COMPONENTS ZlibPrivate QUIET)
 # in Qt 5 it is part of Gui and Widgets.
 set(QT_OPENGL_LIBRARIES "")
 if(QT_VERSION_MAJOR GREATER_EQUAL 6)
-    find_package(Qt6 REQUIRED COMPONENTS OpenGL OpenGLWidgets)
-    set(QT_OPENGL_LIBRARIES Qt6::OpenGL Qt6::OpenGLWidgets)
+    find_package(Qt6 REQUIRED COMPONENTS OpenGL)
+    set(QT_OPENGL_LIBRARIES Qt6::OpenGL)
 endif()
 qt_standard_project_setup(I18N_TRANSLATED_LANGUAGES en)
 
@@ -375,7 +375,7 @@ if(ENABLE_VOICE AND TARGET ffmpeg)
         src/Core/Video/CallVideo.cpp
         src/Core/Video/TileVisibility.cpp
         src/UI/Video/VideoSurface.cpp
-        src/UI/CallWindow.cpp
+        src/UI/CallView.cpp
     )
     if(WIN32)
         list(APPEND PROJECT_SOURCES src/UI/Video/D3D11GlBridge.cpp)
@@ -484,6 +484,20 @@ if(BUILD_TESTS)
         target_include_directories(TestSinkWants PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME SinkWantsTests COMMAND TestSinkWants)
 
+        qt_add_executable(TestVoiceClient tests/tst_VoiceClient.cpp src/Core/Logging.cpp
+            src/Core/OrderedJson.cpp src/Core/ProxyConfig.cpp src/Core/Snowflake.cpp
+            src/Discord/ClientIdentity.cpp src/Discord/CurlUtils.cpp
+            src/Discord/Voice/DaveSession.cpp src/Discord/Voice/Rtcp.cpp
+            src/Discord/Voice/RtpPacket.cpp src/Discord/Voice/SinkWants.cpp
+            src/Discord/Voice/Socks5UdpAssociation.cpp src/Discord/Voice/TransportFeedback.cpp
+            src/Discord/Voice/UdpTransport.cpp src/Discord/Voice/VideoDepacketizer.cpp
+            src/Discord/Voice/VideoReceiver.cpp src/Discord/Voice/VoiceClient.cpp
+            src/Discord/Voice/VoiceEncryption.cpp src/Discord/Voice/VoiceGateway.cpp)
+        target_link_libraries(TestVoiceClient PRIVATE Qt::Core Qt::Network Qt::Test CURL::libcurl ${SODIUM_TARGET} libdave MLSPP::mlspp)
+        target_include_directories(TestVoiceClient PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(TestVoiceClient PRIVATE NOMINMAX)
+        add_test(NAME VoiceClientTests COMMAND TestVoiceClient)
+
         if(TARGET ffmpeg)
             qt_add_executable(TestRtpVideo tests/tst_RtpVideo.cpp src/Discord/Voice/RtpPacket.cpp
                 src/Discord/Voice/VideoDepacketizer.cpp src/Discord/Voice/VideoReceiver.cpp
@@ -570,7 +584,7 @@ if (MSVC)
             list(APPEND _msvc_test_targets TestApng TestClips)
         endif()
         if(TARGET TestRtp)
-            list(APPEND _msvc_test_targets TestRtp TestUdpTransport TestSinkWants)
+            list(APPEND _msvc_test_targets TestRtp TestUdpTransport TestSinkWants TestVoiceClient)
         endif()
         if(TARGET TestRtpVideo)
             list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface)

@@ -48,6 +48,9 @@ struct VideoReceiveStats
     quint64 decryptFailures = 0;
     // Share of packets lost since the previous report, 0 to 1.
     double lossFraction = 0;
+    // What the server says the way to this client carries, and loses. Zero until it has said.
+    quint64 serverEstimateBps = 0;
+    double serverLossFraction = 0;
 };
 
 class VoiceClient : public QObject
@@ -99,8 +102,9 @@ public:
     // SSRCs to receive and hand on. Everything else that arrives is discarded.
     void setVideoPlan(const MediaSinkWants &wants, const QSet<quint32> &deliver);
 
-    // A frame handed out could not be decoded; ask every sender to start over.
-    void requestVideoKeyframe();
+    // A frame handed out could not be decoded; ask its sender to start over.
+    void requestVideoKeyframeFrom(Core::Snowflake userId);
+    void requestVideoKeyframeFromEveryone();
 
     // No decoder here can handle the codec after all: tell the server, so that it has senders
     // use another.
@@ -149,7 +153,11 @@ private:
     void ensureDaveSession(uint16_t protocolVersion);
 
     void onPacket(PacketPool::Handle packet);
+    void receiveRtcp(PacketPool::Handle packet);
     void receiveAudio(const ParsedRtp &rtp, PacketPool::Handle packet);
+    // Takes the packet's place in the server's numbering of everything it sends this way,
+    // from its decrypted header extensions, for the feedback that goes back.
+    void noteTransportSequence(std::span<const uint8_t> extensions);
     // Replaces the packet with its end-to-end decrypted contents.
     bool daveDecryptAudio(quint32 ssrc, PacketPool::Handle &packet);
 
@@ -221,6 +229,7 @@ private:
     MediaSinkWants plannedWants;
     QSet<quint32> deliveredSsrcs;
     bool explicitVideoPlan = false;
+    bool videoDroppedAwaitingDaveKeys = false;
     VideoFrameHandler videoFrameHandler;
     QTimer *videoTimer = nullptr;
     QElapsedTimer videoClock;
@@ -235,6 +244,15 @@ private:
     TransportFeedback transportFeedback;
     qint64 transportReportedMs = 0;
     quint32 transportMediaSsrc = 0;
+
+    struct HeardSenderReport
+    {
+        quint32 compactNtp = 0;
+        qint64 arrivalUs = 0;
+    };
+    QHash<quint32, HeardSenderReport> senderReports;
+    quint64 serverEstimateBps = 0;
+    double serverLossFraction = 0;
 
     static constexpr int KEEPALIVE_INTERVAL_MS = 10000;
     static constexpr int VIDEO_TICK_MS = 20;

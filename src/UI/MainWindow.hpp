@@ -52,7 +52,7 @@ class TrayIcon;
 #ifndef ACHERON_NO_VOICE
 class VoiceStatusBar;
 class StreamPreviewPopup;
-class CallWindow;
+class CallView;
 #endif
 } // namespace UI
 } // namespace Acheron
@@ -191,6 +191,10 @@ private:
     ViewMode viewMode = ViewMode::TextChannel;
     bool memberListWanted = false;
     QSplitter *centerSplitter = nullptr;
+    // Above the chat: where the video of a call is shown while there is any.
+    QSplitter *callSplitter = nullptr;
+    QWidget *callHost = nullptr;
+    void updateCallHost();
     QWidget *threadPane = nullptr;
     QWidget *threadHeader = nullptr;
     QPushButton *popOutButton = nullptr;
@@ -238,9 +242,11 @@ private:
 #ifndef ACHERON_NO_VOICE
     VoiceStatusBar *voiceStatusBar;
     StreamPreviewPopup *streamPreviewPopup = nullptr;
-    // The video window of each account's call, by account id.
-    QHash<quint64, QPointer<CallWindow>> callWindows;
-    CallWindow *openCallWindow(Core::ClientInstance *instance);
+    // The video view of each account's call, by account id. They sit in `callHost` unless
+    // popped out.
+    QHash<quint64, QPointer<CallView>> callViews;
+    CallView *ensureCallView(Core::ClientInstance *instance);
+    void removeCallView(quint64 accountId);
 #endif
     AccountsWindow *accountsWindow = nullptr;
     SettingsWindow *settingsWindow = nullptr;

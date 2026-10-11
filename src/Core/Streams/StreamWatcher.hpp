@@ -58,10 +58,12 @@ private slots:
     void onStreamChanged(const QString &streamKey);
     void onStreamEnded(const QString &streamKey, Acheron::Core::StreamEndReason reason);
     void onVoiceStateChanged();
-    void autoWatch();
+    void onVoiceConnected();
+    void onParticipantChanged(Snowflake userId);
 
 private:
     void remove(const QString &streamKey, bool tellGateway);
+    void autoWatchStreamOf(Snowflake userId);
 
     Discord::Client *client;
     StreamManager *streams;
@@ -74,6 +76,7 @@ private:
     std::optional<Discord::StreamKey> pendingWatch;
     // Streams that turned this account away for being full; not asked for again on its behalf.
     QSet<QString> fullStreams;
+    QString lastAutoWatched;
     quint32 nextAudioSource = 1;
 };
 

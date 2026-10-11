@@ -6,12 +6,14 @@
 #include <QGuiApplication>
 #include <QImage>
 #include <QMatrix3x3>
+#include <QMouseEvent>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLExtraFunctions>
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
-#include <QOpenGLWidget>
+#include <QOpenGLWindow>
+#include <QPlatformSurfaceEvent>
 #include <QPainter>
 #include <QPen>
 #include <QSettings>
@@ -40,10 +42,8 @@ const char *const GPU_DRAWING_KEY = "video/gpu_drawing";
 const char *const DIRECT_FRAMES_KEY = "video/direct_frames";
 
 constexpr int RESCALE_DELAY_MS = 120;
-// Drawn over video, so these do not follow the theme: the green Discord rings a speaker
-// with, and the red of its LIVE marker.
+// Drawn over video, so it does not follow the theme: the green Discord rings a speaker with.
 const QColor SPEAKING_RING(0x23, 0xA5, 0x5A);
-const QColor LIVE_RED(0xED, 0x42, 0x45);
 constexpr int HD_HEIGHT = 720;
 
 // QImage::Format_RGB32 is a 32-bit word per pixel, so its byte order follows the machine's.
@@ -385,6 +385,9 @@ public:
         std::lock_guard lock(mutex);
         card = std::move(picture);
         hardwareFramesUsable.store(card != nullptr, std::memory_order_relaxed);
+        // The frame held may be one the card before this one never got to.
+        if (shown && last->hw_frames_ctx)
+            requestHandOver();
     }
 #endif
 
@@ -598,29 +601,32 @@ private:
 // Draws the picture with the graphics card. A frame in memory goes up as textures, and a shader
 // converts them to RGB while the card scales them to the widget. A frame the decoder left on
 // the card arrives as a finished texture, which is only drawn. The layer sits inside the
-// surface, fills it, and lets the mouse through to it.
-class VideoSurface::GlLayer : public QOpenGLWidget, protected QOpenGLFunctions
+// surface, fills it, and passes the mouse and keys on to it.
+//
+// It is a window of its own inside the surface's window, not a widget. A widget that draws
+// with OpenGL makes Qt rebuild the whole window it is put into, visibly, and from then on
+// compose all of that window through OpenGL for every frame of video.
+class VideoSurface::GlLayer : public QOpenGLWindow, protected QOpenGLFunctions
 {
 public:
     GlLayer(VideoSurface *owner, std::shared_ptr<Sink> sink)
-        : QOpenGLWidget(owner), owner(owner), sink(std::move(sink))
+        : QOpenGLWindow(sharedContext()), owner(owner), sink(std::move(sink))
     {
-        setAttribute(Qt::WA_TransparentForMouseEvents);
+        // Several of these draw from one thread; waiting for the screen in each would have
+        // them hold one another up.
+        QSurfaceFormat format = requestedFormat();
+        format.setSwapInterval(0);
+        setFormat(format);
     }
 
     ~GlLayer() override
     {
-        // The context outlives this object's members by a moment, and must not call back then.
-        disconnect(contextGoing);
         closeCard();
-        if (!context())
-            return;
-        makeCurrent();
-        glDeleteTextures(static_cast<GLsizei>(textures.size()), textures.data());
-        glDeleteTextures(1, &overlayTexture);
-        program.removeAllShaders();
-        plainProgram.removeAllShaders();
-        doneCurrent();
+        if (glReady && context() && handle()) {
+            makeCurrent();
+            releaseGl();
+            doneCurrent();
+        }
     }
 
     // The overlays have changed and need painting again.
@@ -631,10 +637,80 @@ public:
 
     [[nodiscard]] bool drawsFromCard() const { return shown == Shown::OnCard; }
 
+    // What is on the surface now, drawn afresh. Null before the window has been shown.
+    [[nodiscard]] QImage snapshot()
+    {
+        if (!isValid() || !handle())
+            return {};
+        makeCurrent();
+        paintGL();
+        const QSize area = size() * devicePixelRatio();
+        QImage image(area, QImage::Format_RGBA8888);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadPixels(0, 0, area.width(), area.height(), GL_RGBA, GL_UNSIGNED_BYTE, image.bits());
+        // OpenGL counts rows from the bottom.
+        image = image.mirrored();
+        image.setDevicePixelRatio(devicePixelRatio());
+        return image;
+    }
+
 protected:
+    // Every window of this kind shares its textures with the others, so that one set of
+    // hand-over workers serves them all.
+    static QOpenGLContext *sharedContext()
+    {
+        static QOpenGLContext *const root = [] {
+            auto *context = new QOpenGLContext(qApp);
+            context->create();
+            return context;
+        }();
+        return root->isValid() ? root : nullptr;
+    }
+
+    bool event(QEvent *event) override
+    {
+        // The last moment at which the context can be made current on this window.
+        if (event->type() == QEvent::PlatformSurface && static_cast<QPlatformSurfaceEvent *>(event)->surfaceEventType() == QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed && glReady) {
+            makeCurrent();
+            releaseGl();
+            doneCurrent();
+        }
+        return QOpenGLWindow::event(event);
+    }
+
+    // Mouse and keys land on this window, but belong to the surface it is in.
+    void mousePressEvent(QMouseEvent *event) override { QCoreApplication::sendEvent(owner, event); }
+    void mouseDoubleClickEvent(QMouseEvent *event) override { QCoreApplication::sendEvent(owner, event); }
+    void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        QCoreApplication::sendEvent(owner, event);
+        if (event->button() == Qt::RightButton) {
+            QContextMenuEvent menu(QContextMenuEvent::Mouse, event->pos(), event->globalPos());
+            QCoreApplication::sendEvent(owner, &menu);
+        }
+    }
+    void keyPressEvent(QKeyEvent *event) override { QCoreApplication::sendEvent(owner->window(), event); }
+    void focusInEvent(QFocusEvent *event) override
+    {
+        QOpenGLWindow::focusInEvent(event);
+        // A click here brings the surface's window forward, and that is all it should do:
+        // whatever was being typed into keeps the keyboard.
+        if (QWindow *top = owner->window()->windowHandle())
+            top->requestActivate();
+    }
+
+    // A new context: whatever was made in the last one went with it.
     void initializeGL() override
     {
+        forgetGl();
+    }
+
+    void setupGl()
+    {
         initializeOpenGLFunctions();
+        program = std::make_unique<QOpenGLShaderProgram>();
+        plainProgram = std::make_unique<QOpenGLShaderProgram>();
+        glReady = true;
 
         // Written for OpenGL ES 2 and the desktop versions it is a subset of, so that the same
         // source runs through ANGLE and on old drivers.
@@ -668,10 +744,10 @@ protected:
             }
         )";
 
-        usable = program.addShaderFromSourceCode(QOpenGLShader::Vertex, VERTEX) && program.addShaderFromSourceCode(QOpenGLShader::Fragment, FRAGMENT);
-        program.bindAttributeLocation("position", 0);
-        program.bindAttributeLocation("texcoord", 1);
-        usable = usable && program.link();
+        usable = program->addShaderFromSourceCode(QOpenGLShader::Vertex, VERTEX) && program->addShaderFromSourceCode(QOpenGLShader::Fragment, FRAGMENT);
+        program->bindAttributeLocation("position", 0);
+        program->bindAttributeLocation("texcoord", 1);
+        usable = usable && program->link();
 
         // A texture that is already RGB: the overlays, and a picture made on the card.
         static const char *const PLAIN_FRAGMENT = R"(
@@ -686,11 +762,11 @@ protected:
                 gl_FragColor = opaque > 0.5 ? vec4(colour.rgb, 1.0) : colour;
             }
         )";
-        plainProgram.addShaderFromSourceCode(QOpenGLShader::Vertex, VERTEX);
-        plainProgram.addShaderFromSourceCode(QOpenGLShader::Fragment, PLAIN_FRAGMENT);
-        plainProgram.bindAttributeLocation("position", 0);
-        plainProgram.bindAttributeLocation("texcoord", 1);
-        plainProgram.link();
+        plainProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, VERTEX);
+        plainProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, PLAIN_FRAGMENT);
+        plainProgram->bindAttributeLocation("position", 0);
+        plainProgram->bindAttributeLocation("texcoord", 1);
+        plainProgram->link();
 
         glGenTextures(1, &overlayTexture);
         glBindTexture(GL_TEXTURE_2D, overlayTexture);
@@ -710,12 +786,7 @@ protected:
         glBindTexture(GL_TEXTURE_2D, 0);
 
 #ifdef Q_OS_WIN
-        // The card's pictures are in textures of this context's share group, and are of no
-        // use once it has gone.
-        closeCard();
-        disconnect(contextGoing);
-        contextGoing = connect(context(), &QOpenGLContext::aboutToBeDestroyed, this, [this] { closeCard(); });
-        if (usable && plainProgram.isLinked() && QSettings().value(DIRECT_FRAMES_KEY, true).toBool() && D3D11GlBridge::contextSupportsIt()) {
+        if (usable && plainProgram->isLinked() && QSettings().value(DIRECT_FRAMES_KEY, true).toBool() && D3D11GlBridge::contextSupportsIt()) {
             if (auto worker = CardWorker::sharingWith(context())) {
                 card = std::make_shared<CardPicture>(std::move(worker));
                 sink->setCard(card);
@@ -728,6 +799,8 @@ protected:
 
     void paintGL() override
     {
+        if (!glReady)
+            setupGl();
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
@@ -785,6 +858,32 @@ private:
 #endif
     }
 
+    // Everything made in the context, which is current and about to go. The frame itself is
+    // with the sink, so the picture comes back in the next context.
+    void releaseGl()
+    {
+        // The card's pictures are in textures of this context's share group.
+        closeCard();
+        glDeleteTextures(static_cast<GLsizei>(textures.size()), textures.data());
+        glDeleteTextures(1, &overlayTexture);
+        forgetGl();
+    }
+
+    void forgetGl()
+    {
+        closeCard();
+        textures = {};
+        overlayTexture = 0;
+        allocations = {};
+        overlaySize = {};
+        overlaysStale = true;
+        program.reset();
+        plainProgram.reset();
+        usable = false;
+        glReady = false;
+        shown = Shown::Nothing;
+    }
+
     void closeCard()
     {
 #ifdef Q_OS_WIN
@@ -802,7 +901,7 @@ private:
     // Sets the viewport to where the picture belongs: as large as fits, in the middle.
     void placePicture(QSize picture)
     {
-        const QSize area = size() * devicePixelRatioF();
+        const QSize area = size() * devicePixelRatio();
         const QSize where = fitted(picture, area);
         glViewport((area.width() - where.width()) / 2, (area.height() - where.height()) / 2, where.width(), where.height());
     }
@@ -813,22 +912,22 @@ private:
         static const GLfloat POSITIONS[] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f };
         static const GLfloat TEXCOORDS[] = { 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f };
 
-        plainProgram.bind();
+        plainProgram->bind();
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texture);
-        plainProgram.setUniformValue("image", 0);
-        plainProgram.setUniformValue("opaque", opaque ? 1.0f : 0.0f);
+        plainProgram->setUniformValue("image", 0);
+        plainProgram->setUniformValue("opaque", opaque ? 1.0f : 0.0f);
         // The arrays are in memory, which only means that with no buffer bound.
         glBindBuffer(GL_ARRAY_BUFFER, 0);
-        plainProgram.enableAttributeArray(0);
-        plainProgram.enableAttributeArray(1);
-        plainProgram.setAttributeArray(0, GL_FLOAT, POSITIONS, 2);
-        plainProgram.setAttributeArray(1, GL_FLOAT, TEXCOORDS, 2);
+        plainProgram->enableAttributeArray(0);
+        plainProgram->enableAttributeArray(1);
+        plainProgram->setAttributeArray(0, GL_FLOAT, POSITIONS, 2);
+        plainProgram->setAttributeArray(1, GL_FLOAT, TEXCOORDS, 2);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        plainProgram.disableAttributeArray(0);
-        plainProgram.disableAttributeArray(1);
+        plainProgram->disableAttributeArray(0);
+        plainProgram->disableAttributeArray(1);
         glBindTexture(GL_TEXTURE_2D, 0);
-        plainProgram.release();
+        plainProgram->release();
     }
 
     // The overlays change a few times a minute and the picture sixty times a second, so they
@@ -836,9 +935,9 @@ private:
     // frame with one blended quad.
     void drawOverlays(bool hasPicture)
     {
-        const qreal ratio = devicePixelRatioF();
+        const qreal ratio = devicePixelRatio();
         const QSize area = size() * ratio;
-        if (area.isEmpty() || !plainProgram.isLinked())
+        if (area.isEmpty() || !plainProgram || !plainProgram->isLinked())
             return;
 
         if (overlaysStale || hasPicture != overlaysHadPicture || area != overlaySize) {
@@ -933,35 +1032,35 @@ private:
         static const GLfloat POSITIONS[] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f };
         static const GLfloat TEXCOORDS[] = { 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f };
 
-        program.bind();
+        program->bind();
         for (int unit = 0; unit < 3; unit++) {
             glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(unit));
             glBindTexture(GL_TEXTURE_2D, textures[static_cast<size_t>(unit)]);
         }
-        program.setUniformValue("planeY", 0);
-        program.setUniformValue("planeU", 1);
-        program.setUniformValue("planeV", 2);
-        program.setUniformValue("interleaved", nv12 ? 1.0f : 0.0f);
-        program.setUniformValue("lumaScale", lumaScale);
-        program.setUniformValue("chromaScale", chromaScale);
-        program.setUniformValue("conversion", conversion);
-        program.setUniformValue("offset", offset);
+        program->setUniformValue("planeY", 0);
+        program->setUniformValue("planeU", 1);
+        program->setUniformValue("planeV", 2);
+        program->setUniformValue("interleaved", nv12 ? 1.0f : 0.0f);
+        program->setUniformValue("lumaScale", lumaScale);
+        program->setUniformValue("chromaScale", chromaScale);
+        program->setUniformValue("conversion", conversion);
+        program->setUniformValue("offset", offset);
 
         // The arrays below are in memory, which only means that with no buffer bound.
         glBindBuffer(GL_ARRAY_BUFFER, 0);
-        program.enableAttributeArray(0);
-        program.enableAttributeArray(1);
-        program.setAttributeArray(0, GL_FLOAT, POSITIONS, 2);
-        program.setAttributeArray(1, GL_FLOAT, TEXCOORDS, 2);
+        program->enableAttributeArray(0);
+        program->enableAttributeArray(1);
+        program->setAttributeArray(0, GL_FLOAT, POSITIONS, 2);
+        program->setAttributeArray(1, GL_FLOAT, TEXCOORDS, 2);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        program.disableAttributeArray(0);
-        program.disableAttributeArray(1);
+        program->disableAttributeArray(0);
+        program->disableAttributeArray(1);
 
         for (int unit = 2; unit >= 0; unit--) {
             glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(unit));
             glBindTexture(GL_TEXTURE_2D, 0);
         }
-        program.release();
+        program->release();
     }
 
     struct Allocation
@@ -972,8 +1071,8 @@ private:
 
     VideoSurface *owner;
     std::shared_ptr<Sink> sink;
-    QOpenGLShaderProgram program;
-    QOpenGLShaderProgram plainProgram;
+    std::unique_ptr<QOpenGLShaderProgram> program;
+    std::unique_ptr<QOpenGLShaderProgram> plainProgram;
     GLuint overlayTexture = 0;
     QSize overlaySize;
     bool overlaysStale = true;
@@ -983,7 +1082,7 @@ private:
 #ifdef Q_OS_WIN
     std::shared_ptr<CardPicture> card;
 #endif
-    QMetaObject::Connection contextGoing;
+    bool glReady = false;
     GLuint cardTexture = 0;
     Shown shown = Shown::Nothing;
     quint64 preparedSerial = 0;
@@ -1012,7 +1111,11 @@ VideoSurface::VideoSurface(QWidget *parent)
     frameSink = std::make_shared<Sink>(this, gpu);
     if (gpu) {
         glLayer = new GlLayer(this, frameSink);
-        glLayer->setGeometry(rect());
+        // The container owns the layer's window and keeps it over this widget.
+        glContainer = QWidget::createWindowContainer(glLayer, this);
+        glContainer->setFocusPolicy(Qt::NoFocus);
+        glContainer->setAttribute(Qt::WA_TransparentForMouseEvents);
+        glContainer->setGeometry(rect());
     }
 
     setAttribute(Qt::WA_OpaquePaintEvent);
@@ -1029,6 +1132,13 @@ VideoSurface::VideoSurface(QWidget *parent)
 VideoSurface::~VideoSurface()
 {
     frameSink->detach();
+    // Now, while the rest of this is still here for it.
+    delete glContainer;
+}
+
+QImage VideoSurface::snapshot()
+{
+    return glLayer ? glLayer->snapshot() : grab().toImage();
 }
 
 std::shared_ptr<Core::Media::VideoFrameSink> VideoSurface::sink() const
@@ -1096,13 +1206,6 @@ void VideoSurface::setSpeaking(bool value)
     refreshOverlays();
 }
 
-void VideoSurface::setLive(bool value)
-{
-    if (live == value)
-        return;
-    live = value;
-    refreshOverlays();
-}
 
 void VideoSurface::announceGeometry()
 {
@@ -1139,8 +1242,8 @@ void VideoSurface::reportGeometry(bool evenIfUnchanged)
 void VideoSurface::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
-    if (glLayer)
-        glLayer->setGeometry(rect());
+    if (glContainer)
+        glContainer->setGeometry(rect());
     frameSink->setTarget(size() * devicePixelRatioF(), devicePixelRatioF());
     rescaleTimer.start();
     reportGeometry();
@@ -1167,6 +1270,13 @@ void VideoSurface::mouseDoubleClickEvent(QMouseEvent *event)
 {
     QWidget::mouseDoubleClickEvent(event);
     emit doubleClicked();
+}
+
+void VideoSurface::mouseReleaseEvent(QMouseEvent *event)
+{
+    QWidget::mouseReleaseEvent(event);
+    if (event->button() == Qt::LeftButton && rect().contains(event->pos()))
+        emit clicked();
 }
 
 void VideoSurface::paintEvent(QPaintEvent *)
@@ -1235,20 +1345,6 @@ void VideoSurface::paintOverlays(QPainter &painter, bool hasPicture)
         painter.drawText(bounds, Qt::AlignLeft | Qt::AlignBottom, captionText);
     }
 
-    if (live) {
-        QFont bold = font();
-        bold.setBold(true);
-        painter.setFont(bold);
-        const QString label = tr("LIVE");
-        const QSize text = QFontMetrics(bold, this).size(Qt::TextSingleLine, label);
-        const QRect pill(width() - text.width() - 20, 8, text.width() + 12, text.height() + 4);
-        painter.setRenderHint(QPainter::Antialiasing);
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(LIVE_RED);
-        painter.drawRoundedRect(pill, 4, 4);
-        painter.setPen(Qt::white);
-        painter.drawText(pill, Qt::AlignCenter, label);
-    }
 
     if (speaking) {
         painter.setRenderHint(QPainter::Antialiasing, false);

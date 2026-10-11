@@ -11,13 +11,23 @@ namespace Voice {
 namespace {
 
 constexpr uint8_t RTCP_VERSION_BITS = 2 << 6;
+constexpr uint8_t TYPE_SENDER_REPORT = 200;
 constexpr uint8_t TYPE_RECEIVER_REPORT = 201;
+constexpr uint8_t TYPE_APPLICATION = 204;
 constexpr uint8_t TYPE_TRANSPORT_FEEDBACK = 205;
 constexpr uint8_t TYPE_PAYLOAD_FEEDBACK = 206;
 constexpr uint8_t FORMAT_NACK = 1;
 constexpr uint8_t FORMAT_PLI = 1;
 constexpr int REPORT_BLOCK_SIZE = 24;
 constexpr int MAX_REPORT_BLOCKS = 31;
+constexpr int HEADER_SIZE = 4;
+// Header, sender, NTP time: as far into a sender report as is read.
+constexpr int SENDER_REPORT_READ_SIZE = 16;
+// Discord's inbound estimate, as its bytes come off the wire. The native module reads the
+// four as one number, 0x31534944, and writes "DIS1" in its own byte order.
+constexpr uint8_t INBOUND_ESTIMATE_NAME[4] = { 0x31, 0x53, 0x49, 0x44 };
+// Header, sender, name, then a user id (8), the rate (3) and the loss (1).
+constexpr int INBOUND_ESTIMATE_SIZE = 24;
 
 // The length field counts 32-bit words, not including the first.
 void writeHeader(uint8_t *p, uint8_t countOrFormat, uint8_t type, int size)
@@ -56,6 +66,31 @@ int writeReceiverReport(std::span<uint8_t> out, uint32_t senderSsrc, std::span<c
         p += REPORT_BLOCK_SIZE;
     }
     return size;
+}
+
+ReceivedRtcp parseRtcp(std::span<const uint8_t> compound)
+{
+    ReceivedRtcp received;
+    while (compound.size() >= HEADER_SIZE) {
+        const uint8_t *p = compound.data();
+        const size_t size = (static_cast<size_t>(qFromBigEndian<uint16_t>(p + 2)) + 1) * 4;
+        if ((p[0] & 0xC0) != RTCP_VERSION_BITS || size > compound.size())
+            break;
+
+        if (p[1] == TYPE_SENDER_REPORT && size >= SENDER_REPORT_READ_SIZE) {
+            const uint32_t seconds = qFromBigEndian<uint32_t>(p + 8);
+            const uint32_t fraction = qFromBigEndian<uint32_t>(p + 12);
+            received.senderReports.push_back({ qFromBigEndian<uint32_t>(p + 4), (seconds << 16) | (fraction >> 16) });
+        } else if (p[1] == TYPE_APPLICATION && size >= INBOUND_ESTIMATE_SIZE && std::equal(p + 8, p + 12, INBOUND_ESTIMATE_NAME)) {
+            // The rate is an 18-bit mantissa under a 6-bit exponent, as in REMB.
+            const uint32_t rate = (static_cast<uint32_t>(p[20]) << 16) | (static_cast<uint32_t>(p[21]) << 8) | p[22];
+            received.hasInboundEstimate = true;
+            received.inboundBitsPerSecond = static_cast<uint64_t>(rate & 0x3FFFF) << (rate >> 18);
+            received.inboundLoss = p[23] / 256.0;
+        }
+        compound = compound.subspan(size);
+    }
+    return received;
 }
 
 int writeNack(std::span<uint8_t> out, uint32_t senderSsrc, uint32_t mediaSsrc, std::span<const uint16_t> sequences)

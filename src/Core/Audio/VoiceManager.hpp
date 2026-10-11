@@ -4,6 +4,7 @@
 #include <QThread>
 #include <QHash>
 #include <QList>
+#include <QPointer>
 #include <QSet>
 
 #include <functional>
@@ -203,6 +204,15 @@ private:
     VoiceConnection *voiceConnection = nullptr;
     Discord::Voice::VoiceClient *voiceClient = nullptr;
     AudioPipeline *audioPipeline = nullptr;
+
+    struct AudioSource
+    {
+        QPointer<Discord::Voice::VoiceClient> client;
+        float volume = 1.0f;
+    };
+    // Kept apart from the pipeline, which is replaced whenever the voice connection is.
+    QHash<quint32, AudioSource> audioSources;
+    void feedAudioSourceToPipeline(quint32 source);
     CallVideo *callVideo = nullptr;
     unsigned int voiceGeneration = 0;
 

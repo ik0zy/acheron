@@ -3,6 +3,7 @@
 #include <QList>
 #include <QString>
 
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -57,7 +58,9 @@ public:
 
 // Decodes one remote video on its own thread. Frames may be pushed from any thread; when the
 // decoder falls behind or meets a frame it cannot use, it drops to the next key frame and asks
-// for one. A hardware decoder that fails at the start is replaced by a software one.
+// for one. A hardware decoder that fails at the start is replaced by a software one, which is
+// given the same frame: only if software decodes it does the failure count against the
+// hardware for later decoders.
 class VideoDecoder
 {
 public:
@@ -90,6 +93,11 @@ public:
 
     [[nodiscard]] Stats stats() const;
 
+    // How far behind the decoder may get before it gives up on catching up: a second and a
+    // half, whatever the stream's frame rate, and never more frames than this. A decoder with
+    // time to spare works a shorter backlog off within moments and loses nothing by it, where
+    // starting over costs a key frame every time (measured on a 1080p60 stream).
+    static constexpr int MAX_QUEUE_AGE_MS = 1500;
     static constexpr int MAX_QUEUED_FRAMES = 90;
     static constexpr int MAX_SOFTWARE_THREADS = 4;
     // A hardware decoder that errs before it has produced this many frames is given up on.
@@ -101,6 +109,7 @@ private:
     {
         Discord::Voice::VideoCodec codec;
         Discord::Voice::EncodedVideoFrame frame;
+        std::chrono::steady_clock::time_point queuedAt;
     };
 
     void run();
@@ -109,12 +118,15 @@ private:
     bool openSoftware(Discord::Voice::VideoCodec codec);
     void close();
     void decode(Queued &queued);
-    void fail();
+    [[nodiscard]] bool decodeWithOpenDecoder(const Discord::Voice::EncodedVideoFrame &paddedFrame, int size);
+    void startOverAtNextKeyframe();
+    void reportUndecodableFrame();
     void describeDecoder();
 
     mutable std::mutex mutex;
     std::condition_variable wake;
     std::deque<Queued> queue;
+    bool queueWasDiscarded = false;
     bool stopping = false;
     std::shared_ptr<VideoFrameSink> frameSink;
     std::function<void()> keyframeRequester;

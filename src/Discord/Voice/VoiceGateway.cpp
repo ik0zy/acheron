@@ -353,8 +353,8 @@ void VoiceGateway::networkLoop()
     do {
         shouldReconnect = false;
 
-        QString connectUrl = QStringLiteral("wss://%1/?v=%2")
-                                     .arg(params.endpoint)
+        QString connectUrl = QStringLiteral("%1://%2/?v=%3")
+                                     .arg(params.gatewayScheme, params.endpoint)
                                      .arg(VOICE_GATEWAY_VERSION);
 
         curl = curl_easy_init();
