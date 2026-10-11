@@ -197,6 +197,7 @@ bool ChannelTreeView::handleMouseEventForExpansion(QMouseEvent *event)
         return true;
     } else if (nodeType != ChannelNode::Type::Channel &&
                nodeType != ChannelNode::Type::VoiceChannel &&
+               nodeType != ChannelNode::Type::DMChannel &&
                !isAlwaysExpanded(nodeType) &&
                model()->hasChildren(proxyIndex)) {
         setExpanded(proxyIndex, !isExpanded(proxyIndex));
