@@ -1,7 +1,10 @@
 #include "ScreenSharePicker.hpp"
 
+#include "Core/Audio/LoopbackCapture.hpp"
 #include "Core/Streams/StreamBroadcaster.hpp"
+#include "Core/Video/ScreenCapture.hpp"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QHBoxLayout>
@@ -9,23 +12,33 @@
 #include <QListWidget>
 #include <QPainter>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QStandardItemModel>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
+
+#include <utility>
 
 namespace Acheron {
 namespace UI {
 
+using Core::Video::CaptureMethod;
+using Core::Video::CaptureSource;
 using Core::Video::SendQuality;
 
 namespace {
 
 const char *const HEIGHT_KEY = "video/share_height";
 const char *const FRAMERATE_KEY = "video/share_framerate";
+const char *const AUDIO_KEY = "video/share_audio";
 
-constexpr int VISIBLE_SOURCE_ROWS = 2;
-constexpr int SOURCE_LABEL_HEIGHT = 36;
+constexpr int SOURCE_COLUMNS = 3;
+constexpr int SOURCE_GAP = 12;
+constexpr int SOURCE_LABEL_HEIGHT = 22;
+constexpr int VISIBLE_WINDOW_ROWS = 2;
 
 void setItemEnabled(QComboBox *combo, int index, bool enabled)
 {
@@ -39,47 +52,69 @@ ScreenSharePicker::ScreenSharePicker(const Core::Video::SharerTier &tier, QWidge
     : BasePopup(parent), tier(tier), quality(rememberedQuality(tier))
 {
     auto *layout = new QVBoxLayout(getContainer());
-    layout->setSpacing(10);
+    layout->setSpacing(8);
     layout->setContentsMargins(16, 16, 16, 16);
 
+    auto *titleRow = new QHBoxLayout;
     auto *titleLabel = new QLabel(tr("Share Your Screen"), getContainer());
     QFont titleFont = titleLabel->font();
     titleFont.setBold(true);
     titleFont.setPointSize(titleFont.pointSize() + 2);
     titleLabel->setFont(titleFont);
-    layout->addWidget(titleLabel);
+    titleRow->addWidget(titleLabel, 1);
+    auto *refreshButton = new QToolButton(getContainer());
+    refreshButton->setText(tr("Refresh"));
+    refreshButton->setToolTip(tr("List the screens and windows again"));
+    refreshButton->setAutoRaise(true);
+    titleRow->addWidget(refreshButton);
+    layout->addLayout(titleRow);
+    connect(refreshButton, &QToolButton::clicked, this, &ScreenSharePicker::onRefreshClicked);
 
-    sourceList = new QListWidget(getContainer());
-    sourceList->setViewMode(QListView::IconMode);
-    sourceList->setFlow(QListView::LeftToRight);
-    sourceList->setWrapping(true);
-    sourceList->setResizeMode(QListView::Adjust);
-    sourceList->setMovement(QListView::Static);
-    sourceList->setSelectionMode(QAbstractItemView::SingleSelection);
-    sourceList->setIconSize(THUMBNAIL_SIZE);
-    sourceList->setSpacing(6);
-    sourceList->setMinimumWidth(THUMBNAIL_SIZE.width() * 2 + 48);
-    sourceList->setFixedHeight((THUMBNAIL_SIZE.height() + SOURCE_LABEL_HEIGHT) * VISIBLE_SOURCE_ROWS);
-    layout->addWidget(sourceList);
-    connect(sourceList, &QListWidget::itemSelectionChanged, this, &ScreenSharePicker::refreshShareButton);
-    connect(sourceList, &QListWidget::itemActivated, this, &ScreenSharePicker::onShareClicked);
+    const bool windowsOffered = Core::Video::windowCaptureAvailable();
+    auto *screensLabel = new QLabel(tr("Screens"), getContainer());
+    screensLabel->setVisible(windowsOffered);
+    layout->addWidget(screensLabel);
+    screenList = makeSourceList(windowsOffered ? 1 : VISIBLE_WINDOW_ROWS);
+    layout->addWidget(screenList);
+    auto *windowsLabel = new QLabel(tr("Windows"), getContainer());
+    windowsLabel->setVisible(windowsOffered);
+    layout->addWidget(windowsLabel);
+    windowList = makeSourceList(VISIBLE_WINDOW_ROWS);
+    windowList->setVisible(windowsOffered);
+    layout->addWidget(windowList);
+    connect(screenList, &QListWidget::itemSelectionChanged, this, &ScreenSharePicker::onScreenSelected);
+    connect(windowList, &QListWidget::itemSelectionChanged, this, &ScreenSharePicker::onWindowSelected);
 
-    auto *qualityRow = new QHBoxLayout;
-    qualityRow->addWidget(new QLabel(tr("Resolution"), getContainer()));
+    auto *optionsRow = new QHBoxLayout;
+    optionsRow->addWidget(new QLabel(tr("Resolution"), getContainer()));
     heightCombo = new QComboBox(getContainer());
     for (const int height : Core::Video::SEND_HEIGHTS)
         heightCombo->addItem(heightLabel(height), height);
-    qualityRow->addWidget(heightCombo);
-    qualityRow->addSpacing(12);
-    qualityRow->addWidget(new QLabel(tr("Frame Rate"), getContainer()));
+    optionsRow->addWidget(heightCombo);
+    optionsRow->addSpacing(12);
+    optionsRow->addWidget(new QLabel(tr("Frame Rate"), getContainer()));
     framerateCombo = new QComboBox(getContainer());
     for (const int framerate : Core::Video::SEND_FRAMERATES)
         framerateCombo->addItem(framerateLabel(framerate), framerate);
-    qualityRow->addWidget(framerateCombo);
-    qualityRow->addStretch(1);
-    layout->addLayout(qualityRow);
+    optionsRow->addWidget(framerateCombo);
+    optionsRow->addSpacing(12);
+    optionsRow->addWidget(new QLabel(tr("Capture Method"), getContainer()));
+    methodCombo = new QComboBox(getContainer());
+    methodCombo->addItem(tr("Automatic"), static_cast<int>(CaptureMethod::Auto));
+    methodCombo->addItem(tr("Graphics Capture"), static_cast<int>(CaptureMethod::GraphicsCapture));
+    methodCombo->addItem(tr("Desktop Duplication"), static_cast<int>(CaptureMethod::DesktopDuplication));
+    optionsRow->addWidget(methodCombo);
+    optionsRow->addStretch(1);
+    layout->addLayout(optionsRow);
     connect(heightCombo, QOverload<int>::of(&QComboBox::activated), this, &ScreenSharePicker::onHeightChosen);
     connect(framerateCombo, QOverload<int>::of(&QComboBox::activated), this, &ScreenSharePicker::onFramerateChosen);
+    connect(methodCombo, QOverload<int>::of(&QComboBox::activated), this, &ScreenSharePicker::onMethodChosen);
+
+    auto *audioRow = new QHBoxLayout;
+    audioCheck = new QCheckBox(tr("Share audio"), getContainer());
+    audioRow->addWidget(audioCheck);
+    audioRow->addStretch(1);
+    layout->addLayout(audioRow);
 
     noteLabel = new QLabel(getContainer());
     noteLabel->setWordWrap(true);
@@ -93,9 +128,19 @@ ScreenSharePicker::ScreenSharePicker(const Core::Video::SharerTier &tier, QWidge
     connect(buttons, &QDialogButtonBox::accepted, this, &ScreenSharePicker::onShareClicked);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
-    addSources();
+    // A remembered method this machine has since lost is shown as the automatic choice it
+    // would be captured by anyway.
+    const CaptureMethod remembered = Core::Video::captureMethod();
+    for (int i = 0; i < methodCombo->count(); i++)
+        setItemEnabled(methodCombo, i, Core::Video::captureMethodUsable(static_cast<CaptureMethod>(methodCombo->itemData(i).toInt())));
+    methodCombo->setCurrentIndex(methodCombo->findData(static_cast<int>(Core::Video::captureMethodUsable(remembered) ? remembered : CaptureMethod::Auto)));
+
+    const bool soundCapturable = Core::Audio::processLoopbackAvailable();
+    audioCheck->setEnabled(soundCapturable);
+    audioCheck->setChecked(soundCapturable && QSettings().value(AUDIO_KEY, true).toBool());
+
+    listSources();
     showQuality();
-    refreshShareButton();
     Core::StreamBroadcaster::whenEncodersKnown(this, [this](const QList<Discord::Voice::VideoCodec> &codecs) { onEncodersKnown(codecs); });
 }
 
@@ -124,28 +169,75 @@ QString ScreenSharePicker::framerateLabel(int framerate)
     return tr("%1 fps").arg(framerate);
 }
 
-void ScreenSharePicker::addSources()
+QListWidget *ScreenSharePicker::makeSourceList(int visibleRows)
 {
-    sources = Core::Video::captureSources();
+    auto *list = new QListWidget(getContainer());
+    list->setViewMode(QListView::IconMode);
+    list->setFlow(QListView::LeftToRight);
+    list->setWrapping(true);
+    list->setResizeMode(QListView::Adjust);
+    list->setMovement(QListView::Static);
+    list->setSelectionMode(QAbstractItemView::SingleSelection);
+    list->setIconSize(THUMBNAIL_SIZE);
+    list->setGridSize(THUMBNAIL_SIZE + QSize(SOURCE_GAP, SOURCE_LABEL_HEIGHT));
+    list->setUniformItemSizes(true);
+    list->setWordWrap(false);
+    list->setTextElideMode(Qt::ElideRight);
+    list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    list->setMinimumWidth(list->gridSize().width() * SOURCE_COLUMNS + list->verticalScrollBar()->sizeHint().width() + 2 * list->frameWidth());
+    list->setFixedHeight(list->gridSize().height() * visibleRows + 2 * list->frameWidth());
+    connect(list, &QListWidget::itemActivated, this, &ScreenSharePicker::onShareClicked);
+    return list;
+}
 
-    QPixmap blank(THUMBNAIL_SIZE);
-    blank.fill(Qt::black);
-    for (int i = 0; i < sources.size(); i++) {
-        const Core::Video::CaptureSource &source = sources[i];
-        const QString name = source.name.isEmpty() ? tr("Screen %1").arg(i + 1) : source.name;
-        auto *item = new QListWidgetItem(QIcon(blank), tr("%1 (%2x%3)").arg(name).arg(source.geometry.width()).arg(source.geometry.height()), sourceList);
-        item->setData(Qt::UserRole, source.id);
-        item->setTextAlignment(Qt::AlignHCenter | Qt::AlignTop);
+void ScreenSharePicker::listSources()
+{
+    const QListWidgetItem *chosen = chosenItem();
+    const QString chosenId = chosen ? sources[chosen->data(Qt::UserRole).toInt()].id : QString();
+
+    {
+        const QSignalBlocker screensBlocked(screenList);
+        const QSignalBlocker windowsBlocked(windowList);
+        screenList->clear();
+        windowList->clear();
+        sourceItems.clear();
+        sources = Core::Video::captureSources();
+        sources.append(Core::Video::captureWindows());
+
+        QPixmap blank(THUMBNAIL_SIZE);
+        blank.fill(Qt::black);
+        for (int i = 0; i < sources.size(); i++) {
+            const CaptureSource &source = sources[i];
+            const bool isWindow = source.kind == CaptureSource::Kind::Window;
+            const QString label = isWindow ? source.name : tr("%1 (%2x%3)").arg(source.name).arg(source.geometry.width()).arg(source.geometry.height());
+            auto *item = new QListWidgetItem(QIcon(blank), label, isWindow ? windowList : screenList);
+            item->setData(Qt::UserRole, i);
+            item->setToolTip(label);
+            item->setTextAlignment(Qt::AlignHCenter | Qt::AlignTop);
+            item->setSelected(source.id == chosenId);
+            sourceItems.append(item);
+        }
+        if (!chosenItem() && !sourceItems.isEmpty())
+            sourceItems.first()->setSelected(true);
     }
-    if (!sources.isEmpty())
-        sourceList->setCurrentRow(0);
 
-    // One still for each turn of the event loop, so that the picker is up before the first.
+    refreshShareButton();
+    loadThumbnailsFromTheFirst();
+}
+
+// One still for each turn of the event loop, so that the picker is up before the first and
+// stays usable while a window is slow to draw itself.
+void ScreenSharePicker::loadThumbnailsFromTheFirst()
+{
+    thumbnailsLoaded = 0;
+    if (std::exchange(thumbnailQueued, true))
+        return;
     QTimer::singleShot(0, this, &ScreenSharePicker::loadNextThumbnail);
 }
 
 void ScreenSharePicker::loadNextThumbnail()
 {
+    thumbnailQueued = false;
     if (thumbnailsLoaded >= sources.size())
         return;
 
@@ -159,9 +251,39 @@ void ScreenSharePicker::loadNextThumbnail()
         painter.drawImage((thumbnail.width() - fitted.width()) / 2, (thumbnail.height() - fitted.height()) / 2, fitted);
         painter.end();
         thumbnail.setDevicePixelRatio(devicePixelRatioF());
-        sourceList->item(index)->setIcon(QIcon(thumbnail));
+        sourceItems[index]->setIcon(QIcon(thumbnail));
     }
+    thumbnailQueued = true;
     QTimer::singleShot(0, this, &ScreenSharePicker::loadNextThumbnail);
+}
+
+QListWidgetItem *ScreenSharePicker::chosenItem() const
+{
+    for (const QListWidget *list : { screenList, windowList }) {
+        const QList<QListWidgetItem *> selected = list->selectedItems();
+        if (!selected.isEmpty())
+            return selected.first();
+    }
+    return nullptr;
+}
+
+void ScreenSharePicker::onRefreshClicked()
+{
+    listSources();
+}
+
+void ScreenSharePicker::onScreenSelected()
+{
+    if (!screenList->selectedItems().isEmpty())
+        windowList->clearSelection();
+    refreshShareButton();
+}
+
+void ScreenSharePicker::onWindowSelected()
+{
+    if (!windowList->selectedItems().isEmpty())
+        screenList->clearSelection();
+    refreshShareButton();
 }
 
 void ScreenSharePicker::showQuality()
@@ -186,6 +308,10 @@ void ScreenSharePicker::onFramerateChosen(int index)
     quality.framerate = framerateCombo->itemData(index).toInt();
 }
 
+void ScreenSharePicker::onMethodChosen(int)
+{
+}
+
 void ScreenSharePicker::onEncodersKnown(const QList<Discord::Voice::VideoCodec> &codecs)
 {
     encodersKnown = true;
@@ -205,17 +331,20 @@ void ScreenSharePicker::refreshShareButton()
         noteLabel->clear();
     noteLabel->setVisible(!noteLabel->text().isEmpty());
 
-    shareButton->setEnabled(canEncode && sourceList->currentItem() != nullptr);
+    shareButton->setEnabled(canEncode && chosenItem() != nullptr);
 }
 
 void ScreenSharePicker::onShareClicked()
 {
-    QListWidgetItem *chosen = sourceList->currentItem();
+    const QListWidgetItem *chosen = chosenItem();
     if (!canEncode || !chosen)
         return;
 
     rememberQuality(quality);
-    emit shareRequested(chosen->data(Qt::UserRole).toString(), quality);
+    Core::Video::setCaptureMethod(static_cast<CaptureMethod>(methodCombo->currentData().toInt()));
+    if (audioCheck->isEnabled())
+        QSettings().setValue(AUDIO_KEY, audioCheck->isChecked());
+    emit shareRequested(sources[chosen->data(Qt::UserRole).toInt()], quality, audioCheck->isEnabled() && audioCheck->isChecked());
     accept();
 }
 

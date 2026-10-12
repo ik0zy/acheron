@@ -25,9 +25,11 @@ class Client;
 
 namespace Core {
 
+class StreamAudio;
 class StreamPreviewUploader;
 
 namespace Audio {
+class LoopbackCapture;
 class VoiceConnection;
 class VoiceManager;
 } // namespace Audio
@@ -59,6 +61,16 @@ public:
     };
     Q_ENUM(State)
 
+    // What has become of the sound a share was started with.
+    enum class AudioState {
+        // None was asked for, this machine cannot capture any, or the RTC connection is not up.
+        Off,
+        Capturing,
+        // The capture failed, and the share goes on without sound.
+        Failed,
+    };
+    Q_ENUM(AudioState)
+
     struct Stats
     {
         Video::BroadcastStats encoder;
@@ -69,6 +81,7 @@ public:
         int receivers = -1;
         bool encodingSuspended = false;
         bool captureStalled = false;
+        AudioState audio = AudioState::Off;
     };
 
     using TermsProvider = std::function<ShareTerms()>;
@@ -100,7 +113,9 @@ public:
     [[nodiscard]] QString failure() const { return failureText; }
     void clearFailure();
 
-    void start(const QString &sourceId, const Video::SendQuality &quality);
+    // `withAudio` also sends what the shared window's program is playing or, for a screen,
+    // everything this machine plays except this client's own sound.
+    void start(const Video::CaptureSource &source, const Video::SendQuality &quality, bool withAudio);
     // While live, without reconnecting. A quality the account may not use is not taken.
     void setQuality(const Video::SendQuality &quality);
     void stop();
@@ -115,7 +130,8 @@ public:
     static constexpr int BITRATE_SETTLE_MS = 2000;
 
 signals:
-    // Also sent when the capture stalls or resumes, and when a failure is cleared.
+    // Also sent when the capture stalls or resumes, when the sound starts being captured or
+    // fails, and when a failure is cleared.
     void stateChanged();
     void previewChanged(const QImage &preview);
     // The share ended without being asked to. failure() has the same sentence.
@@ -145,8 +161,10 @@ private:
     void onPipelineStarted(const QSize &encodedSize, int framerate);
     void onPreviewReady(const QImage &preview);
     void onCaptureStalled(bool stalled);
+    void onSourceClosed();
     void onPipelineFailed(const QString &reason);
     void onPipelineStats(const Video::BroadcastStats &stats);
+    void onSoundCaptureFailed(const QString &reason);
 
     void setState(State state);
     void sendCreate(const QList<Discord::Voice::VideoCodec> &codecs);
@@ -156,6 +174,7 @@ private:
     void connectRtc();
     void disconnectRtc(bool announceStop);
     void deliverFromRtc(quint64 serial, std::function<void()> deliver);
+    void startSoundCapture();
 
     void startPipeline();
     void stopPipeline();
@@ -179,7 +198,8 @@ private:
     State currentState = State::Idle;
     QString failureText;
     Discord::StreamKey streamKey;
-    QString sourceId;
+    Video::CaptureSource source;
+    bool audioWanted = false;
     Video::SendQuality sendQuality;
     QString preferredRegion;
     QList<Discord::Voice::VideoCodec> encodableCodecs;
@@ -206,6 +226,12 @@ private:
     bool videoAnnounced = false;
     Discord::Voice::LocalVideoDescription announced;
     int receivers = -1;
+
+    // The sound that goes with the share, for as long as one RTC connection lasts: captured on
+    // a thread of the capture's own, encoded and sent on the connection's.
+    std::unique_ptr<StreamAudio> streamAudio;
+    std::unique_ptr<Audio::LoopbackCapture> soundCapture;
+    bool soundCaptureFailed = false;
 
     std::unique_ptr<Video::BroadcastPipeline> pipeline;
     QMetaObject::Connection framesToRtc;

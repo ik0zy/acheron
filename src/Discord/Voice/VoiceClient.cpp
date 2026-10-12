@@ -242,6 +242,7 @@ void VoiceClient::cleanupTransport()
     rtpSequence = 0;
     rtpTimestamp = 0;
     rtpEpoch = {};
+    soundshareAnnounced = false;
 }
 
 void VoiceClient::onGatewayConnected()
@@ -418,9 +419,25 @@ void VoiceClient::setSpeaking(bool speaking)
     gateway->sendSpeaking(flags, 0, localSsrc);
 }
 
+void VoiceClient::beginSoundshare()
+{
+    if (currentState != State::Connected || !gateway || !params.sendsAudio)
+        return;
+
+    newTalkspurt = true;
+    if (std::exchange(soundshareAnnounced, true))
+        return;
+    gateway->sendSpeaking(static_cast<int>(SpeakingFlag::SOUNDSHARE), 0, localSsrc);
+}
+
 void VoiceClient::sendSilence()
 {
     if (currentState != State::Connected || !encryption || !udpTransport)
+        return;
+
+    // The silence is the microphone's, and a stream's connection has no microphone: its owner
+    // sends the sound it shares and nothing in between.
+    if (params.streamContext)
         return;
 
     // no need to keepalive by sending silence if we spoke recently

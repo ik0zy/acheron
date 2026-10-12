@@ -1,9 +1,12 @@
 #pragma once
 
+#include <QList>
+#include <QRect>
 #include <QSize>
 #include <QString>
 
 #include <chrono>
+#include <memory>
 #include <optional>
 
 #include "Core/Video/BroadcastPipeline.hpp"
@@ -20,10 +23,62 @@ namespace Video {
 // kept, never enlarged, and both sides even. A `maxHeight` of zero is the source's own size.
 [[nodiscard]] QSize encodeSizeFor(const QSize &source, int maxHeight);
 
-// Captures one screen at a steady rate, scaled and converted for an encoder. It scales on the
-// graphics card when that works and in software when it does not, and builds its capture anew
-// whenever Windows takes the screen away, which it does on a mode change, on a switch to the
-// secure desktop, and when a full-screen program takes the output over.
+// How pictures are taken off the machine. Remembered as `video/capture_method`.
+enum class CaptureMethod {
+    // A screen by desktop duplication, a window by graphics capture where Windows has it.
+    Auto,
+    // Windows.Graphics.Capture: a window is captured by itself whatever covers it, and
+    // Windows 10 draws a yellow border around what is being captured.
+    GraphicsCapture,
+    // No border. A window is cut out of its screen while no window above overlaps it, and is
+    // asked to draw itself otherwise, as the official client does on Windows 10.
+    DesktopDuplication,
+};
+[[nodiscard]] CaptureMethod captureMethod();
+void setCaptureMethod(CaptureMethod method);
+// False for a method this build or this Windows cannot use. A share asked to use one is
+// captured by a method that can be used.
+[[nodiscard]] bool captureMethodUsable(CaptureMethod method);
+
+// A minimised window shows nothing to capture until it is brought back.
+void restoreIfMinimised(const CaptureSource &window);
+
+// A top-level window as far as it matters to whether it hides part of another.
+struct StackedWindow
+{
+    // In the desktop's own pixels: the inside of the window in question, and all that shows of
+    // any other.
+    QRect bounds;
+    bool visible = true;
+    bool minimised = false;
+    // Kept from the screen by Windows, as a window on another virtual desktop is.
+    bool cloaked = false;
+    // WS_EX_TRANSPARENT or WS_EX_NOACTIVATE: an overlay, or something that never comes forward.
+    bool overlay = false;
+    // Windows' stand-in for a browser tab among the taskbar's previews.
+    bool tabProxy = false;
+    // The taskbar's preview of a window at its full size, which shows over everything.
+    bool livePreview = false;
+};
+// Whether the window at `target`, in a stack listed from the top down, cannot be cut out of
+// the screen by itself: it shows nothing there, or a window above it overlaps it at all. The
+// official client's rule, by which a window's own menus and dialogs cover it as well.
+[[nodiscard]] bool windowIsCovered(const QList<StackedWindow> &topDown, int target);
+
+// How often the last picture of a source that has gone still is sent again, so that whoever
+// starts watching has something to look at.
+constexpr int STILL_PICTURE_INTERVAL_MS = 500;
+// Whether the last picture of a source that shows nothing new is to be encoded again, so long
+// after it last was. A key frame someone is waiting for does not wait for the source to stir,
+// but does keep to the frame rate.
+[[nodiscard]] bool stillPictureIsDue(qint64 msSinceLastPicture, bool keyFrameWaitedFor, int framerate);
+
+// Captures one screen or one window at a steady rate at most, scaled and converted for an
+// encoder. It scales on the graphics card when that works and in software when it does not,
+// and builds its capture anew whenever Windows takes the source away, which it does to a screen
+// on a mode change, on a switch to the secure desktop, and when a full-screen program takes the
+// output over. A window is followed as it moves and as it changes size, and what is captured
+// of it is the inside of its frame.
 //
 // Not thread safe; it belongs to the thread that reads from it.
 class ScreenCapture
@@ -32,6 +87,7 @@ public:
     struct Request
     {
         QString sourceId;
+        CaptureMethod method = CaptureMethod::Auto;
         int maxHeight = 0;
         int framerate = 30;
         // The format (an AVPixelFormat, NV12 or YUV420P) of pictures in system memory.
@@ -39,7 +95,7 @@ public:
         // Pictures are left on the graphics card as Direct3D 11 NV12 frames whenever they can
         // be scaled there, and arrive in `softwareFormat` otherwise.
         bool keepOnCard = false;
-        // With `keepOnCard`: a screen sent at its own size is handed over as the BGRA frames
+        // With `keepOnCard`: a source sent at its own size is handed over as the BGRA frames
         // it is captured in, marked with the colours the encoder is to convert them to.
         bool rgbOnCard = false;
         // For a codec that cannot say which colours it carries and is taken as BT.601.
@@ -50,12 +106,17 @@ public:
         Frame,
         // Nothing new yet; ask again.
         NoFrame,
-        // The screen cannot be captured at the moment; ask again. Each call waits a little.
+        // The source cannot be captured at the moment; ask again. Each call waits a little.
         Stalled,
+        // The window is minimised or hidden and shows nothing until it is brought back; ask
+        // again. Each call waits a little.
+        Hidden,
+        // The window was closed.
+        Closed,
         Failed,
     };
 
-    ScreenCapture() = default;
+    ScreenCapture();
     ~ScreenCapture();
 
     ScreenCapture(const ScreenCapture &) = delete;
@@ -63,12 +124,24 @@ public:
 
     void configure(const Request &request);
     // Blocks until the next picture is due. A picture must be let go of before the next is
-    // read: the pictures scaled on the card all share one texture.
+    // read, unless deliversOnlyChanges(): the pictures scaled on the card all share one texture.
     Status read(AVFrame *into);
     [[nodiscard]] QString failure() const { return failureText; }
 
+    // Graphics capture has a picture only when the source shows something new. Its last
+    // picture may be kept, and is what a viewer is to be sent again while nothing comes.
+    [[nodiscard]] bool deliversOnlyChanges() const;
+    // What the pictures have come from, for the statistics. For a window captured by
+    // duplication it counts those cut out of the screen and those the window drew itself.
+    [[nodiscard]] QString captureName() const;
+
     static constexpr int RETRY_INTERVAL_MS = 250;
     static constexpr int GIVE_UP_AFTER_MS = 5000;
+    // How long a window's size has to hold before the picture is made anew for it, so that
+    // dragging an edge does not start the encoder over at every step.
+    static constexpr int RESIZE_SETTLE_MS = 300;
+    // How long a window is given to draw itself. One that takes longer has stopped answering.
+    static constexpr int DRAWING_LIMIT_MS = 5000;
 
 private:
     enum class CardScaling {
@@ -79,11 +152,32 @@ private:
         Suspected,
     };
 
-    int build();
+    enum class Path {
+        Duplication,
+        GraphicsCapture,
+        // A window by duplication: cut out of its screen, or drawn by itself, picture by picture.
+        WindowByDuplication,
+    };
+
+    struct Backends;
+
+    Status watchWindow();
+    Status readDuplication(AVFrame *into);
+    Status readGraphicsCapture(AVFrame *into);
+    Status readWindowByDuplication(AVFrame *into);
+    bool cutOutOfScreen(const QRect &client, AVFrame *card);
+    bool duplicateScreenOf(const QRect &client);
+    bool drawnByItself(const QRect &client);
+    int buildDuplication();
+    int buildGraphicsCapture();
+    void dropDuplication();
     void tearDown();
+    void delivered(AVFrame *picture, bool bt601);
     Status afterFailure(int error);
 
     Request request;
+    std::unique_ptr<Backends> backends;
+    Path path = Path::Duplication;
     AVFilterGraph *graph = nullptr;
     AVFilterContext *sink = nullptr;
     bool graphScalesOnCard = false;
@@ -93,6 +187,7 @@ private:
     CardScaling cardScaling = CardScaling::Untried;
     std::optional<std::chrono::steady_clock::time_point> failingSince;
     std::chrono::steady_clock::time_point retryAt;
+    bool closed = false;
     bool failed = false;
     QString failureText;
 };

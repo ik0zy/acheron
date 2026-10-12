@@ -35,6 +35,9 @@ using Discord::Voice::VideoCodec;
 constexpr int PREVIEW_INTERVAL_MS = 500;
 constexpr QSize PREVIEW_BOUND(512, 288);
 constexpr int STATS_INTERVAL_MS = 1000;
+// How long a window has to have been hidden before its share is paused. One that is being
+// closed is hidden for a moment first, and that is the end of the share and not a pause.
+constexpr int HIDDEN_BEFORE_PAUSED_MS = 200;
 constexpr int MIN_BITRATE = 50'000;
 constexpr int BITRATE_WHEN_NONE_GIVEN = 2'500'000;
 
@@ -102,9 +105,11 @@ public:
 
     void start(const BroadcastSettings &settings)
     {
+        const CaptureMethod method = captureMethod();
         {
             std::lock_guard lock(mutex);
             wanted = settings;
+            wantedMethod = method;
             bitrate = settings.bitrate;
             generation++;
         }
@@ -124,13 +129,14 @@ public:
 
 private:
     void run();
-    void capture(const BroadcastSettings &settings, quint64 session);
+    void capture(const BroadcastSettings &settings, CaptureMethod method, quint64 session);
     [[nodiscard]] int64_t nextTimestamp();
 
     BroadcastPipeline *pipeline;
     std::mutex mutex;
     std::condition_variable wake;
     std::optional<BroadcastSettings> wanted;
+    CaptureMethod wantedMethod = CaptureMethod::Auto;
     bool quitting = false;
     // Moves on with every start and stop; a capture ends when it is no longer its own.
     std::atomic<quint64> generation{ 0 };
@@ -146,6 +152,7 @@ void BroadcastPipeline::Worker::run()
 {
     for (;;) {
         BroadcastSettings settings;
+        CaptureMethod method = CaptureMethod::Auto;
         quint64 session = 0;
         {
             std::unique_lock lock(mutex);
@@ -153,10 +160,11 @@ void BroadcastPipeline::Worker::run()
             if (quitting)
                 return;
             settings = *wanted;
+            method = wantedMethod;
             wanted.reset();
             session = generation;
         }
-        capture(settings, session);
+        capture(settings, method, session);
     }
 }
 
@@ -167,7 +175,7 @@ int64_t BroadcastPipeline::Worker::nextTimestamp()
     return lastTimestamp;
 }
 
-void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, quint64 session)
+void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, CaptureMethod method, quint64 session)
 {
     Media::VideoEncoder::Settings encoding;
     encoding.codec = settings.codec;
@@ -182,6 +190,7 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, quint
 
     ScreenCapture::Request request;
     request.sourceId = settings.sourceId;
+    request.method = method;
     request.maxHeight = settings.maxHeight;
     request.framerate = encoding.framerate;
     request.softwareFormat = encoder.softwareFormat();
@@ -192,14 +201,18 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, quint
     screen.configure(request);
 
     const FramePointer frame(av_frame_alloc());
+    // The last picture of a source that has one only when it shows something new.
+    const FramePointer kept(av_frame_alloc());
     PreviewMaker previews;
     std::vector<EncodedVideoFrame> encoded;
+    QElapsedTimer sincePicture;
     QElapsedTimer sincePreview;
     QElapsedTimer sinceStats;
     sinceStats.start();
 
-    bool announced = false;
+    QSize announcedSize;
     bool stalled = false;
+    QElapsedTimer hiddenFor;
     bool wasSuspended = false;
     quint64 framesEncoded = 0;
     quint64 framesDropped = 0;
@@ -213,33 +226,63 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, quint
             emit pipeline->failed(screen.failure());
             return;
         }
-        if (status == ScreenCapture::Status::Stalled && announced && !stalled) {
-            stalled = true;
-            emit pipeline->captureStalled(true);
+        if (status == ScreenCapture::Status::Closed) {
+            emit pipeline->sourceClosed();
+            return;
         }
-        if (status != ScreenCapture::Status::Frame)
+
+        // A hidden window is known to show nothing, also before its first picture. A source
+        // that cannot be read has until its first picture to settle before that is a stall.
+        const bool hidden = status == ScreenCapture::Status::Hidden;
+        if (hidden && !hiddenFor.isValid())
+            hiddenFor.start();
+        bool stalledNow = stalled;
+        if (hidden)
+            stalledNow = stalled || hiddenFor.elapsed() >= HIDDEN_BEFORE_PAUSED_MS;
+        else if (status == ScreenCapture::Status::Stalled)
+            stalledNow = stalled || announcedSize.isValid();
+        else if (status == ScreenCapture::Status::Frame || hiddenFor.isValid())
+            stalledNow = false;
+        if (!hidden)
+            hiddenFor.invalidate();
+        if (std::exchange(stalled, stalledNow) != stalledNow)
+            emit pipeline->captureStalled(stalledNow);
+
+        const bool suspendedNow = suspended;
+        AVFrame *picture = nullptr;
+        if (status == ScreenCapture::Status::Frame && screen.deliversOnlyChanges()) {
+            av_frame_unref(kept.get());
+            av_frame_move_ref(kept.get(), frame.get());
+            picture = kept.get();
+        } else if (status == ScreenCapture::Status::Frame) {
+            picture = frame.get();
+        } else if (status == ScreenCapture::Status::NoFrame && kept->buf[0] && screen.deliversOnlyChanges()) {
+            const bool keyFrameWaitedFor = keyframeWanted || (wasSuspended && !suspendedNow);
+            if (stillPictureIsDue(sincePicture.elapsed(), keyFrameWaitedFor, encoding.framerate))
+                picture = kept.get();
+        }
+        if (!picture)
             continue;
-        if (std::exchange(stalled, false))
-            emit pipeline->captureStalled(false);
+        sincePicture.start();
 
         const int64_t timestamp = nextTimestamp();
-        const QSize size(frame->width, frame->height);
+        const QSize size(picture->width, picture->height);
         capturedLately++;
 
         const bool keyframeAsked = keyframeWanted.exchange(false);
-        const bool suspendedNow = suspended;
         if (!suspendedNow) {
             encoder.setBitrate(usableBitrate(bitrate, settings.maxBitrate));
             if (keyframeAsked || wasSuspended)
                 encoder.requestKeyframe();
 
             encoded.clear();
-            const Media::VideoEncoder::Outcome outcome = encoder.encode(frame.get(), timestamp, encoded);
+            const Media::VideoEncoder::Outcome outcome = encoder.encode(picture, timestamp, encoded);
             if (outcome == Media::VideoEncoder::Outcome::CardFramesRefused) {
                 qCInfo(LogVideo) << "The encoder does not take pictures that are on the graphics card; reading them back into memory";
                 request.keepOnCard = false;
                 screen.configure(request);
                 av_frame_unref(frame.get());
+                av_frame_unref(kept.get());
                 continue;
             }
             if (outcome == Media::VideoEncoder::Outcome::Failed) {
@@ -249,7 +292,8 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, quint
         }
         wasSuspended = suspendedNow;
 
-        if (!std::exchange(announced, true))
+        // Again whenever a window has changed its size, which the picture follows.
+        if (std::exchange(announcedSize, size) != size)
             emit pipeline->started(size, encoding.framerate);
 
         if (!suspendedNow) {
@@ -264,7 +308,7 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, quint
 
         if (!sincePreview.isValid() || sincePreview.elapsed() >= PREVIEW_INTERVAL_MS) {
             sincePreview.start();
-            const QImage preview = previews.make(frame.get());
+            const QImage preview = previews.make(picture);
             if (!preview.isNull())
                 emit pipeline->previewReady(preview);
         }
@@ -273,7 +317,8 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, quint
             const double seconds = static_cast<double>(sinceStats.restart()) / 1000.0;
             const Media::VideoEncoder::Stats &encoderStats = encoder.stats();
             BroadcastStats stats;
-            stats.encoderName = encoderStats.encoderName;
+            // The capture goes into the name for want of a place of its own in the statistics.
+            stats.encoderName = QStringLiteral("%1, from %2").arg(encoderStats.encoderName.isEmpty() ? QStringLiteral("no encoder yet") : encoderStats.encoderName, screen.captureName());
             stats.hardware = encoderStats.hardware;
             stats.encodedSize = size;
             stats.capturedFps = capturedLately / seconds;

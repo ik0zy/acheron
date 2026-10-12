@@ -5,6 +5,7 @@
 #include "Core/Streams/StreamWatcher.hpp"
 #include "Core/Theme/Icons.hpp"
 #include "Core/Video/CallVideo.hpp"
+#include "Core/Video/ScreenCapture.hpp"
 #include "UI/ElidedLabel.hpp"
 #include "UI/ScreenSharePicker.hpp"
 #include "UI/Video/VideoSurface.hpp"
@@ -168,7 +169,7 @@ CallView::CallView(Core::Audio::VoiceManager *voice, Core::StreamWatcher *watche
     summaryLabel = new ElidedLabel(title, controls);
     bar->addWidget(summaryLabel, 1);
 
-    captureAvailable = broadcaster && Core::Video::screenCaptureAvailable();
+    captureAvailable = broadcaster && (Core::Video::screenCaptureAvailable() || Core::Video::windowCaptureAvailable());
     shareButton = new QToolButton(controls);
     shareButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     bar->addWidget(shareButton);
@@ -537,7 +538,7 @@ void CallView::applyOwnShareState(Tile &tile)
         break;
     case StreamBroadcaster::State::Live:
         if (broadcaster->stats().captureStalled)
-            surface->setMessage(tr("Stream Paused"), tr("The screen has stopped delivering pictures."));
+            surface->setMessage(tr("Stream Paused"), sharingWindow ? tr("The window is minimized or hidden.") : tr("The screen has stopped delivering pictures."));
         else
             surface->setMessage({});
         break;
@@ -562,9 +563,12 @@ void CallView::onShareClicked()
 
     auto *picker = new ScreenSharePicker(broadcaster->tier(), this);
     picker->setAttribute(Qt::WA_DeleteOnClose);
-    connect(picker, &ScreenSharePicker::shareRequested, this, [this](const QString &sourceId, const SendQuality &quality) {
-        if (broadcaster)
-            broadcaster->start(sourceId, quality);
+    connect(picker, &ScreenSharePicker::shareRequested, this, [this](const Core::Video::CaptureSource &source, const SendQuality &quality, bool withAudio) {
+        if (!broadcaster)
+            return;
+        sharingWindow = source.kind == Core::Video::CaptureSource::Kind::Window;
+        Core::Video::restoreIfMinimised(source);
+        broadcaster->start(source, quality, withAudio);
     });
     picker->open();
 }
@@ -621,6 +625,10 @@ QStringList CallView::ownShareStats() const
     lines << tr("Bitrate: %1 kbps sent, %2 kbps asked of the encoder").arg(stats.network.bitrateBps / 1000).arg(stats.targetBitrate / 1000);
     lines << (stats.receivers < 0 ? tr("Viewers: not reported yet") : tr("Viewers: %1").arg(stats.receivers));
     lines << (stats.network.lossFraction < 0 ? tr("Loss: not reported yet") : tr("Loss: %1%").arg(stats.network.lossFraction * 100.0, 0, 'f', 1));
+    if (stats.audio == StreamBroadcaster::AudioState::Capturing)
+        lines << tr("Sound: shared");
+    else if (stats.audio == StreamBroadcaster::AudioState::Failed)
+        lines << tr("Sound: could not be captured, sharing without it");
     if (stats.encodingSuspended)
         lines << tr("Encoding suspended: nobody is watching");
     if (stats.captureStalled)

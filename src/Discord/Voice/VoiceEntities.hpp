@@ -388,7 +388,8 @@ struct ConnectionParams
     // told apart by the payload types given here.
     QList<Codec> videoCodecs;
     // A stream's viewer has no microphone on that connection and sends no audio at all, not
-    // even the silence a voice connection opens with.
+    // even the silence a voice connection opens with. Its owner sends the sound that is shared
+    // with it, if any is.
     bool sendsAudio = true;
     // A Go Live stream's connection rather than a voice channel's. The same messages mean
     // slightly different things on the two.

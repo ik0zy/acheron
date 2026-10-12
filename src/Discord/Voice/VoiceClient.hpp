@@ -120,6 +120,12 @@ public:
 
     void setSpeaking(bool speaking);
 
+    // On a stream's connection, whose audio is the sound its owner shares: a run of that sound
+    // starts, so the next frame carries the marker and a timestamp taken from the clock again.
+    // The server is told of the sound once a session, with the SOUNDSHARE flag, as the official
+    // client tells it: no later run is announced, and neither is the end of one.
+    void beginSoundshare();
+
     bool isDaveEnabled() const;
     void requestVerificationCode(Core::Snowflake targetUserId, std::function<void(const QString &)> callback);
 
@@ -298,6 +304,7 @@ private:
     std::chrono::steady_clock::time_point rtpEpoch;
     std::chrono::steady_clock::time_point lastAudioSendTime;
     bool newTalkspurt = false;
+    bool soundshareAnnounced = false;
 
     std::unique_ptr<DaveSession> daveSession;
     std::set<std::string> connectedUserIds;

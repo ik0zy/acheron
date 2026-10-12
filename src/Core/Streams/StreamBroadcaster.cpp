@@ -1,9 +1,11 @@
 #include "StreamBroadcaster.hpp"
 
+#include "Core/Audio/LoopbackCapture.hpp"
 #include "Core/Audio/VoiceConnection.hpp"
 #include "Core/Audio/VoiceManager.hpp"
 #include "Core/Logging.hpp"
 #include "Core/Media/VideoDecoder.hpp"
+#include "Core/Streams/StreamAudio.hpp"
 #include "Core/Streams/StreamPreviews.hpp"
 #include "Discord/Client.hpp"
 
@@ -11,6 +13,7 @@
 #include <QPointer>
 #include <QThreadPool>
 
+#include <algorithm>
 #include <utility>
 
 namespace Acheron {
@@ -158,10 +161,14 @@ StreamBroadcaster::Stats StreamBroadcaster::stats() const
     now.receivers = receivers;
     now.encodingSuspended = encodingSuspended;
     now.captureStalled = captureStalled;
+    if (soundCaptureFailed)
+        now.audio = AudioState::Failed;
+    else if (soundCapture)
+        now.audio = AudioState::Capturing;
     return now;
 }
 
-void StreamBroadcaster::start(const QString &source, const Video::SendQuality &quality)
+void StreamBroadcaster::start(const Video::CaptureSource &chosen, const Video::SendQuality &quality, bool withAudio)
 {
     if (isSharing())
         return;
@@ -177,7 +184,9 @@ void StreamBroadcaster::start(const QString &source, const Video::SendQuality &q
         return;
     }
 
-    sourceId = source;
+    source = chosen;
+    audioWanted = withAudio;
+    soundCaptureFailed = false;
     sendQuality = Video::usableQuality(quality, here.tier);
     preferredRegion = here.preferredRegion;
     streamKey = Discord::StreamKey::forChannel(voice->currentGuildId(), voice->currentChannelId(), accountId);
@@ -241,6 +250,7 @@ void StreamBroadcaster::end(bool tellGateway)
     sendCodec = VideoCodec::Unknown;
     receivers = -1;
     captureStalled = false;
+    soundCaptureFailed = false;
     viewerSize = {};
     limits = {};
     latestPreview = QImage();
@@ -383,12 +393,16 @@ void StreamBroadcaster::connectRtc()
     screen.quality = 100;
     params.streams = { screen };
     params.videoCodecs = Media::offeredVideoCodecs(encodableCodecs);
-    params.sendsAudio = false;
+    params.sendsAudio = audioWanted && Audio::processLoopbackAvailable();
     params.streamContext = true;
 
     connection = new Audio::VoiceConnection(params, this);
     VoiceClient *rtc = connection->client();
     const quint64 serial = ++connectionSerial;
+    if (params.sendsAudio) {
+        streamAudio = std::make_unique<StreamAudio>(rtc, std::max(StreamAudio::MIN_BITRATE, voice->opusBitrate()));
+        connection->adopt(streamAudio.get());
+    }
 
     // The client's signals are taken on its own thread and passed on from there with the
     // connection's number. A queued call still arrives after its connection has been closed,
@@ -433,11 +447,49 @@ void StreamBroadcaster::disconnectRtc(bool announceStop)
 
     VoiceClient *rtc = connection->client();
     QObject::disconnect(framesToRtc);
+    soundCapture.reset();
     connection->stop(announceStop ? std::function<void()>([rtc] { rtc->stopVideo(); }) : std::function<void()>());
+    streamAudio.reset();
     delete connection;
     connection = nullptr;
 
     applySuspension();
+}
+
+void StreamBroadcaster::startSoundCapture()
+{
+    if (!streamAudio || soundCapture || soundCaptureFailed)
+        return;
+
+    const auto self = static_cast<quint32>(QCoreApplication::applicationPid());
+    const bool ofWindow = source.kind == Video::CaptureSource::Kind::Window;
+    if (ofWindow && source.processId == 0) {
+        onSoundCaptureFailed(tr("The program the shared window belongs to is not known."));
+        return;
+    }
+    // All this client plays is the call, and the people in it would get themselves back.
+    if (ofWindow && source.processId == self)
+        return;
+
+    soundCapture = std::make_unique<Audio::LoopbackCapture>();
+    connect(soundCapture.get(), &Audio::LoopbackCapture::frameCaptured, streamAudio.get(), &StreamAudio::onFrameCaptured);
+    connect(soundCapture.get(), &Audio::LoopbackCapture::failed, this, [this, serial = connectionSerial](const QString &reason) {
+        if (serial == connectionSerial)
+            onSoundCaptureFailed(reason);
+    });
+    if (ofWindow)
+        soundCapture->start(source.processId, Audio::LoopbackCapture::Scope::ProcessTree);
+    else
+        soundCapture->start(self, Audio::LoopbackCapture::Scope::AllButProcessTree);
+    emit stateChanged();
+}
+
+void StreamBroadcaster::onSoundCaptureFailed(const QString &reason)
+{
+    qCWarning(LogVoice) << "Screen share" << streamKey.toString() << "goes on without sound:" << reason;
+    soundCaptureFailed = true;
+    soundCapture.reset();
+    emit stateChanged();
 }
 
 void StreamBroadcaster::deliverFromRtc(quint64 serial, std::function<void()> deliver)
@@ -457,6 +509,7 @@ void StreamBroadcaster::onRtcStateChanged(VoiceClient::State state)
     rtcConnected = true;
     reconnects = 0;
     videoAnnounced = false;
+    startSoundCapture();
 
     VoiceClient *rtc = connection->client();
     QMetaObject::invokeMethod(rtc, [this, rtc, serial = connectionSerial] {
@@ -541,6 +594,10 @@ void StreamBroadcaster::startPipeline()
         if (serial == pipelineSerial)
             onCaptureStalled(stalled);
     });
+    connect(pipeline.get(), &Video::BroadcastPipeline::sourceClosed, this, [this, serial] {
+        if (serial == pipelineSerial)
+            onSourceClosed();
+    });
     connect(pipeline.get(), &Video::BroadcastPipeline::failed, this, [this, serial](const QString &reason) {
         if (serial == pipelineSerial)
             onPipelineFailed(reason);
@@ -552,7 +609,7 @@ void StreamBroadcaster::startPipeline()
     sendFramesToRtc();
 
     Video::BroadcastSettings settings;
-    settings.sourceId = sourceId;
+    settings.sourceId = source.id;
     settings.maxHeight = sendQuality.height;
     settings.framerate = sendQuality.framerate;
     settings.codec = sendCodec;
@@ -621,6 +678,12 @@ void StreamBroadcaster::onCaptureStalled(bool stalled)
     previewUploader->setStalled(stalled);
     client->sendStreamSetPaused(streamKey.toString(), stalled);
     emit stateChanged();
+}
+
+// Closing the shared window ends the share as stopping it does, in the official client too.
+void StreamBroadcaster::onSourceClosed()
+{
+    stop();
 }
 
 void StreamBroadcaster::onPipelineFailed(const QString &reason)

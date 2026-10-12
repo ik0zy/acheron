@@ -459,10 +459,17 @@ EncodedVideoFrame h264Keyframe(quint32 timestamp)
 }
 
 // A voice connection that offers VP8 and has reached the connected state. One that sends video
-// offers to encode it, and H264 besides.
+// offers to encode it, and H264 besides. It can be a stream's connection as its owner has it
+// instead, with the sound that is shared or without.
 struct Call
 {
-    explicit Call(bool sendsVideo = false)
+    enum class Kind {
+        Voice,
+        Stream,
+        StreamWithSound,
+    };
+
+    explicit Call(bool sendsVideo = false, Kind kind = Kind::Voice)
     {
         ConnectionParams params;
         params.endpoint = server.endpoint();
@@ -473,7 +480,8 @@ struct Call
         params.userId = Core::Snowflake(3);
         params.sessionId = QStringLiteral("session");
         params.video = true;
-        params.sendsAudio = false;
+        params.sendsAudio = kind == Kind::StreamWithSound;
+        params.streamContext = kind != Kind::Voice;
 
         Codec vp8;
         vp8.name = QStringLiteral("VP8");
@@ -587,6 +595,9 @@ private slots:
     void aSenderReportAndStatisticsFollowEverySecond();
     void aChangeOfCodecIsTakenUp();
     void noVideoGoesOutWhileEndToEndKeysAreMissing();
+
+    void sharedSoundIsAnnouncedOnceAndMarkedAtEveryRun();
+    void aStreamWithoutSoundSendsNoAudio();
 };
 
 void TestVoiceClient::connectsAndSaysWhatItCanReceive()
@@ -1168,6 +1179,69 @@ void TestVoiceClient::noVideoGoesOutWhileEndToEndKeysAreMissing()
     QCOMPARE(call.server.rtp[3].header.timestamp, 12000u);
     call.server.rtp.removeLast();
     QCOMPARE(call.reassembled(VideoCodec::VP8, OWN_VIDEO_SSRC), keyframe.data);
+}
+
+void TestVoiceClient::sharedSoundIsAnnouncedOnceAndMarkedAtEveryRun()
+{
+    constexpr int OPUS_PAYLOAD_TYPE = 120;
+    constexpr quint32 SAMPLES_PER_FRAME = 960;
+    constexpr int RUNS = 3;
+    constexpr int FRAMES_PER_RUN = 4;
+    constexpr int BETWEEN_RUNS_MS = 150;
+
+    Call call(true, Call::Kind::StreamWithSound);
+    QTRY_VERIFY(call.isUp());
+
+    // Nothing is shared yet: no word of it, and not the silence a voice connection opens with.
+    QTest::qWait(200);
+    QVERIFY(call.server.rtp.isEmpty());
+    QVERIFY(call.server.received(5).isEmpty());
+
+    for (int run = 0; run < RUNS; run++) {
+        call.client->beginSoundshare();
+        for (int frame = 0; frame < FRAMES_PER_RUN; frame++)
+            call.client->sendAudio(QByteArray(40 + frame, static_cast<char>(run * 16 + frame)));
+        QTRY_COMPARE(call.server.rtp.size(), (run + 1) * FRAMES_PER_RUN);
+        QTest::qWait(BETWEEN_RUNS_MS);
+    }
+    QCOMPARE(call.server.undecryptable, 0);
+
+    for (int i = 0; i < RUNS * FRAMES_PER_RUN; i++) {
+        const RtpSeen &packet = call.server.rtp[i];
+        const int frame = i % FRAMES_PER_RUN;
+        QCOMPARE(packet.header.ssrc, OWN_AUDIO_SSRC);
+        QCOMPARE(int(packet.header.payloadType), OPUS_PAYLOAD_TYPE);
+        QCOMPARE(packet.header.marker, frame == 0);
+        QCOMPARE(packet.header.sequence, static_cast<quint16>(call.server.rtp[0].header.sequence + i));
+        QVERIFY(packet.extensions.empty());
+        QCOMPARE(packet.payload, Bytes(static_cast<size_t>(40 + frame), static_cast<uint8_t>(i / FRAMES_PER_RUN * 16 + frame)));
+
+        if (i == 0)
+            continue;
+        // Within a run the frames follow one another. A new run is timed by the clock again,
+        // so the pause before it shows.
+        const quint32 sincePrevious = packet.header.timestamp - call.server.rtp[i - 1].header.timestamp;
+        if (frame != 0)
+            QCOMPARE(sincePrevious, SAMPLES_PER_FRAME);
+        else
+            QVERIFY2(sincePrevious > SAMPLES_PER_FRAME * 2, qPrintable(QString::number(sincePrevious)));
+    }
+
+    QCOMPARE(call.server.receivedText(5), QList<QByteArray>{ R"({"op":5,"d":{"speaking":2,"delay":0,"ssrc":777}})" });
+}
+
+void TestVoiceClient::aStreamWithoutSoundSendsNoAudio()
+{
+    Call call(true, Call::Kind::Stream);
+    QTRY_VERIFY(call.isUp());
+
+    call.client->beginSoundshare();
+    call.client->sendAudio(QByteArray(40, 'a'));
+    QTest::qWait(200);
+
+    QVERIFY(call.server.rtp.isEmpty());
+    QVERIFY(call.server.received(5).isEmpty());
+    QCOMPARE(call.server.undecryptable, 0);
 }
 
 QTEST_GUILESS_MAIN(TestVoiceClient)

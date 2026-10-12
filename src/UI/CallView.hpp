@@ -167,6 +167,7 @@ private:
     QToolButton *shareButton;
     QMenu *shareQualityMenu;
     bool captureAvailable = false;
+    bool sharingWindow = false;
     QCheckBox *nonVideoCheck;
     QPushButton *statsButton;
     QPushButton *popOutButton;

@@ -379,6 +379,8 @@ if(ENABLE_VOICE AND TARGET ffmpeg)
         src/Core/Streams/StreamSession.cpp
         src/Core/Streams/StreamWatcher.cpp
         src/Core/Streams/StreamBroadcaster.cpp
+        src/Core/Streams/StreamAudio.cpp
+        src/Core/Audio/LoopbackCapture.cpp
         src/Core/Video/BroadcastPipeline.cpp
         src/Core/Video/ScreenCapture.cpp
         src/Core/Video/SendQuality.cpp
@@ -492,6 +494,14 @@ if(BUILD_TESTS)
         target_link_libraries(TestRtp PRIVATE Qt::Core Qt::Test ${SODIUM_TARGET})
         target_include_directories(TestRtp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME RtpTests COMMAND TestRtp)
+
+        qt_add_executable(TestLoopbackCapture tests/tst_LoopbackCapture.cpp src/Core/Logging.cpp src/Core/Audio/LoopbackCapture.cpp)
+        target_link_libraries(TestLoopbackCapture PRIVATE Qt::Core Qt::Test)
+        target_include_directories(TestLoopbackCapture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src "${CMAKE_CURRENT_SOURCE_DIR}/vendor/miniaudio")
+        if(WIN32)
+            target_link_libraries(TestLoopbackCapture PRIVATE ole32)
+        endif()
+        add_test(NAME LoopbackCaptureTests COMMAND TestLoopbackCapture)
 
         qt_add_executable(TestOpusEncoder tests/tst_OpusEncoder.cpp src/Core/Logging.cpp src/Core/Audio/OpusEncoder.cpp)
         target_link_libraries(TestOpusEncoder PRIVATE Qt::Core Qt::Test ${OPUS_TARGET})
@@ -638,7 +648,7 @@ if (MSVC)
             list(APPEND _msvc_test_targets TestApng TestClips TestMediaInput)
         endif()
         if(TARGET TestRtp)
-            list(APPEND _msvc_test_targets TestRtp TestOpusEncoder TestUdpTransport TestSinkWants TestVoiceClient)
+            list(APPEND _msvc_test_targets TestRtp TestOpusEncoder TestLoopbackCapture TestUdpTransport TestSinkWants TestVoiceClient)
         endif()
         if(TARGET TestRtpVideo)
             list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface TestVideoSend TestVideoEncode)
@@ -702,6 +712,9 @@ if(TARGET ffmpeg)
     target_compile_definitions(${PROJECT_NAME} PRIVATE ACHERON_HAVE_FFMPEG)
 endif()
 if(ENABLE_VOICE AND TARGET ffmpeg)
+    if(WIN32)
+        target_link_libraries(${PROJECT_NAME} PRIVATE ole32)
+    endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE ACHERON_HAVE_STREAM_VIEW)
     target_link_libraries(${PROJECT_NAME} PRIVATE ${QT_OPENGL_LIBRARIES})
 endif()

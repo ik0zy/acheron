@@ -16,20 +16,33 @@ namespace Acheron {
 namespace Core {
 namespace Video {
 
-// Something that can be shared: for now, a screen.
+// Something that can be shared: a screen, or one window.
 struct CaptureSource
 {
-    // "screen:<n>", where n is stable for as long as the monitors stay as they are.
+    enum class Kind {
+        Screen,
+        Window,
+    };
+
+    // "screen:<n>", where n is stable for as long as the monitors stay as they are, or
+    // "window:<handle>".
     QString id;
+    Kind kind = Kind::Screen;
+    // A screen's number, or a window's title.
     QString name;
     // In the desktop's own pixels.
     QRect geometry;
+    // The process a window belongs to, which is whose sound goes with it. Zero for a screen.
+    quint32 processId = 0;
 };
 
 // False where this build or this machine cannot capture a screen at all, in which case nothing
 // offers to share one.
 [[nodiscard]] bool screenCaptureAvailable();
 [[nodiscard]] QList<CaptureSource> captureSources();
+// The same for single windows. A build or a Windows too old to capture one has none to offer.
+[[nodiscard]] bool windowCaptureAvailable();
+[[nodiscard]] QList<CaptureSource> captureWindows();
 // A still of the source as it is now, no larger than `bound`, for a picker. Null when it
 // cannot be had.
 [[nodiscard]] QImage captureThumbnail(const CaptureSource &source, const QSize &bound);
@@ -100,6 +113,8 @@ signals:
     void previewReady(const QImage &preview);
     // The source stopped delivering pictures (true) or resumed (false).
     void captureStalled(bool stalled);
+    // The window being shared was closed. Nothing more will come, and nothing went wrong.
+    void sourceClosed();
     // Nothing more will come: the source is gone, or no encoder could be opened.
     void failed(const QString &reason);
     void statsUpdated(const Acheron::Core::Video::BroadcastStats &stats);
