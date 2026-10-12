@@ -33,9 +33,9 @@ void setHardwareDecodingEnabled(bool enabled);
 // graphics card offers one. Probed once.
 [[nodiscard]] QList<Discord::Voice::VideoCodec> decodableVideoCodecs();
 
-// The same as a SELECT_PROTOCOL codec list: payload types are positional, and every entry is
-// decode only.
-[[nodiscard]] QList<Discord::Voice::Codec> offeredVideoCodecs();
+// The same as a SELECT_PROTOCOL codec list: payload types are positional. Every entry is offered
+// for decoding, and those in `encodable` for sending as well.
+[[nodiscard]] QList<Discord::Voice::Codec> offeredVideoCodecs(const QList<Discord::Voice::VideoCodec> &encodable = {});
 
 // Where decoded frames go. present() runs on the decoder's thread and must not keep the frame
 // past the call without taking its own reference. Frames are in system memory, as planar

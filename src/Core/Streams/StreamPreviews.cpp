@@ -1,7 +1,9 @@
 #include "StreamPreviews.hpp"
 
+#include <QBuffer>
 #include <QDateTime>
 #include <QPointer>
+#include <QSettings>
 
 namespace Acheron {
 namespace Core {
@@ -66,6 +68,87 @@ void StreamPreviews::forgetOwner(Snowflake ownerId)
 void StreamPreviews::clear()
 {
     entries.clear();
+}
+
+StreamPreviewUploader::StreamPreviewUploader(Upload upload, QObject *parent)
+    : QObject(parent), upload(std::move(upload))
+{
+    due.setSingleShot(true);
+    connect(&due, &QTimer::timeout, this, &StreamPreviewUploader::onDue);
+}
+
+bool StreamPreviewUploader::enabled()
+{
+    return QSettings().value(QStringLiteral("video/stream_previews"), true).toBool();
+}
+
+QString StreamPreviewUploader::thumbnailOf(const QImage &picture)
+{
+    if (picture.isNull())
+        return {};
+
+    const QImage fitted = picture.scaled(LARGEST, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+
+    QByteArray jpeg;
+    QBuffer buffer(&jpeg);
+    buffer.open(QIODevice::WriteOnly);
+    if (!fitted.save(&buffer, "JPEG", JPEG_QUALITY))
+        return {};
+    return QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(jpeg.toBase64());
+}
+
+void StreamPreviewUploader::start(const QString &key)
+{
+    stop();
+    if (!enabled())
+        return;
+    streamKey = key;
+    due.start(FIRST_WAIT_MS);
+}
+
+void StreamPreviewUploader::stop()
+{
+    run++;
+    due.stop();
+    pictureWanted = false;
+    streamKey.clear();
+}
+
+void StreamPreviewUploader::setStalled(bool value)
+{
+    stalled = value;
+}
+
+void StreamPreviewUploader::onDue()
+{
+    if (stalled)
+        due.start(RETRY_WAIT_MS);
+    else
+        pictureWanted = true;
+}
+
+void StreamPreviewUploader::offer(const QImage &picture)
+{
+    if (!pictureWanted)
+        return;
+    pictureWanted = false;
+
+    const QString thumbnail = thumbnailOf(picture);
+    if (thumbnail.isEmpty()) {
+        due.start(RETRY_WAIT_MS);
+        return;
+    }
+
+    upload(streamKey, thumbnail, [self = QPointer<StreamPreviewUploader>(this), startedBy = run](bool uploaded) {
+        if (self)
+            self->onUploadDone(startedBy, uploaded);
+    });
+}
+
+void StreamPreviewUploader::onUploadDone(quint64 startedBy, bool uploaded)
+{
+    if (startedBy == run)
+        due.start(uploaded ? UPLOADED_WAIT_MS : RETRY_WAIT_MS);
 }
 
 } // namespace Core

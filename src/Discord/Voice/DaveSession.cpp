@@ -54,6 +54,8 @@ void DaveSession::reinit()
     daveEncryptor = discord::dave::CreateEncryptor();
     if (localSsrc != 0)
         daveEncryptor->AssignSsrcToCodec(localSsrc, discord::dave::Codec::Opus);
+    if (localVideoSsrc != 0)
+        daveEncryptor->AssignSsrcToCodec(localVideoSsrc, localVideoCodec);
 
     auto keyPackage = mlsSession->GetMarshalledKeyPackage();
     if (!keyPackage.empty()) {
@@ -264,6 +266,14 @@ void DaveSession::setLocalSsrc(quint32 ssrc)
     localSsrc = ssrc;
     if (daveEncryptor)
         daveEncryptor->AssignSsrcToCodec(ssrc, discord::dave::Codec::Opus);
+}
+
+void DaveSession::setLocalVideoCodec(quint32 ssrc, discord::dave::Codec codec)
+{
+    localVideoSsrc = ssrc;
+    localVideoCodec = codec;
+    if (daveEncryptor)
+        daveEncryptor->AssignSsrcToCodec(ssrc, codec);
 }
 
 void DaveSession::addConnectedUser(const std::string &id)

@@ -1434,6 +1434,16 @@ void Client::fetchStreamPreview(const QString &streamKey, StreamPreviewCallback 
     });
 }
 
+void Client::uploadStreamPreview(const QString &streamKey, const QString &thumbnail, std::function<void(bool uploaded)> callback)
+{
+    QJsonObject body;
+    body["thumbnail"] = thumbnail;
+
+    httpClient->post("/streams/" + streamKey + "/preview", body, [callback](const HttpResponse &response) {
+        callback(response.success);
+    });
+}
+
 void Client::requestGuildMembers(Snowflake guildId, const QList<Snowflake> &userIds, bool presences)
 {
     gateway->requestGuildMembers(guildId, userIds, presences);

@@ -38,6 +38,8 @@ class CallStore;
 class StreamManager;
 class StreamPreviews;
 class StreamWatcher;
+class StreamBroadcaster;
+struct ShareTerms;
 
 class ClientInstance : public QObject
 {
@@ -70,6 +72,7 @@ public:
 #endif
 #ifdef ACHERON_HAVE_STREAM_VIEW
     [[nodiscard]] StreamWatcher *streamWatcher() const;
+    [[nodiscard]] StreamBroadcaster *streamBroadcaster() const;
 #endif
 
     [[nodiscard]] QList<Discord::Role> getRolesForGuild(Snowflake guildId);
@@ -215,6 +218,10 @@ private:
 #endif
 #ifdef ACHERON_HAVE_STREAM_VIEW
     StreamWatcher *streamWatch = nullptr;
+    StreamBroadcaster *streamBroadcast = nullptr;
+    // Whether the account may share its screen in the voice channel or call it is in, by the
+    // official client's rule, and what it may share there.
+    [[nodiscard]] ShareTerms screenShareTerms();
 #endif
 
     Storage::RoleRepository roleRepo;

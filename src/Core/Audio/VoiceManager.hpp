@@ -165,6 +165,8 @@ private:
     Snowflake channelId;
     bool selfMute = false;
     bool selfDeaf = false;
+    // Set by the server while this account has a stream up; the client never asks for it.
+    bool selfStream = false;
 
     // pending data: VOICE_SERVER_UPDATE may arrive before VOICE_STATE_UPDATE
     // both are needed to connect

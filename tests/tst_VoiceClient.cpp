@@ -1,9 +1,11 @@
 // A real VoiceClient, with its gateway socket, UDP transport and cipher, against a voice server
 // that lives in this file: a WebSocket and a UDP socket on the loopback interface that speak
-// just enough of Discord's side to bring a connection up and send it video.
+// just enough of Discord's side to bring a connection up, send it video and take video from it.
 
 #include "Discord/Voice/Rtcp.hpp"
 #include "Discord/Voice/RtpPacket.hpp"
+#include "Discord/Voice/VideoDepacketizer.hpp"
+#include "Discord/Voice/VideoSender.hpp"
 #include "Discord/Voice/VoiceClient.hpp"
 #include "Discord/Voice/VoiceEncryption.hpp"
 
@@ -11,6 +13,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSignalSpy>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTest>
@@ -27,6 +30,8 @@ namespace {
 
 constexpr int VIDEO_PAYLOAD_TYPE = 101;
 constexpr int RTX_PAYLOAD_TYPE = 102;
+constexpr int H264_PAYLOAD_TYPE = 103;
+constexpr int H264_RTX_PAYLOAD_TYPE = 104;
 constexpr uint8_t TRANSPORT_SEQUENCE_EXTENSION = 5;
 constexpr int PACKETS_PER_FRAME = 3;
 
@@ -36,6 +41,57 @@ constexpr quint32 ALICE_RTX_SSRC = 6001;
 constexpr quint64 BOB = 1002;
 constexpr quint32 BOB_SSRC = 7000;
 constexpr quint32 BOB_RTX_SSRC = 7001;
+
+// What the server gives the client to send on. Told of no video streams, the client takes the
+// two SSRCs after its audio one.
+constexpr quint32 OWN_AUDIO_SSRC = 777;
+constexpr quint32 OWN_VIDEO_SSRC = OWN_AUDIO_SSRC + 1;
+constexpr quint32 OWN_RTX_SSRC = OWN_AUDIO_SSRC + 2;
+constexpr quint32 SERVER_SSRC = 1;
+
+using Bytes = std::vector<uint8_t>;
+
+// One RTP packet the client sent, opened.
+struct RtpSeen
+{
+    RtpHeader header;
+    int size = 0;
+    Bytes extensions;
+    Bytes payload;
+};
+
+Bytes pictureLoss(quint32 mediaSsrc)
+{
+    Bytes packet(12);
+    writePli(packet, SERVER_SSRC, mediaSsrc);
+    return packet;
+}
+
+Bytes nack(quint32 mediaSsrc, quint16 sequence)
+{
+    Bytes packet(16);
+    const quint16 sequences[] = { sequence };
+    writeNack(packet, SERVER_SSRC, mediaSsrc, sequences);
+    return packet;
+}
+
+// RFC 5104, 4.3.1: the stream is named in an entry, not in the header.
+Bytes fullIntraRequest(quint32 mediaSsrc)
+{
+    Bytes packet = { 0x84, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0 };
+    qToBigEndian(mediaSsrc, packet.data() + 12);
+    return packet;
+}
+
+// Discord's count of who receives a stream: an application packet whose name bytes are
+// 30 53 49 44, with an entry of twelve bytes for every receiver.
+Bytes receiverCount(quint32 ssrc, int receivers)
+{
+    Bytes packet = { static_cast<uint8_t>(0x80 | receivers), 204, 0, static_cast<uint8_t>(2 + receivers * 3), 0, 0, 0, 0, 0x30, 0x53, 0x49, 0x44 };
+    qToBigEndian(ssrc, packet.data() + 4);
+    packet.resize(packet.size() + static_cast<size_t>(receivers) * 12, 0x11);
+    return packet;
+}
 
 struct NackSeen
 {
@@ -51,7 +107,8 @@ public:
     FakeVoiceServer()
     {
         gateway.listen(QHostAddress::LocalHost);
-        media.bind(QHostAddress::LocalHost);
+        // Spelled out, because Qt 5 takes the bare enumerator for a port number.
+        media.bind(QHostAddress(QHostAddress::LocalHost));
         connect(&gateway, &QTcpServer::newConnection, this, &FakeVoiceServer::onGatewayConnection);
         connect(&media, &QUdpSocket::readyRead, this, &FakeVoiceServer::onDatagrams);
     }
@@ -59,6 +116,8 @@ public:
     [[nodiscard]] QString endpoint() const { return QStringLiteral("127.0.0.1:%1").arg(gateway.serverPort()); }
 
     [[nodiscard]] QList<QJsonObject> received(int opcode) const { return receivedByOpcode.value(opcode); }
+    // The same messages as the client wrote them, for what depends on the order of their keys.
+    [[nodiscard]] QList<QByteArray> receivedText(int opcode) const { return textByOpcode.value(opcode); }
 
     void send(int opcode, const QJsonObject &data)
     {
@@ -138,6 +197,24 @@ public:
 
     [[nodiscard]] quint16 transportSequencesSent() const { return nextTransportSequence; }
 
+    // A compound packet as the server sends them: a receiver report, then whatever else.
+    void sendFeedback(std::initializer_list<Bytes> parts, std::span<const ReceptionReport> reports = {})
+    {
+        PacketBuffer packet;
+        packet.resize(8 + 24 * static_cast<int>(reports.size()));
+        writeReceiverReport(packet.bytes(), SERVER_SSRC, reports);
+        for (const Bytes &part : parts)
+            packet.append(part);
+        cipher->seal(packet, RTCP_CLEAR_SIZE);
+        media.writeDatagram(reinterpret_cast<const char *>(packet.data()), packet.size(), clientAddress, clientPort);
+    }
+
+    // What READY and SESSION_DESCRIPTION say, for a test to set before the client gets there.
+    QJsonArray readyStreams;
+    int daveProtocolVersion = 0;
+
+    QList<RtpSeen> rtp;
+    QList<ReceivedRtcp::SenderReport> senderReports;
     QList<NackSeen> nacks;
     QList<quint32> keyframeRequests;
     QList<quint32> receptionReports;
@@ -205,30 +282,32 @@ private:
                 return;
             }
             if (opcode == TEXT)
-                onGatewayMessage(QJsonDocument::fromJson(body).object());
+                onGatewayMessage(body);
         }
     }
 
-    void onGatewayMessage(const QJsonObject &message)
+    void onGatewayMessage(const QByteArray &text)
     {
         constexpr int IDENTIFY = 0;
         constexpr int SELECT_PROTOCOL = 1;
         constexpr int HEARTBEAT = 3;
 
+        const QJsonObject message = QJsonDocument::fromJson(text).object();
         const int opcode = message["op"].toInt();
         const QJsonObject data = message["d"].toObject();
         receivedByOpcode[opcode].append(data);
+        textByOpcode[opcode].append(text);
 
         const QString mode = encryptionModeToString(EncryptionMode::AEAD_XCHACHA20_POLY1305_RTPSIZE);
         if (opcode == IDENTIFY) {
-            send(2, QJsonObject{ { "ssrc", 777 }, { "ip", "127.0.0.1" }, { "port", media.localPort() }, { "modes", QJsonArray{ mode } }, { "streams", QJsonArray() } });
+            send(2, QJsonObject{ { "ssrc", 777 }, { "ip", "127.0.0.1" }, { "port", media.localPort() }, { "modes", QJsonArray{ mode } }, { "streams", readyStreams } });
         } else if (opcode == SELECT_PROTOCOL) {
             const QByteArray key(32, char(0x42));
             QJsonArray keyNumbers;
             for (char byte : key)
                 keyNumbers.append(static_cast<uint8_t>(byte));
             cipher = std::make_unique<VoiceEncryption>(EncryptionMode::AEAD_XCHACHA20_POLY1305_RTPSIZE, key);
-            send(4, QJsonObject{ { "mode", mode }, { "secret_key", keyNumbers }, { "audio_codec", "opus" }, { "video_codec", "VP8" }, { "dave_protocol_version", 0 } });
+            send(4, QJsonObject{ { "mode", mode }, { "secret_key", keyNumbers }, { "audio_codec", "opus" }, { "video_codec", "VP8" }, { "dave_protocol_version", daveProtocolVersion } });
         } else if (opcode == HEARTBEAT) {
             send(6, QJsonObject{ { "t", data["t"] } });
         }
@@ -258,7 +337,28 @@ private:
             }
             if (cipher && classifyPacket(bytes) == PacketKind::Rtcp)
                 onFeedback(bytes);
+            else if (cipher && classifyPacket(bytes) == PacketKind::Rtp)
+                onMedia(bytes);
         }
+    }
+
+    void onMedia(std::span<const uint8_t> sealed)
+    {
+        const std::optional<ParsedRtp> parsed = parseRtp(sealed);
+        PacketBuffer packet;
+        packet.append(sealed);
+        if (!parsed || !cipher->open(packet, parsed->clearSize) || packet.size() < parsed->clearSize + parsed->extensionSize) {
+            undecryptable++;
+            return;
+        }
+
+        RtpSeen seen;
+        seen.header = parsed->header;
+        seen.size = packet.size();
+        const std::span<const uint8_t> body = packet.bytes().subspan(static_cast<size_t>(parsed->clearSize));
+        seen.extensions.assign(body.begin(), body.begin() + parsed->extensionSize);
+        seen.payload.assign(body.begin() + parsed->extensionSize, body.end());
+        rtp.append(seen);
     }
 
     void onFeedback(std::span<const uint8_t> sealed)
@@ -278,6 +378,9 @@ private:
         constexpr int PICTURE_LOSS = 1;
 
         const std::span<const uint8_t> compound = packet.bytes();
+        for (const ReceivedRtcp::SenderReport &report : parseRtcp(compound).senderReports)
+            senderReports.append(report);
+
         size_t offset = 0;
         while (offset + 4 <= compound.size()) {
             const uint8_t *part = compound.data() + offset;
@@ -317,6 +420,7 @@ private:
     QByteArray incoming;
     bool upgraded = false;
     QHash<int, QList<QJsonObject>> receivedByOpcode;
+    QHash<int, QList<QByteArray>> textByOpcode;
 
     QUdpSocket media;
     QHostAddress clientAddress;
@@ -332,10 +436,33 @@ struct FrameSeen
     bool keyframe = false;
 };
 
-// A voice connection that offers VP8 and has reached the connected state.
+// A frame for the client to send. The VP8 packetizer does not look inside what it cuts up.
+EncodedVideoFrame videoFrame(size_t size, bool keyframe, quint32 timestamp)
+{
+    EncodedVideoFrame frame;
+    frame.data.resize(size);
+    for (size_t i = 0; i < size; i++)
+        frame.data[i] = static_cast<uint8_t>(i * 7 + 3);
+    frame.rtpTimestamp = timestamp;
+    frame.keyframe = keyframe;
+    return frame;
+}
+
+EncodedVideoFrame h264Keyframe(quint32 timestamp)
+{
+    EncodedVideoFrame frame;
+    frame.data = { 0, 0, 0, 1, 0x67, 0x42, 0x11, 0x22, 0, 0, 0, 1, 0x68, 0x33, 0x44, 0, 0, 0, 1, 0x65, 0x88 };
+    frame.data.resize(frame.data.size() + 3000, 0x5A);
+    frame.rtpTimestamp = timestamp;
+    frame.keyframe = true;
+    return frame;
+}
+
+// A voice connection that offers VP8 and has reached the connected state. One that sends video
+// offers to encode it, and H264 besides.
 struct Call
 {
-    Call()
+    explicit Call(bool sendsVideo = false)
     {
         ConnectionParams params;
         params.endpoint = server.endpoint();
@@ -354,9 +481,20 @@ struct Call
         vp8.priority = 1000;
         vp8.payloadType = VIDEO_PAYLOAD_TYPE;
         vp8.rtxPayloadType = RTX_PAYLOAD_TYPE;
-        vp8.encode = false;
+        vp8.encode = sendsVideo;
         vp8.decode = true;
         params.videoCodecs = { vp8 };
+        if (sendsVideo) {
+            Codec h264;
+            h264.name = QStringLiteral("H264");
+            h264.type = QStringLiteral("video");
+            h264.priority = 2000;
+            h264.payloadType = H264_PAYLOAD_TYPE;
+            h264.rtxPayloadType = H264_RTX_PAYLOAD_TYPE;
+            h264.encode = true;
+            h264.decode = false;
+            params.videoCodecs.append(h264);
+        }
 
         client = std::make_unique<VoiceClient>(params);
         client->setVideoFrameHandler([this](Core::Snowflake userId, VideoCodec, EncodedVideoFrame frame) {
@@ -390,6 +528,30 @@ struct Call
         return static_cast<int>(std::count_if(frames.cbegin(), frames.cend(), [userId](const FrameSeen &frame) { return frame.userId == userId; }));
     }
 
+    void startVideo()
+    {
+        LocalVideoDescription description;
+        description.maxWidth = 1280;
+        description.maxHeight = 720;
+        description.maxFramerate = 30;
+        description.maxBitrate = 3500000;
+        client->startVideo(description);
+    }
+
+    // The payloads of the packets the server has from the client on one SSRC, put back together.
+    [[nodiscard]] Bytes reassembled(VideoCodec codec, quint32 ssrc) const
+    {
+        std::vector<std::span<const uint8_t>> payloads;
+        for (const RtpSeen &packet : server.rtp) {
+            if (packet.header.ssrc == ssrc)
+                payloads.emplace_back(packet.payload);
+        }
+        Bytes frame;
+        if (!assembleFrame(codec, payloads, frame))
+            frame.clear();
+        return frame;
+    }
+
     FakeVoiceServer server;
     std::unique_ptr<VoiceClient> client;
     QList<FrameSeen> frames;
@@ -411,6 +573,20 @@ private slots:
     void aKeyframeRequestGoesToThatSenderAlone();
     void aStrayPacketLeavesTheStreamRunning();
     void everyPacketTheServerNumberedIsReportedBack();
+
+    void theServerNamesTheCodecVideoIsSentWith();
+    void nothingIsSaidOfVideoBeforeItHasStarted();
+    void startingVideoAnnouncesTheLayerItIsSentOn();
+    void withoutStreamsFromTheServerTheSsrcsFollowTheAudioOne();
+    void aFrameArrivesAsPacketsThatReassemble();
+    void stoppingVideoSaysSoAndSendsNothingMore();
+    void aNackBringsThePacketBackOnTheRetransmissionStream();
+    void keyframeRequestsReachTheEncoderButNotInABurst();
+    void theReceiverCountIsPassedOn();
+    void whatViewersWantIsPassedOn();
+    void aSenderReportAndStatisticsFollowEverySecond();
+    void aChangeOfCodecIsTakenUp();
+    void noVideoGoesOutWhileEndToEndKeysAreMissing();
 };
 
 void TestVoiceClient::connectsAndSaysWhatItCanReceive()
@@ -563,6 +739,435 @@ void TestVoiceClient::everyPacketTheServerNumberedIsReportedBack()
     QTRY_COMPARE(call.server.acknowledgedUpTo, static_cast<int>(call.server.transportSequencesSent()));
     QTRY_VERIFY(call.server.receptionReports.contains(ALICE_SSRC) && call.server.receptionReports.contains(BOB_SSRC));
     QCOMPARE(call.server.undecryptable, 0);
+}
+
+void TestVoiceClient::theServerNamesTheCodecVideoIsSentWith()
+{
+    // Offered for decoding alone, the codec the server names is not one to send with.
+    Call receiving;
+    QTRY_VERIFY(receiving.isUp());
+    QCOMPARE(receiving.client->videoSendCodec(), VideoCodec::Unknown);
+
+    VideoCodec codecAtConnected = VideoCodec::Unknown;
+    Call call(true);
+    QObject::connect(call.client.get(), &VoiceClient::connected, call.client.get(), [&] { codecAtConnected = call.client->videoSendCodec(); });
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::Unknown);
+    QTRY_VERIFY(call.isUp());
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::VP8);
+    QCOMPARE(codecAtConnected, VideoCodec::VP8);
+}
+
+void TestVoiceClient::nothingIsSaidOfVideoBeforeItHasStarted()
+{
+    Call call(true);
+
+    // Not connected yet: there is nothing to announce video to.
+    call.startVideo();
+    QTRY_VERIFY(call.isUp());
+
+    QSignalSpy keyframes(call.client.get(), &VoiceClient::videoKeyframeRequested);
+    call.client->stopVideo();
+    call.client->describeVideo(LocalVideoDescription());
+    call.client->sendVideoFrame(videoFrame(3000, true, 0));
+    call.server.sendFeedback({ pictureLoss(OWN_VIDEO_SSRC) });
+    QTest::qWait(200);
+
+    QVERIFY(call.server.received(12).isEmpty());
+    QVERIFY(call.server.rtp.isEmpty());
+    QVERIFY(call.server.senderReports.isEmpty());
+    QCOMPARE(keyframes.count(), 0);
+    QCOMPARE(call.server.undecryptable, 0);
+}
+
+void TestVoiceClient::startingVideoAnnouncesTheLayerItIsSentOn()
+{
+    Call call(true);
+    // Two layers, the full one second, and its retransmissions not on the SSRC after its own.
+    call.server.readyStreams = QJsonArray{
+        QJsonObject{ { "type", "video" }, { "rid", "50" }, { "ssrc", 5002 }, { "rtx_ssrc", 5003 }, { "quality", 50 }, { "active", false } },
+        QJsonObject{ { "type", "video" }, { "rid", "100" }, { "ssrc", 5000 }, { "rtx_ssrc", 5005 }, { "quality", 100 }, { "active", false } },
+    };
+    QTRY_VERIFY(call.isUp());
+
+    const QByteArray opening = R"({"op":12,"d":{"audio_ssrc":777,"video_ssrc":5000,"rtx_ssrc":5001,"streams":[)";
+    const QByteArray lowLayer = R"({"type":"video","rid":"50","ssrc":5002,"active":false,"quality":50,"rtx_ssrc":5003})";
+
+    call.startVideo();
+    QTRY_COMPARE(call.server.receivedText(12).size(), 1);
+    QCOMPARE(call.server.receivedText(12)[0], opening + lowLayer + R"(,{"type":"video","rid":"100","ssrc":5000,"active":true,"quality":100,"rtx_ssrc":5005,"max_bitrate":3500000,"max_framerate":30,"max_resolution":{"type":"fixed","width":1280,"height":720}}]}})");
+
+    // New limits, this time for whatever size the source has.
+    LocalVideoDescription source;
+    source.maxFramerate = 60;
+    source.maxBitrate = 9000000;
+    call.client->describeVideo(source);
+    QTRY_COMPARE(call.server.receivedText(12).size(), 2);
+    const QByteArray limitsAtSource = R"("quality":100,"rtx_ssrc":5005,"max_bitrate":9000000,"max_framerate":60,"max_resolution":{"type":"source","width":0,"height":0}}]}})";
+    QCOMPARE(call.server.receivedText(12)[1], opening + lowLayer + R"(,{"type":"video","rid":"100","ssrc":5000,"active":true,)" + limitsAtSource);
+
+    // Off: no SSRC at the top, and the layers as they were but inactive.
+    call.client->stopVideo();
+    QTRY_COMPARE(call.server.receivedText(12).size(), 3);
+    QCOMPARE(call.server.receivedText(12)[2], R"({"op":12,"d":{"audio_ssrc":777,"video_ssrc":0,"rtx_ssrc":0,"streams":[)" + lowLayer + R"(,{"type":"video","rid":"100","ssrc":5000,"active":false,)" + limitsAtSource);
+
+    // Already off: there is nothing new to say.
+    call.client->stopVideo();
+    call.client->describeVideo(source);
+    QTest::qWait(100);
+    QCOMPARE(call.server.receivedText(12).size(), 3);
+
+    // No speaking message goes with video.
+    QVERIFY(call.server.received(5).isEmpty());
+}
+
+void TestVoiceClient::withoutStreamsFromTheServerTheSsrcsFollowTheAudioOne()
+{
+    Call call(true);
+    QTRY_VERIFY(call.isUp());
+
+    call.startVideo();
+    QTRY_COMPARE(call.server.receivedText(12).size(), 1);
+    QCOMPARE(call.server.receivedText(12)[0], QByteArray(R"({"op":12,"d":{"audio_ssrc":777,"video_ssrc":778,"rtx_ssrc":779,"streams":[{"type":"video","rid":"100","ssrc":778,"active":true,"quality":100,"rtx_ssrc":779,"max_bitrate":3500000,"max_framerate":30,"max_resolution":{"type":"fixed","width":1280,"height":720}}]}})"));
+}
+
+void TestVoiceClient::aFrameArrivesAsPacketsThatReassemble()
+{
+    Call call(true);
+    QTRY_VERIFY(call.isUp());
+    call.startVideo();
+
+    // More packets than leave in one go, so the order across pacing ticks is seen too.
+    const EncodedVideoFrame frame = videoFrame(20000, true, 123456);
+    constexpr int PACKETS = 18;
+    call.client->sendVideoFrame(frame);
+    QTRY_COMPARE(call.server.rtp.size(), PACKETS);
+    QCOMPARE(call.server.undecryptable, 0);
+
+    for (int i = 0; i < PACKETS; i++) {
+        const RtpSeen &packet = call.server.rtp[i];
+        QCOMPARE(packet.header.ssrc, OWN_VIDEO_SSRC);
+        QCOMPARE(int(packet.header.payloadType), VIDEO_PAYLOAD_TYPE);
+        QCOMPARE(packet.header.timestamp, 123456u);
+        QCOMPARE(packet.header.sequence, static_cast<quint16>(call.server.rtp[0].header.sequence + i));
+        QCOMPARE(packet.header.marker, i == PACKETS - 1);
+        QVERIFY(packet.size <= VideoSendStream::MAX_PACKET_SIZE);
+
+        // One numbering for everything this connection sends of video, beginning at one.
+        const std::span<const uint8_t> transportSequence = findRtpExtension(packet.extensions, VideoSendStream::TRANSPORT_SEQUENCE_EXTENSION);
+        QCOMPARE(transportSequence.size(), size_t(2));
+        QCOMPARE(int(qFromBigEndian<quint16>(transportSequence.data())), i + 1);
+        QCOMPARE(findRtpExtension(packet.extensions, VideoSendStream::ABS_SEND_TIME_EXTENSION).size(), size_t(3));
+        QCOMPARE(findRtpExtension(packet.extensions, VideoSendStream::TRANSMISSION_OFFSET_EXTENSION).size(), size_t(3));
+    }
+    QCOMPARE(call.reassembled(VideoCodec::VP8, OWN_VIDEO_SSRC), frame.data);
+}
+
+void TestVoiceClient::stoppingVideoSaysSoAndSendsNothingMore()
+{
+    Call call(true);
+    QTRY_VERIFY(call.isUp());
+    call.startVideo();
+    call.client->sendVideoFrame(videoFrame(1000, true, 0));
+    QTRY_COMPARE(call.server.rtp.size(), 1);
+
+    // What is still waiting to leave is dropped with the rest.
+    call.client->sendVideoFrame(videoFrame(100000, false, 3000));
+    call.client->stopVideo();
+    QTRY_COMPARE(call.server.received(12).size(), 2);
+    const QJsonObject off = call.server.received(12)[1];
+    QCOMPARE(off["video_ssrc"].toInt(-1), 0);
+    QCOMPARE(off["rtx_ssrc"].toInt(-1), 0);
+    QCOMPARE(off["streams"].toArray()[0].toObject()["ssrc"].toInt(), int(OWN_VIDEO_SSRC));
+    QCOMPARE(off["streams"].toArray()[0].toObject()["active"].toBool(true), false);
+
+    call.client->sendVideoFrame(videoFrame(1000, true, 6000));
+    call.server.sendFeedback({ nack(OWN_VIDEO_SSRC, call.server.rtp[0].header.sequence) });
+    QTest::qWait(200);
+    QCOMPARE(call.server.rtp.size(), 1);
+
+    // Started again, it is announced again and carries on.
+    call.startVideo();
+    call.client->sendVideoFrame(videoFrame(1000, true, 9000));
+    QTRY_COMPARE(call.server.rtp.size(), 2);
+    QCOMPARE(call.server.received(12).size(), 3);
+    QCOMPARE(call.server.received(12)[2]["video_ssrc"].toInt(), int(OWN_VIDEO_SSRC));
+    QCOMPARE(call.server.rtp[1].header.sequence, static_cast<quint16>(call.server.rtp[0].header.sequence + 1));
+}
+
+void TestVoiceClient::aNackBringsThePacketBackOnTheRetransmissionStream()
+{
+    constexpr quint32 VIDEO_SSRC = 5000;
+    constexpr quint32 RTX_SSRC = 5005;
+
+    Call call(true);
+    call.server.readyStreams = QJsonArray{ QJsonObject{ { "type", "video" }, { "rid", "100" }, { "ssrc", qint64(VIDEO_SSRC) }, { "rtx_ssrc", qint64(RTX_SSRC) }, { "quality", 100 }, { "active", false } } };
+    QTRY_VERIFY(call.isUp());
+    call.startVideo();
+    QSignalSpy statistics(call.client.get(), &VoiceClient::videoSendStatsUpdated);
+
+    call.client->sendVideoFrame(videoFrame(4000, true, 777));
+    QTRY_COMPARE(call.server.rtp.size(), 4);
+    const RtpSeen lost = call.server.rtp[2];
+    QCOMPARE(lost.header.ssrc, VIDEO_SSRC);
+
+    // Someone else's packet of the same number, and one this client never sent, bring nothing.
+    call.server.sendFeedback({ nack(BOB_SSRC, lost.header.sequence), nack(VIDEO_SSRC, static_cast<quint16>(lost.header.sequence + 100)), nack(VIDEO_SSRC, lost.header.sequence) });
+    QTRY_COMPARE(call.server.rtp.size(), 5);
+    QTest::qWait(100);
+    QCOMPARE(call.server.rtp.size(), 5);
+
+    const RtpSeen &repeated = call.server.rtp[4];
+    QCOMPARE(repeated.header.ssrc, RTX_SSRC);
+    QCOMPARE(int(repeated.header.payloadType), RTX_PAYLOAD_TYPE);
+    QCOMPARE(repeated.header.timestamp, 777u);
+    QCOMPARE(repeated.payload.size(), lost.payload.size() + 2);
+    QCOMPARE(qFromBigEndian<quint16>(repeated.payload.data()), lost.header.sequence);
+    QCOMPARE(Bytes(repeated.payload.begin() + 2, repeated.payload.end()), lost.payload);
+    QVERIFY(repeated.size <= VideoSendStream::MAX_PACKET_SIZE);
+
+    const std::span<const uint8_t> transportSequence = findRtpExtension(repeated.extensions, VideoSendStream::TRANSPORT_SEQUENCE_EXTENSION);
+    QCOMPARE(transportSequence.size(), size_t(2));
+    QCOMPARE(int(qFromBigEndian<quint16>(transportSequence.data())), 5);
+
+    QTRY_VERIFY_WITH_TIMEOUT(statistics.count() >= 1, 1500);
+    const VideoSendStats counted = statistics[0][0].value<VideoSendStats>();
+    QCOMPARE(counted.nacksReceived, quint64(2));
+    QCOMPARE(counted.retransmitted, quint64(1));
+    QCOMPARE(counted.packets, quint64(4));
+}
+
+void TestVoiceClient::keyframeRequestsReachTheEncoderButNotInABurst()
+{
+    Call call(true);
+    QTRY_VERIFY(call.isUp());
+    call.startVideo();
+    QSignalSpy keyframes(call.client.get(), &VoiceClient::videoKeyframeRequested);
+
+    // About someone else's video.
+    call.server.sendFeedback({ pictureLoss(BOB_SSRC), fullIntraRequest(BOB_SSRC) });
+    QTest::qWait(100);
+    QCOMPARE(keyframes.count(), 0);
+
+    call.server.sendFeedback({ pictureLoss(OWN_VIDEO_SSRC) });
+    QTRY_COMPARE(keyframes.count(), 1);
+
+    // Every viewer asking at once is one more key frame, not one each.
+    for (int i = 0; i < 5; i++)
+        call.server.sendFeedback({ pictureLoss(OWN_VIDEO_SSRC), fullIntraRequest(OWN_VIDEO_SSRC) });
+    QTest::qWait(100);
+    QCOMPARE(keyframes.count(), 1);
+    QTRY_COMPARE(keyframes.count(), 2);
+    QTest::qWait(500);
+    QCOMPARE(keyframes.count(), 2);
+
+    // A full intra request by itself, long enough after, is passed on at once.
+    call.server.sendFeedback({ fullIntraRequest(OWN_VIDEO_SSRC) });
+    QTRY_COMPARE_WITH_TIMEOUT(keyframes.count(), 3, 200);
+}
+
+void TestVoiceClient::theReceiverCountIsPassedOn()
+{
+    Call call(true);
+    QTRY_VERIFY(call.isUp());
+    QSignalSpy receivers(call.client.get(), &VoiceClient::videoReceiversChanged);
+    QSignalSpy keyframes(call.client.get(), &VoiceClient::videoKeyframeRequested);
+    const auto counts = [&receivers] {
+        QList<int> seen;
+        for (const QList<QVariant> &arguments : receivers)
+            seen.append(arguments[0].toInt());
+        return seen;
+    };
+
+    // Known before video starts, when there is no encoder to ask anything of.
+    call.server.sendFeedback({ receiverCount(BOB_SSRC, 4), receiverCount(OWN_VIDEO_SSRC, 0) });
+    QTRY_COMPARE(counts(), QList<int>{ 0 });
+
+    call.startVideo();
+    call.server.sendFeedback({ receiverCount(OWN_VIDEO_SSRC, 2) });
+    QTRY_COMPARE(counts(), (QList<int>{ 0, 2 }));
+    // The first to watch has seen nothing yet.
+    QTRY_COMPARE(keyframes.count(), 1);
+
+    // Said again, one more of them, or none left: nothing for the encoder to do.
+    call.server.sendFeedback({ receiverCount(OWN_VIDEO_SSRC, 2) });
+    call.server.sendFeedback({ receiverCount(OWN_VIDEO_SSRC, 3) });
+    call.server.sendFeedback({ receiverCount(OWN_VIDEO_SSRC, 0) });
+    QTRY_COMPARE(counts(), (QList<int>{ 0, 2, 3, 0 }));
+    QTest::qWait(400);
+    QCOMPARE(keyframes.count(), 1);
+
+    call.server.sendFeedback({ receiverCount(OWN_VIDEO_SSRC, 1) });
+    QTRY_COMPARE(counts(), (QList<int>{ 0, 2, 3, 0, 1 }));
+    QTRY_COMPARE(keyframes.count(), 2);
+}
+
+void TestVoiceClient::whatViewersWantIsPassedOn()
+{
+    Call call(true);
+    QTRY_VERIFY(call.isUp());
+    QSignalSpy wants(call.client.get(), &VoiceClient::videoWantsReceived);
+
+    const QString own = QString::number(OWN_VIDEO_SSRC);
+    const QString other = QString::number(BOB_SSRC);
+    constexpr int MEDIA_SINK_WANTS = 15;
+    call.server.send(MEDIA_SINK_WANTS, QJsonObject{ { "any", 100 } });
+    call.server.send(MEDIA_SINK_WANTS, QJsonObject{ { own, 50 }, { "any", 100 }, { "pixelCounts", QJsonObject{ { own, 230400 }, { other, 1 } } } });
+    call.server.send(MEDIA_SINK_WANTS, QJsonObject{ { other, 10 }, { "any", 20 }, { "pixelCounts", QJsonObject{ { other, 5 } } } });
+    call.server.send(MEDIA_SINK_WANTS, QJsonObject{ { own, 0 }, { "any", 30 } });
+    call.server.send(MEDIA_SINK_WANTS, QJsonObject{ { own, 0 }, { "any", 0 } });
+    call.server.send(MEDIA_SINK_WANTS, QJsonObject{ { other, 10 } });
+    QTRY_COMPARE(wants.count(), 6);
+
+    const auto said = [&wants](int index) { return qMakePair(wants[index][0].toInt(), wants[index][1].toInt()); };
+    QCOMPARE(said(0), qMakePair(100, 0));
+    QCOMPARE(said(1), qMakePair(50, 230400));
+    QCOMPARE(said(2), qMakePair(20, 0));
+    QCOMPARE(said(3), qMakePair(30, 0));
+    QCOMPARE(said(4), qMakePair(100, 0));
+    QCOMPARE(said(5), qMakePair(100, 0));
+}
+
+void TestVoiceClient::aSenderReportAndStatisticsFollowEverySecond()
+{
+    Call call(true);
+    QTRY_VERIFY(call.isUp());
+    call.startVideo();
+    QSignalSpy statistics(call.client.get(), &VoiceClient::videoSendStatsUpdated);
+
+    call.client->sendVideoFrame(videoFrame(3000, true, 90000));
+    QTRY_COMPARE(call.server.rtp.size(), 3);
+    quint32 payloadBytes = 0;
+    for (const RtpSeen &packet : call.server.rtp)
+        payloadBytes += static_cast<quint32>(packet.payload.size());
+
+    QTRY_VERIFY_WITH_TIMEOUT(!call.server.senderReports.isEmpty(), 1500);
+    const ReceivedRtcp::SenderReport report = call.server.senderReports[0];
+    QCOMPARE(report.ssrc, OWN_VIDEO_SSRC);
+    QCOMPARE(report.packetCount, 3u);
+    QCOMPARE(report.octetCount, payloadBytes);
+    // The frame's own time moved on by however long ago it was sent: under a second and a half.
+    QVERIFY(report.rtpTimestamp - 90000u < 135000u);
+    QVERIFY(report.compactNtp != 0);
+    QCOMPARE(call.server.undecryptable, 0);
+
+    QTRY_VERIFY(statistics.count() >= 1);
+    const VideoSendStats first = statistics[0][0].value<VideoSendStats>();
+    QCOMPARE(first.codec, QStringLiteral("VP8"));
+    QCOMPARE(first.packets, quint64(3));
+    QCOMPARE(first.bytes, quint64(payloadBytes));
+    QCOMPARE(first.frames, quint64(1));
+    QCOMPARE(first.keyframes, quint64(1));
+    // Three thousand bytes and their headers went out in about a second.
+    QVERIFY(first.bitrateBps > 2000 * 8 && first.bitrateBps < 4000 * 8);
+    QVERIFY(first.lossFraction < 0);
+    QCOMPARE(first.roundTripMs, -1);
+    QCOMPARE(first.receivers, -1);
+
+    // The server answers the report, and says half of what was sent since did not arrive.
+    ReceptionReport answer;
+    answer.ssrc = OWN_VIDEO_SSRC;
+    answer.fractionLost = 128;
+    answer.lastSenderReport = report.compactNtp;
+    // What it says of the audio in the same breath is not about the video.
+    ReceptionReport aboutAudio;
+    aboutAudio.ssrc = OWN_AUDIO_SSRC;
+    aboutAudio.fractionLost = 255;
+    const ReceptionReport answers[] = { answer, aboutAudio };
+    call.server.sendFeedback({ receiverCount(OWN_VIDEO_SSRC, 2), pictureLoss(OWN_VIDEO_SSRC) }, answers);
+
+    statistics.clear();
+    QTRY_VERIFY_WITH_TIMEOUT(statistics.count() >= 1, 1500);
+    const VideoSendStats second = statistics[0][0].value<VideoSendStats>();
+    QCOMPARE(second.lossFraction, 0.5);
+    QVERIFY(second.roundTripMs >= 0 && second.roundTripMs < 1500);
+    QCOMPARE(second.receivers, 2);
+    QCOMPARE(second.keyframeRequests, quint64(1));
+    QCOMPARE(second.packets, quint64(3));
+    QTRY_VERIFY(call.server.senderReports.size() >= 2);
+}
+
+void TestVoiceClient::aChangeOfCodecIsTakenUp()
+{
+    Call call(true);
+    QTRY_VERIFY(call.isUp());
+    call.startVideo();
+    QSignalSpy codecs(call.client.get(), &VoiceClient::videoSendCodecChanged);
+    constexpr int SESSION_UPDATE = 14;
+
+    // Something else about the session changes: the codec stays.
+    call.server.send(SESSION_UPDATE, QJsonObject{ { "media_session_id", "abc" } });
+    call.server.send(SESSION_UPDATE, QJsonObject{ { "video_codec", "H264" } });
+    QTRY_COMPARE(codecs.count(), 1);
+    QCOMPARE(codecs[0][0].value<VideoCodec>(), VideoCodec::H264);
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::H264);
+
+    // The new codec's stream opens with a key frame. Anything before one is left out, even
+    // when it would packetize: it may be a frame the old encoder still had in hand.
+    EncodedVideoFrame delta;
+    delta.data = { 0, 0, 0, 1, 0x41, 0x88, 0x5A, 0x5A };
+    delta.rtpTimestamp = 3000;
+    call.client->sendVideoFrame(delta);
+    const EncodedVideoFrame keyframe = h264Keyframe(6000);
+    call.client->sendVideoFrame(keyframe);
+    QTRY_COMPARE(call.server.rtp.size(), 4);
+    for (const RtpSeen &packet : call.server.rtp) {
+        QCOMPARE(int(packet.header.payloadType), H264_PAYLOAD_TYPE);
+        QCOMPARE(packet.header.timestamp, 6000u);
+    }
+    // The parameter sets travel together, ahead of the picture's fragments.
+    QCOMPARE(call.server.rtp[0].payload[0] & 0x1F, 24);
+    QCOMPARE(call.server.rtp[1].payload[0] & 0x1F, 28);
+    QCOMPARE(call.reassembled(VideoCodec::H264, OWN_VIDEO_SSRC), keyframe.data);
+
+    call.server.sendFeedback({ nack(OWN_VIDEO_SSRC, call.server.rtp[1].header.sequence) });
+    QTRY_COMPARE(call.server.rtp.size(), 5);
+    QCOMPARE(call.server.rtp[4].header.ssrc, OWN_RTX_SSRC);
+    QCOMPARE(int(call.server.rtp[4].header.payloadType), H264_RTX_PAYLOAD_TYPE);
+
+    // A codec this client never offered to encode: there is nothing to send video with.
+    call.server.send(SESSION_UPDATE, QJsonObject{ { "video_codec", "AV1" } });
+    QTRY_COMPARE(codecs.count(), 2);
+    QCOMPARE(codecs[1][0].value<VideoCodec>(), VideoCodec::Unknown);
+    call.client->sendVideoFrame(keyframe);
+    QTest::qWait(150);
+    QCOMPARE(call.server.rtp.size(), 5);
+}
+
+void TestVoiceClient::noVideoGoesOutWhileEndToEndKeysAreMissing()
+{
+    Call call(true);
+    call.server.daveProtocolVersion = 1;
+    QTRY_VERIFY(call.isUp());
+    QSignalSpy keyframes(call.client.get(), &VoiceClient::videoKeyframeRequested);
+
+    // Announced all the same; only the pictures wait.
+    call.startVideo();
+    call.client->sendVideoFrame(videoFrame(3000, true, 0));
+    call.client->sendVideoFrame(videoFrame(3000, false, 3000));
+    QTRY_COMPARE(call.server.received(12).size(), 1);
+    QTest::qWait(200);
+    QVERIFY(!call.client->isDaveEnabled());
+    QVERIFY(call.server.rtp.isEmpty());
+    QCOMPARE(keyframes.count(), 0);
+
+    // The call goes on without end-to-end encryption, so the frames may leave as they are.
+    constexpr int DAVE_PREPARE_TRANSITION = 21;
+    constexpr int DAVE_EXECUTE_TRANSITION = 22;
+    call.server.send(DAVE_PREPARE_TRANSITION, QJsonObject{ { "protocol_version", 0 }, { "transition_id", 5 } });
+    call.server.send(DAVE_EXECUTE_TRANSITION, QJsonObject{ { "transition_id", 5 } });
+    QTRY_COMPARE(keyframes.count(), 1);
+
+    // Sending picks up at a key frame; what builds on frames nobody was sent is left out.
+    call.client->sendVideoFrame(videoFrame(3000, false, 6000));
+    const EncodedVideoFrame keyframe = videoFrame(3000, true, 9000);
+    call.client->sendVideoFrame(keyframe);
+    call.client->sendVideoFrame(videoFrame(100, false, 12000));
+    QTRY_COMPARE(call.server.rtp.size(), 4);
+    for (int i = 0; i < 3; i++)
+        QCOMPARE(call.server.rtp[i].header.timestamp, 9000u);
+    QCOMPARE(call.server.rtp[3].header.timestamp, 12000u);
+    call.server.rtp.removeLast();
+    QCOMPARE(call.reassembled(VideoCodec::VP8, OWN_VIDEO_SSRC), keyframe.data);
 }
 
 QTEST_GUILESS_MAIN(TestVoiceClient)

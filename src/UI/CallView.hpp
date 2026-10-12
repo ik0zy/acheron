@@ -15,15 +15,20 @@
 
 class QCheckBox;
 class QLabel;
+class QMenu;
 class QPushButton;
 class QToolButton;
 
 namespace Acheron {
 namespace Core {
 class CallVideo;
+class StreamBroadcaster;
 class StreamWatcher;
 namespace Audio {
 class VoiceManager;
+}
+namespace Video {
+struct SendQuality;
 }
 } // namespace Core
 
@@ -40,6 +45,10 @@ class VideoSurface;
 //
 // Clicking a stream that is not being watched watches it. Double-clicking a tile enlarges it
 // over a strip of the others.
+//
+// The account's own screen share is started and stopped from the bar, and has a tile like any
+// other stream, drawn from the capture's previews. A share that ended by itself leaves its
+// tile up to say why, until it is clicked away.
 class CallView : public QWidget
 {
     Q_OBJECT
@@ -48,7 +57,7 @@ public:
     using AvatarResolver = std::function<QUrl(Core::Snowflake)>;
 
     // `dock` is the widget whose layout the view lives in while it is not in its own window.
-    CallView(Core::Audio::VoiceManager *voice, Core::StreamWatcher *watcher, Core::ImageManager *images, Core::Snowflake accountId, NameResolver names, AvatarResolver avatars, const QString &title, QWidget *dock);
+    CallView(Core::Audio::VoiceManager *voice, Core::StreamWatcher *watcher, Core::StreamBroadcaster *broadcaster, Core::ImageManager *images, Core::Snowflake accountId, NameResolver names, AvatarResolver avatars, const QString &title, QWidget *dock);
     ~CallView() override;
 
     // Enlarges one tile, or with an empty id goes back to the grid. Ids are "stream:<user>"
@@ -100,6 +109,14 @@ private:
     void refreshTile(Tile &tile);
     void bindSession(Tile &tile, Core::StreamSession *session);
     void applySessionState(Tile &tile);
+    void applyOwnShareState(Tile &tile);
+    void showOwnPreview(const QImage &preview);
+    void onShareClicked();
+    void fillQualityMenu(QMenu *menu);
+    void changeShareQuality(const Core::Video::SendQuality &quality);
+    [[nodiscard]] QStringList ownShareStats() const;
+    [[nodiscard]] bool isOwnShare(const Tile &tile) const { return tile.stream && tile.userId == accountId; }
+    [[nodiscard]] bool ownShareShown() const;
     void layoutTiles();
     void refreshStats();
     void showTileMenu(const QString &tileId, const QPoint &globalPos);
@@ -121,6 +138,7 @@ private:
 
     QPointer<Core::Audio::VoiceManager> voice;
     QPointer<Core::StreamWatcher> watcher;
+    QPointer<Core::StreamBroadcaster> broadcaster;
     QPointer<Core::CallVideo> video;
     Core::ImageManager *images;
     Core::Snowflake accountId;
@@ -146,6 +164,9 @@ private:
     QWidget *controls;
     QToolButton *collapseButton;
     ElidedLabel *summaryLabel;
+    QToolButton *shareButton;
+    QMenu *shareQualityMenu;
+    bool captureAvailable = false;
     QCheckBox *nonVideoCheck;
     QPushButton *statsButton;
     QPushButton *popOutButton;

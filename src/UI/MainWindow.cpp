@@ -1217,7 +1217,7 @@ CallView *MainWindow::ensureCallView(Core::ClientInstance *instance)
     };
 
     ChannelNode *channel = channelTreeModel->findChannelTreeNode(instance->voiceChannelId());
-    auto *view = new CallView(instance->voice(), instance->streamWatcher(), session->getImageManager(), instance->accountId(), names, avatars, channel ? channel->name : tr("Call"), callHost);
+    auto *view = new CallView(instance->voice(), instance->streamWatcher(), instance->streamBroadcaster(), session->getImageManager(), instance->accountId(), names, avatars, channel ? channel->name : tr("Call"), callHost);
     callViews.insert(accountId, view);
     connect(view, &CallView::presenceChanged, this, &MainWindow::updateCallHost);
     updateCallHost();

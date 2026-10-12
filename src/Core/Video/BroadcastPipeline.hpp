@@ -1,0 +1,117 @@
+#pragma once
+
+#include <QImage>
+#include <QList>
+#include <QObject>
+#include <QRect>
+#include <QSize>
+#include <QString>
+
+#include <memory>
+
+#include "Discord/Voice/VideoReceiver.hpp"
+#include "Discord/Voice/VoiceEnums.hpp"
+
+namespace Acheron {
+namespace Core {
+namespace Video {
+
+// Something that can be shared: for now, a screen.
+struct CaptureSource
+{
+    // "screen:<n>", where n is stable for as long as the monitors stay as they are.
+    QString id;
+    QString name;
+    // In the desktop's own pixels.
+    QRect geometry;
+};
+
+// False where this build or this machine cannot capture a screen at all, in which case nothing
+// offers to share one.
+[[nodiscard]] bool screenCaptureAvailable();
+[[nodiscard]] QList<CaptureSource> captureSources();
+// A still of the source as it is now, no larger than `bound`, for a picker. Null when it
+// cannot be had.
+[[nodiscard]] QImage captureThumbnail(const CaptureSource &source, const QSize &bound);
+
+struct BroadcastSettings
+{
+    QString sourceId;
+    // The tallest picture to send; a taller source is scaled down keeping its shape. Zero
+    // sends the source at its own size.
+    int maxHeight = 720;
+    int framerate = 30;
+    Discord::Voice::VideoCodec codec = Discord::Voice::VideoCodec::Unknown;
+    // Bits per second.
+    int bitrate = 0;
+    int maxBitrate = 0;
+    // From the server; zero means key frames are made only when asked for.
+    int keyframeIntervalMs = 0;
+};
+
+struct BroadcastStats
+{
+    QString encoderName;
+    bool hardware = false;
+    QSize encodedSize;
+    double capturedFps = 0;
+    double encodedFps = 0;
+    double averageEncodeMs = 0;
+    quint64 bitrateBps = 0;
+    quint64 framesEncoded = 0;
+    quint64 framesDropped = 0;
+};
+
+using EncodedFramePointer = std::shared_ptr<const Discord::Voice::EncodedVideoFrame>;
+
+// Captures a source, scales it and encodes it, on a thread of its own. Its signals are
+// emitted from that thread, so connect to them queued or from an object on another thread.
+//
+// Encoded frames are whole access units as the RTP sender wants them: Annex B for H264 with
+// SPS and PPS in front of every key frame, a bare frame for VP8, and a 90 kHz timestamp taken
+// from when the picture was captured.
+class BroadcastPipeline : public QObject
+{
+    Q_OBJECT
+public:
+    explicit BroadcastPipeline(QObject *parent = nullptr);
+    ~BroadcastPipeline() override;
+
+    // The codecs this machine has a working encoder for, of those the RTP sender can packetize.
+    // The first call opens each candidate once and can take a moment; call it off the UI thread.
+    [[nodiscard]] static QList<Discord::Voice::VideoCodec> encodableCodecs();
+
+    // All of these may be called from any thread and return at once.
+    void start(const BroadcastSettings &settings);
+    void stop();
+    // The first frame encoded after this is a key frame.
+    void requestKeyframe();
+    // Encoders that cannot follow a new rate while running are reopened, which costs a key
+    // frame, so callers should move this in steps and not continuously.
+    void setBitrate(int bitrate);
+    // While nobody is watching: capture carries on, so previews stay current, and nothing is
+    // encoded. Sending again starts with a key frame.
+    void setEncodingSuspended(bool suspended);
+
+signals:
+    void started(const QSize &encodedSize, int framerate);
+    void frameEncoded(const Acheron::Core::Video::EncodedFramePointer &frame);
+    // About twice a second, and small: for the sharer's own tile and for the stream's thumbnail.
+    void previewReady(const QImage &preview);
+    // The source stopped delivering pictures (true) or resumed (false).
+    void captureStalled(bool stalled);
+    // Nothing more will come: the source is gone, or no encoder could be opened.
+    void failed(const QString &reason);
+    void statsUpdated(const Acheron::Core::Video::BroadcastStats &stats);
+
+private:
+    class Worker;
+    std::unique_ptr<Worker> worker;
+};
+
+} // namespace Video
+} // namespace Core
+} // namespace Acheron
+
+Q_DECLARE_METATYPE(Acheron::Core::Video::EncodedFramePointer)
+Q_DECLARE_METATYPE(Acheron::Core::Video::BroadcastStats)

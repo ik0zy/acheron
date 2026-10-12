@@ -1,5 +1,6 @@
 // Tests for Go Live signalling: stream keys, the five gateway opcodes a client sends, the four
-// events it receives, the per-account record kept from those events, and the thumbnail cache.
+// events it receives, the per-account record kept from those events, the thumbnail cache, and
+// the thumbnail a stream's owner uploads.
 // Expected payload bytes are what the official client sends (docs/video-re/re-main-gateway.md).
 
 #include "Core/Streams/StreamManager.hpp"
@@ -8,6 +9,7 @@
 #include "Discord/Outbound.hpp"
 #include "Discord/StreamKey.hpp"
 
+#include <QImage>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
@@ -19,6 +21,7 @@ using Core::Snowflake;
 using Core::StreamEndReason;
 using Core::StreamManager;
 using Core::StreamPreviews;
+using Core::StreamPreviewUploader;
 using Core::StreamRecord;
 using Discord::StreamKey;
 
@@ -67,6 +70,40 @@ struct FakeLookups
     }
 };
 
+// Stands in for the REST upload in the same way.
+struct FakeUploads
+{
+    QStringList keys;
+    QStringList thumbnails;
+    QList<std::function<void(bool)>> pending;
+
+    StreamPreviewUploader::Upload uploader()
+    {
+        return [this](const QString &key, const QString &thumbnail, std::function<void(bool)> done) {
+            keys.append(key);
+            thumbnails.append(thumbnail);
+            pending.append(std::move(done));
+        };
+    }
+
+    void answer(bool uploaded) { pending.takeFirst()(uploaded); }
+};
+
+QImage screen(int width, int height)
+{
+    QImage picture(width, height, QImage::Format_RGB32);
+    picture.fill(Qt::darkCyan);
+    return picture;
+}
+
+QImage decodedThumbnail(const QString &thumbnail)
+{
+    const QString prefix = QStringLiteral("data:image/jpeg;base64,");
+    if (!thumbnail.startsWith(prefix))
+        return {};
+    return QImage::fromData(QByteArray::fromBase64(thumbnail.mid(prefix.size()).toLatin1()), "JPEG");
+}
+
 } // namespace
 
 class TestStreams : public QObject
@@ -106,6 +143,16 @@ private slots:
     void successClearsTheBackoff();
     void forgettingAnOwnerDropsOnlyTheirStreams();
     void lookupFinishingAfterForgetIsIgnored();
+
+    void thumbnailIsAJpegFittedInside512x288_data();
+    void thumbnailIsAJpegFittedInside512x288();
+    void noThumbnailOfNoPicture();
+    void firstThumbnailIsUploadedHalfASecondAfterTheVideoStarts();
+    void nextThumbnailIsFiveMinutesAfterAnUpload();
+    void failedUploadIsTriedAgainInAMinute();
+    void stalledCaptureIsLookedAtAgainInAMinute();
+    void uploadFinishingAfterTheStreamStoppedIsIgnored();
+    void startingAgainStartsTheWaitAgain();
 };
 
 void TestStreams::initTestCase()
@@ -544,6 +591,124 @@ void TestStreams::lookupFinishingAfterForgetIsIgnored()
     QVERIFY(changed.isEmpty());
     QVERIFY(previews.request(GUILD_KEY).isEmpty());
     QCOMPARE(lookups.requested.size(), 2);
+}
+
+void TestStreams::thumbnailIsAJpegFittedInside512x288_data()
+{
+    QTest::addColumn<QSize>("source");
+    QTest::addColumn<QSize>("thumbnail");
+
+    QTest::newRow("16:9") << QSize(1920, 1080) << QSize(512, 288);
+    QTest::newRow("4:3") << QSize(1024, 768) << QSize(384, 288);
+    QTest::newRow("ultrawide") << QSize(2560, 1080) << QSize(512, 216);
+    QTest::newRow("portrait") << QSize(1080, 1920) << QSize(162, 288);
+    QTest::newRow("smaller than the bound") << QSize(256, 144) << QSize(512, 288);
+}
+
+void TestStreams::thumbnailIsAJpegFittedInside512x288()
+{
+    QFETCH(QSize, source);
+    QFETCH(QSize, thumbnail);
+
+    const QImage decoded = decodedThumbnail(StreamPreviewUploader::thumbnailOf(screen(source.width(), source.height())));
+    QCOMPARE(decoded.size(), thumbnail);
+}
+
+void TestStreams::noThumbnailOfNoPicture()
+{
+    QVERIFY(StreamPreviewUploader::thumbnailOf(QImage()).isEmpty());
+}
+
+void TestStreams::firstThumbnailIsUploadedHalfASecondAfterTheVideoStarts()
+{
+    FakeUploads uploads;
+    StreamPreviewUploader uploader(uploads.uploader());
+    QCOMPARE(uploader.waitMs(), -1);
+
+    uploader.start(GUILD_KEY);
+    QCOMPARE(uploader.waitMs(), 500);
+    uploader.offer(screen(640, 360));
+    QVERIFY(uploads.keys.isEmpty());
+
+    QTRY_COMPARE(uploader.waitMs(), -1);
+    uploader.offer(screen(640, 360));
+    QCOMPARE(uploads.keys, QStringList{ GUILD_KEY });
+    QCOMPARE(decodedThumbnail(uploads.thumbnails.first()).size(), QSize(512, 288));
+
+    // One picture is enough until the next upload comes due.
+    uploader.offer(screen(640, 360));
+    QCOMPARE(uploads.keys.size(), 1);
+}
+
+void TestStreams::nextThumbnailIsFiveMinutesAfterAnUpload()
+{
+    FakeUploads uploads;
+    StreamPreviewUploader uploader(uploads.uploader());
+    uploader.start(GUILD_KEY);
+    QTRY_COMPARE(uploader.waitMs(), -1);
+    uploader.offer(screen(640, 360));
+
+    uploads.answer(true);
+    QCOMPARE(uploader.waitMs(), 5 * 60 * 1000);
+    uploader.offer(screen(640, 360));
+    QCOMPARE(uploads.keys.size(), 1);
+}
+
+void TestStreams::failedUploadIsTriedAgainInAMinute()
+{
+    FakeUploads uploads;
+    StreamPreviewUploader uploader(uploads.uploader());
+    uploader.start(GUILD_KEY);
+    QTRY_COMPARE(uploader.waitMs(), -1);
+    uploader.offer(screen(640, 360));
+
+    uploads.answer(false);
+    QCOMPARE(uploader.waitMs(), 60 * 1000);
+}
+
+void TestStreams::stalledCaptureIsLookedAtAgainInAMinute()
+{
+    FakeUploads uploads;
+    StreamPreviewUploader uploader(uploads.uploader());
+    uploader.setStalled(true);
+    uploader.start(GUILD_KEY);
+
+    QTRY_COMPARE(uploader.waitMs(), 60 * 1000);
+    uploader.offer(screen(640, 360));
+    QVERIFY(uploads.keys.isEmpty());
+}
+
+void TestStreams::uploadFinishingAfterTheStreamStoppedIsIgnored()
+{
+    FakeUploads uploads;
+    StreamPreviewUploader uploader(uploads.uploader());
+    uploader.start(GUILD_KEY);
+    QTRY_COMPARE(uploader.waitMs(), -1);
+    uploader.offer(screen(640, 360));
+
+    uploader.stop();
+    uploads.answer(true);
+    QCOMPARE(uploader.waitMs(), -1);
+    uploader.offer(screen(640, 360));
+    QCOMPARE(uploads.keys.size(), 1);
+}
+
+void TestStreams::startingAgainStartsTheWaitAgain()
+{
+    FakeUploads uploads;
+    StreamPreviewUploader uploader(uploads.uploader());
+    uploader.start(GUILD_KEY);
+    QTRY_COMPARE(uploader.waitMs(), -1);
+    uploader.offer(screen(640, 360));
+    uploads.answer(true);
+    QCOMPARE(uploader.waitMs(), 5 * 60 * 1000);
+
+    // The stream's RTC connection came back and announced the video anew.
+    uploader.start(CALL_KEY);
+    QCOMPARE(uploader.waitMs(), 500);
+    QTRY_COMPARE(uploader.waitMs(), -1);
+    uploader.offer(screen(640, 360));
+    QCOMPARE(uploads.keys, (QStringList{ GUILD_KEY, CALL_KEY }));
 }
 
 QTEST_GUILESS_MAIN(TestStreams)

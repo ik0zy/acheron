@@ -33,6 +33,7 @@ class VoiceGateway;
 class UdpTransport;
 class VoiceEncryption;
 class DaveSession;
+class VideoSendStream;
 
 // What one connection has received of remote video, summed over its senders.
 struct VideoReceiveStats
@@ -51,6 +52,39 @@ struct VideoReceiveStats
     // What the server says the way to this client carries, and loses. Zero until it has said.
     quint64 serverEstimateBps = 0;
     double serverLossFraction = 0;
+};
+
+// What this client announces of the video it sends, in VIDEO (opcode 12).
+struct LocalVideoDescription
+{
+    // The largest picture that will be sent. Zero by zero means the source's own size, whatever
+    // that turns out to be.
+    int maxWidth = 0;
+    int maxHeight = 0;
+    int maxFramerate = 30;
+    // Bits per second.
+    int maxBitrate = 0;
+};
+
+// What one connection has sent of its own video, and what the server says became of it.
+struct VideoSendStats
+{
+    QString codec;
+    quint64 packets = 0;
+    quint64 bytes = 0;
+    quint64 frames = 0;
+    quint64 keyframes = 0;
+    quint64 retransmitted = 0;
+    quint64 nacksReceived = 0;
+    quint64 keyframeRequests = 0;
+    // Sent over the last second, retransmissions included.
+    quint64 bitrateBps = 0;
+    // From the server's reception reports on the video: the share of packets lost since its
+    // previous report, 0 to 1, and the round trip. Negative until it has reported.
+    double lossFraction = -1;
+    int roundTripMs = -1;
+    // How many are receiving the video, as the server counts them. Negative until it has said.
+    int receivers = -1;
 };
 
 class VoiceClient : public QObject
@@ -110,6 +144,23 @@ public:
     // use another.
     void withdrawVideoCodec(VideoCodec codec);
 
+    // Sending video. Like everything else here, these are called on this client's thread.
+    //
+    // The codec the server has this client send with: one of those offered with `encode` set.
+    // Unknown until the session is described.
+    [[nodiscard]] VideoCodec videoSendCodec() const;
+    // Announces the video and starts accepting frames. Has no effect before the connection is
+    // up; call it from connected(), and again after a reconnect.
+    void startVideo(const LocalVideoDescription &description);
+    // The limits changed while sending: announces them again.
+    void describeVideo(const LocalVideoDescription &description);
+    // Announces that the video is off and forgets what was queued.
+    void stopVideo();
+    // One whole encoded frame in videoSendCodec(): Annex B for H264, with SPS and PPS in front
+    // of every key frame. `rtpTimestamp` is at 90 kHz from any origin. Frames are dropped while
+    // video is not started, and while end-to-end encryption has no key to send them under.
+    void sendVideoFrame(const EncodedVideoFrame &frame);
+
 signals:
     void stateChanged(State newState);
     void connected();
@@ -123,6 +174,19 @@ signals:
     // The encodings a user's video now comes in; none when it has stopped.
     void remoteVideoLayersChanged(Acheron::Core::Snowflake userId, const QList<Acheron::Discord::Voice::VideoLayer> &layers);
     void videoStatsUpdated(const Acheron::Discord::Voice::VideoReceiveStats &stats);
+
+    void videoSendCodecChanged(Acheron::Discord::Voice::VideoCodec codec);
+    // A viewer cannot go on without a key frame, or a new one has arrived.
+    void videoKeyframeRequested();
+    // The server's count of who is receiving the video changed. At zero there is no point in
+    // encoding anything.
+    void videoReceiversChanged(int receivers);
+    // What the server relays of the viewers' wishes for the video being sent: how much of it
+    // is wanted, 0 to 100, and the largest size any of them shows it at, in pixels (zero when
+    // not said).
+    void videoWantsReceived(int want, int pixelCount);
+    // Once a second while video is being sent.
+    void videoSendStatsUpdated(const Acheron::Discord::Voice::VideoSendStats &stats);
 
     void speakingReceived(const SpeakingData &data);
     void clientConnected(const ClientConnectData &data);
@@ -140,6 +204,8 @@ private slots:
     void onGatewayDisconnected(VoiceCloseCode code, const QString &reason);
     void onGatewayReady(const VoiceReady &data);
     void onSessionDescription(const SessionDescription &desc);
+    void onSessionUpdated(const SessionUpdate &update);
+    void onMediaSinkWants(const MediaSinkWants &wants);
     void onSpeaking(const SpeakingData &data);
     void onClientsConnect(const QStringList &userIds);
     void onClientConnect(const ClientConnectData &data);
@@ -181,6 +247,22 @@ private:
     void startVideoTimer();
     void onVideoTick();
     void sendVideoWants();
+
+    void takeLocalVideoStreams(const VoiceReady &ready);
+    [[nodiscard]] quint32 localVideoSsrc() const;
+    void setVideoSendCodec(const QString &name);
+    // Points the sender at the codec in use, making it first if need be. False when video
+    // cannot be sent with that codec.
+    bool prepareVideoSender();
+    void registerLocalVideoWithDave();
+    void announceLocalVideo(bool on);
+    bool daveEncryptVideo(std::span<const uint8_t> frame, std::vector<uint8_t> &encrypted);
+    void startVideoPacing();
+    void onVideoPaceTick();
+    void onVideoSendReportTick();
+    void receiveVideoFeedback(const ReceivedRtcp &received);
+    void noteVideoReceivers(int receivers);
+    void askForLocalKeyframe();
 
 private:
     VoiceGateway *gateway = nullptr;
@@ -257,7 +339,34 @@ private:
     quint64 serverEstimateBps = 0;
     double serverLossFraction = 0;
 
+    // The video layers READY gave this client to send on, and the one it uses.
+    QList<StreamDescription> localVideoStreams;
+    int localVideoLayer = 0;
+    VideoCodec sendCodec = VideoCodec::Unknown;
+    // Set while video is started.
+    std::optional<LocalVideoDescription> localVideo;
+    // The layers as VIDEO last described them, which is how they are named again, inactive,
+    // when video goes off.
+    QList<StreamDescription> announcedVideoStreams;
+    std::unique_ptr<VideoSendStream> videoSender;
+    QTimer *videoPaceTimer = nullptr;
+    QTimer *videoSendReportTimer = nullptr;
+    QTimer *localKeyframeTimer = nullptr;
+    qint64 localKeyframeAskedMs = -1;
+    quint64 localKeyframeRequests = 0;
+    // Something of the stream did not go out (there was no end-to-end key for it yet, or the
+    // codec changed under it), so what follows builds on pictures nobody was sent and is held
+    // back until a key frame comes.
+    bool videoSendAwaitsKeyframe = false;
+    // Negative until the server has said.
+    int videoReceivers = -1;
+    quint64 videoBytesAtSendReport = 0;
+    qint64 videoSendReportedUs = 0;
+
     static constexpr int KEEPALIVE_INTERVAL_MS = 10000;
+    static constexpr int VIDEO_SEND_REPORT_INTERVAL_MS = 1000;
+    // An encoder asked for key frames faster than this only makes the stream worse.
+    static constexpr int LOCAL_KEYFRAME_INTERVAL_MS = 300;
     static constexpr int VIDEO_TICK_MS = 20;
     static constexpr int VIDEO_REPORT_INTERVAL_MS = 1000;
     static constexpr int TRANSPORT_FEEDBACK_INTERVAL_MS = 100;
@@ -270,3 +379,5 @@ private:
 } // namespace Acheron
 
 Q_DECLARE_METATYPE(Acheron::Discord::Voice::VideoReceiveStats)
+Q_DECLARE_METATYPE(Acheron::Discord::Voice::VideoSendStats)
+Q_DECLARE_METATYPE(Acheron::Discord::Voice::VideoCodec)

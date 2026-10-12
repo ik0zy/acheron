@@ -230,7 +230,7 @@ QList<Discord::Voice::VideoCodec> decodableVideoCodecs()
     return codecs;
 }
 
-QList<Discord::Voice::Codec> offeredVideoCodecs()
+QList<Discord::Voice::Codec> offeredVideoCodecs(const QList<Discord::Voice::VideoCodec> &encodable)
 {
     static constexpr int FIRST_PAYLOAD_TYPE = 101;
 
@@ -243,7 +243,7 @@ QList<Discord::Voice::Codec> offeredVideoCodecs()
         codec.priority = (i + 1) * 1000;
         codec.payloadType = FIRST_PAYLOAD_TYPE + 2 * i;
         codec.rtxPayloadType = FIRST_PAYLOAD_TYPE + 2 * i + 1;
-        codec.encode = false;
+        codec.encode = encodable.contains(codecs[i]);
         codec.decode = true;
         offered.append(codec);
     }

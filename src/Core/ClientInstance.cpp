@@ -15,6 +15,7 @@
 #include "Streams/StreamManager.hpp"
 #include "Streams/StreamPreviews.hpp"
 #ifdef ACHERON_HAVE_STREAM_VIEW
+#include "Streams/StreamBroadcaster.hpp"
 #include "Streams/StreamWatcher.hpp"
 #endif
 #include "Discord/Enums.hpp"
@@ -103,6 +104,8 @@ ClientInstance::ClientInstance(const AccountInfo &info,
 #endif
 #ifdef ACHERON_HAVE_STREAM_VIEW
     streamWatch = new StreamWatcher(client, streamManager, voiceManager, info.id, info.proxy, this);
+    streamBroadcast = new StreamBroadcaster(
+            client, streamManager, voiceManager, info.id, info.proxy, [this] { return screenShareTerms(); }, this);
 #endif
 
     connect(client, &Discord::Client::stateChanged, this, &ClientInstance::stateChanged);
@@ -119,6 +122,8 @@ ClientInstance::ClientInstance(const AccountInfo &info,
 #ifdef ACHERON_HAVE_STREAM_VIEW
         streamWatch->reset();
         streamWatch->setGatewaySessionId(gatewaySessionId);
+        streamBroadcast->reset();
+        streamBroadcast->setGatewaySessionId(gatewaySessionId);
 #endif
         streamManager->reset();
         streamPreviewCache->clear();
@@ -1460,6 +1465,9 @@ ClientInstance::~ClientInstance()
     // Its sessions feed the voice manager's mixer, so they go before it does.
     delete streamWatch;
     streamWatch = nullptr;
+    // It reads the voice manager and the repositories, so it goes before they do as well.
+    delete streamBroadcast;
+    streamBroadcast = nullptr;
 #endif
     Storage::DatabaseManager::instance().closeCacheDatabase(account.id);
 }
@@ -1556,6 +1564,42 @@ StreamPreviews *ClientInstance::streamPreviews() const
 StreamWatcher *ClientInstance::streamWatcher() const
 {
     return streamWatch;
+}
+
+StreamBroadcaster *ClientInstance::streamBroadcaster() const
+{
+    return streamBroadcast;
+}
+
+ShareTerms ClientInstance::screenShareTerms()
+{
+    ShareTerms shareTerms;
+    if (!currentVoiceChannelId.isValid())
+        return shareTerms;
+
+    const Discord::User &me = client->getMe();
+    if (me.premiumType.hasValue())
+        shareTerms.tier.premiumType = static_cast<int>(me.premiumType.get());
+
+    if (!currentVoiceGuildId.isValid()) {
+        shareTerms.allowed = true;
+        if (const auto call = callStore->call(currentVoiceChannelId))
+            shareTerms.preferredRegion = call->region.value_or(QString());
+        return shareTerms;
+    }
+
+    shareTerms.tier.guildBoostTier = static_cast<int>(client->getGuildPremiumTier(currentVoiceGuildId));
+
+    // Stage channels have rules of their own, which this client does not follow yet.
+    const auto channel = getChannel(currentVoiceChannelId);
+    if (!channel || channel->type.get() != Discord::ChannelType::GUILD_VOICE)
+        return shareTerms;
+    const auto guild = getGuild(currentVoiceGuildId);
+    if (guild && guild->afkChannelId.hasValue() && guild->afkChannelId.get() == currentVoiceChannelId)
+        return shareTerms;
+
+    shareTerms.allowed = permissionManager->hasChannelPermission(account.id, currentVoiceChannelId, Discord::Permission::STREAM | Discord::Permission::VIEW_CHANNEL | Discord::Permission::CONNECT);
+    return shareTerms;
 }
 #endif
 

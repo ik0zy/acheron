@@ -24,7 +24,8 @@ void StreamWatcher::watchWhenConnected(const Discord::StreamKey &key)
         watch(key);
         return;
     }
-    pendingWatch = key;
+    if (key.ownerId != accountId)
+        pendingWatch = key;
 }
 
 // In a private call the official client watches a stream without being asked: the first live

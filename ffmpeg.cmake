@@ -12,6 +12,10 @@ set(FFMPEG_RUNTIME_DLLS "" CACHE INTERNAL "ffmpeg shared libraries to stage next
 # beside them; staging those too costs 33 MB of DLLs nothing here ever loads.
 set(FFMPEG_COMPONENTS avcodec avformat avutil swscale swresample)
 
+# Screen capture and on-card scaling for sending video live in avfilter. It is taken when the
+# prebuilt package has it and done without otherwise, in which case nothing can be shared.
+set(FFMPEG_HAVE_AVFILTER OFF CACHE INTERNAL "whether the ffmpeg target includes libavfilter" FORCE)
+
 # ffmpeg 5.1, where AVChannelLayout replaced the channel-layout fields MediaDecoder
 # needs. Both routes below check it, or a distro on an older ffmpeg (Ubuntu 22.04 is
 # one) is accepted here and only fails much later on MediaDecoder's #error.
@@ -117,11 +121,23 @@ if(FFMPEG_INCLUDE_DIR AND NOT _ffmpeg_missing
     target_link_libraries(ffmpeg INTERFACE ${_ffmpeg_libraries})
     message(STATUS "Using ffmpeg from ${FFMPEG_INCLUDE_DIR}")
 
+    set(_ffmpeg_staged_components ${FFMPEG_COMPONENTS})
+    if(NOT FFMPEG_avfilter_LIBRARY)
+        unset(FFMPEG_avfilter_LIBRARY CACHE)
+    endif()
+    find_library(FFMPEG_avfilter_LIBRARY NAMES avfilter libavfilter PATH_SUFFIXES lib)
+    if(FFMPEG_avfilter_LIBRARY)
+        target_link_libraries(ffmpeg INTERFACE "${FFMPEG_avfilter_LIBRARY}")
+        target_compile_definitions(ffmpeg INTERFACE ACHERON_HAVE_AVFILTER)
+        list(APPEND _ffmpeg_staged_components avfilter)
+        set(FFMPEG_HAVE_AVFILTER ON CACHE INTERNAL "whether the ffmpeg target includes libavfilter" FORCE)
+    endif()
+
     # shared prebuilds keep their DLLs in <prefix>/bin, staged next to the exe later
     get_filename_component(_ffmpeg_prefix "${FFMPEG_INCLUDE_DIR}" DIRECTORY)
     if(WIN32 AND IS_DIRECTORY "${_ffmpeg_prefix}/bin")
         set(_ffmpeg_dlls "")
-        foreach(_ffmpeg_component ${FFMPEG_COMPONENTS})
+        foreach(_ffmpeg_component ${_ffmpeg_staged_components})
             file(GLOB _ffmpeg_component_dlls "${_ffmpeg_prefix}/bin/${_ffmpeg_component}*.dll")
             list(APPEND _ffmpeg_dlls ${_ffmpeg_component_dlls})
         endforeach()

@@ -352,6 +352,8 @@ if(ENABLE_VOICE)
         src/Discord/Voice/DaveSession.cpp
         src/Discord/Voice/VideoDepacketizer.cpp
         src/Discord/Voice/VideoReceiver.cpp
+        src/Discord/Voice/VideoPacketizer.cpp
+        src/Discord/Voice/VideoSender.cpp
         src/Discord/Voice/Rtcp.cpp
         src/Discord/Voice/SinkWants.cpp
         src/Discord/Voice/TransportFeedback.cpp
@@ -373,12 +375,19 @@ if(ENABLE_VOICE AND TARGET ffmpeg)
     list(APPEND PROJECT_SOURCES
         src/Core/Media/DecodeDemand.cpp
         src/Core/Media/VideoDecoder.cpp
+        src/Core/Media/VideoEncoder.cpp
         src/Core/Streams/StreamSession.cpp
         src/Core/Streams/StreamWatcher.cpp
+        src/Core/Streams/StreamBroadcaster.cpp
+        src/Core/Video/BroadcastPipeline.cpp
+        src/Core/Video/ScreenCapture.cpp
+        src/Core/Video/SendQuality.cpp
+        src/Core/Video/SendRateController.cpp
         src/Core/Video/CallVideo.cpp
         src/Core/Video/TileVisibility.cpp
         src/UI/Video/VideoSurface.cpp
         src/UI/CallView.cpp
+        src/UI/ScreenSharePicker.cpp
     )
     if(WIN32)
         list(APPEND PROJECT_SOURCES src/UI/Video/D3D11GlBridge.cpp)
@@ -461,6 +470,11 @@ if(BUILD_TESTS)
     target_include_directories(TestStreams PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME StreamTests COMMAND TestStreams)
 
+    qt_add_executable(TestSendQuality tests/tst_SendQuality.cpp src/Core/Video/SendQuality.cpp src/Core/Video/SendRateController.cpp)
+    target_link_libraries(TestSendQuality PRIVATE Qt::Core Qt::Test)
+    target_include_directories(TestSendQuality PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME SendQualityTests COMMAND TestSendQuality)
+
     qt_add_executable(TestDecodeDemand tests/tst_DecodeDemand.cpp src/Core/Media/DecodeDemand.cpp)
     target_link_libraries(TestDecodeDemand PRIVATE Qt::Core Qt::Test)
     target_include_directories(TestDecodeDemand PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -500,6 +514,7 @@ if(BUILD_TESTS)
             src/Discord/Voice/Socks5UdpAssociation.cpp src/Discord/Voice/TransportFeedback.cpp
             src/Discord/Voice/UdpTransport.cpp src/Discord/Voice/VideoDepacketizer.cpp
             src/Discord/Voice/VideoReceiver.cpp src/Discord/Voice/VoiceClient.cpp
+            src/Discord/Voice/VideoPacketizer.cpp src/Discord/Voice/VideoSender.cpp
             src/Discord/Voice/VoiceEncryption.cpp src/Discord/Voice/VoiceGateway.cpp)
         target_link_libraries(TestVoiceClient PRIVATE Qt::Core Qt::Network Qt::Test CURL::libcurl ${SODIUM_TARGET} libdave MLSPP::mlspp)
         target_include_directories(TestVoiceClient PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -521,6 +536,25 @@ if(BUILD_TESTS)
             target_link_libraries(TestVideoDecode PRIVATE Qt::Core Qt::Network Qt::Test ffmpeg)
             target_include_directories(TestVideoDecode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
             add_test(NAME VideoDecodeTests COMMAND TestVideoDecode)
+
+            qt_add_executable(TestVideoSend tests/tst_VideoSend.cpp src/Discord/Voice/RtpPacket.cpp
+                src/Discord/Voice/VideoPacketizer.cpp src/Discord/Voice/VideoSender.cpp
+                src/Discord/Voice/VideoDepacketizer.cpp src/Discord/Voice/VideoReceiver.cpp
+                src/Discord/Voice/Rtcp.cpp src/Discord/Voice/TransportFeedback.cpp)
+            target_link_libraries(TestVideoSend PRIVATE Qt::Core Qt::Test ffmpeg libdave MLSPP::mlspp)
+            target_include_directories(TestVideoSend PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            add_test(NAME VideoSendTests COMMAND TestVideoSend)
+
+            qt_add_executable(TestVideoEncode tests/tst_VideoEncode.cpp src/Core/Media/VideoEncoder.cpp
+                src/Core/Media/VideoDecoder.cpp src/Core/Media/RgbScaler.cpp
+                src/Core/Video/BroadcastPipeline.cpp src/Core/Video/ScreenCapture.cpp
+                src/Core/Logging.cpp src/Core/OrderedJson.cpp src/Core/Snowflake.cpp
+                src/Discord/Voice/RtpPacket.cpp src/Discord/Voice/VideoDepacketizer.cpp
+                src/Discord/Voice/VideoReceiver.cpp src/Discord/Voice/Rtcp.cpp)
+            target_link_libraries(TestVideoEncode PRIVATE Qt::Core Qt::Gui Qt::Network Qt::Test ffmpeg)
+            target_compile_definitions(TestVideoEncode PRIVATE ACHERON_HAVE_FFMPEG NOMINMAX)
+            target_include_directories(TestVideoEncode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            add_test(NAME VideoEncodeTests COMMAND TestVideoEncode)
 
             qt_add_executable(TestVideoSurface tests/tst_VideoSurface.cpp src/UI/Video/VideoSurface.cpp src/Core/Media/RgbScaler.cpp)
             target_compile_definitions(TestVideoSurface PRIVATE ACHERON_HAVE_FFMPEG)
@@ -594,7 +628,7 @@ if (MSVC)
     endif()
 
     if(BUILD_TESTS)
-        set(_msvc_test_targets TestMarkdown TestUnicodeEmoji TestOrderedJson TestFrecency TestProto TestProxy TestEmojiGrid TestCdnUrls TestEmbeds TestFavoriteGifs TestVoicePayloads TestStreams TestCalls TestDecodeDemand)
+        set(_msvc_test_targets TestMarkdown TestUnicodeEmoji TestOrderedJson TestFrecency TestProto TestProxy TestEmojiGrid TestCdnUrls TestEmbeds TestFavoriteGifs TestVoicePayloads TestStreams TestCalls TestDecodeDemand TestSendQuality)
         if(TARGET TestApng)
             list(APPEND _msvc_test_targets TestApng TestClips TestMediaInput)
         endif()
@@ -602,7 +636,7 @@ if (MSVC)
             list(APPEND _msvc_test_targets TestRtp TestUdpTransport TestSinkWants TestVoiceClient)
         endif()
         if(TARGET TestRtpVideo)
-            list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface)
+            list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface TestVideoSend TestVideoEncode)
         endif()
         foreach(test_target ${_msvc_test_targets})
             target_link_options(${test_target} PRIVATE $<$<CONFIG:Debug>:/INCREMENTAL>)

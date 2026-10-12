@@ -167,6 +167,8 @@ public:
 
     using StreamPreviewCallback = std::function<void(const StreamPreviewLookup &)>;
     void fetchStreamPreview(const QString &streamKey, StreamPreviewCallback callback);
+    // The thumbnail of a stream this account owns, as a JPEG data URL.
+    void uploadStreamPreview(const QString &streamKey, const QString &thumbnail, std::function<void(bool uploaded)> callback);
     void setVoiceConnected(bool connected);
 
     void restoreHeartbeatSession(const std::optional<HeartbeatSession> &stored);

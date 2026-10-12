@@ -56,6 +56,10 @@ public:
     std::vector<uint8_t> lastEpochAuthenticator() const;
 
     void setLocalSsrc(quint32 ssrc);
+    // The SSRC this client sends video on. The encryptor goes by the codec to tell which parts
+    // of a frame have to stay readable for it to be packetized. The SSRC that carries
+    // retransmissions is not named: they repeat packets of frames encrypted already.
+    void setLocalVideoCodec(quint32 ssrc, discord::dave::Codec codec);
     void addConnectedUser(const std::string &userId);
     void removeConnectedUser(const std::string &userId);
     void applyKeyRatchetForSsrc(quint32 ssrc, uint64_t userId);
@@ -80,6 +84,8 @@ private:
     Core::Snowflake channelId;
     Core::Snowflake userId;
     quint32 localSsrc = 0;
+    quint32 localVideoSsrc = 0;
+    discord::dave::Codec localVideoCodec = discord::dave::Codec::Unknown;
 
     std::set<std::string> connectedUserIds;
     int pendingTransitionId = -1;
