@@ -182,6 +182,7 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, Captu
     encoding.framerate = std::max(1, settings.framerate);
     encoding.bitrate = usableBitrate(bitrate, settings.maxBitrate);
     encoding.keyframeIntervalMs = settings.keyframeIntervalMs;
+    encoding.content = Media::VideoEncoder::Content::Screen;
     Media::VideoEncoder encoder(encoding);
     if (!encoder.hasEncoder()) {
         emit pipeline->failed(BroadcastPipeline::tr("No %1 encoder works on this machine.").arg(Discord::Voice::videoCodecName(settings.codec)));
@@ -269,8 +270,13 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, Captu
         const QSize size(picture->width, picture->height);
         capturedLately++;
 
+        // Nothing is encoded of a size the encoder would add too much black to. The size is
+        // still reported, and it is for whoever started this to have another codec chosen.
+        const QSize codedSize = encoder.codedSize(size);
+        const bool heldBack = !Media::paddingIsAcceptable(size, codedSize);
+
         const bool keyframeAsked = keyframeWanted.exchange(false);
-        if (!suspendedNow) {
+        if (!suspendedNow && !heldBack) {
             encoder.setBitrate(usableBitrate(bitrate, settings.maxBitrate));
             if (keyframeAsked || wasSuspended)
                 encoder.requestKeyframe();
@@ -293,10 +299,13 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, Captu
         wasSuspended = suspendedNow;
 
         // Again whenever a window has changed its size, which the picture follows.
-        if (std::exchange(announcedSize, size) != size)
+        if (std::exchange(announcedSize, size) != size) {
+            if (heldBack)
+                qCInfo(LogVideo) << "Not encoding" << Discord::Voice::videoCodecName(settings.codec) << "at" << size << "which its encoder would code as" << codedSize;
             emit pipeline->started(size, encoding.framerate);
+        }
 
-        if (!suspendedNow) {
+        if (!suspendedNow && !heldBack) {
             framesDropped += encoded.empty() ? 1 : 0;
             for (EncodedVideoFrame &each : encoded) {
                 framesEncoded++;
@@ -318,7 +327,10 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, Captu
             const Media::VideoEncoder::Stats &encoderStats = encoder.stats();
             BroadcastStats stats;
             // The capture goes into the name for want of a place of its own in the statistics.
-            stats.encoderName = QStringLiteral("%1, from %2").arg(encoderStats.encoderName.isEmpty() ? QStringLiteral("no encoder yet") : encoderStats.encoderName, screen.captureName());
+            QString encoderName = encoderStats.encoderName.isEmpty() ? QStringLiteral("no encoder yet") : encoderStats.encoderName;
+            if (heldBack)
+                encoderName = QStringLiteral("none while %1 would add black to this size").arg(Discord::Voice::videoCodecName(settings.codec));
+            stats.encoderName = QStringLiteral("%1, from %2").arg(encoderName, screen.captureName());
             stats.hardware = encoderStats.hardware;
             stats.encodedSize = size;
             stats.capturedFps = capturedLately / seconds;

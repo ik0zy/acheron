@@ -48,7 +48,7 @@ public:
     void queryGuildMembers(Core::Snowflake guildId, const QString &query, int limit, bool presences);
     void requestForumUnreads(Core::Snowflake guildId, Core::Snowflake forumId,
                              const QList<QPair<Core::Snowflake, Core::Snowflake>> &threads);
-    void sendVoiceStateUpdate(Core::Snowflake guildId, Core::Snowflake channelId, bool selfMute, bool selfDeaf);
+    void sendVoiceStateUpdate(Core::Snowflake guildId, Core::Snowflake channelId, bool selfMute, bool selfDeaf, bool selfVideo);
     void sendCallConnect(Core::Snowflake channelId);
     void sendStreamCreate(const StreamKey &channel, const QString &preferredRegion);
     void sendStreamDelete(const QString &streamKey);

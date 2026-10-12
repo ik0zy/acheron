@@ -59,6 +59,7 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
         channelId = Snowflake::Invalid;
         guildId = Snowflake::Invalid;
         selfStream = false;
+        selfVideo = false;
         pending = {};
     }
 
@@ -131,6 +132,7 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
             channelId = Snowflake::Invalid;
             guildId = Snowflake::Invalid;
             selfStream = false;
+            selfVideo = false;
             pending = {};
 
             if (oldChannel.isValid())
@@ -149,6 +151,16 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
         channelId = newChannelId;
         guildId = state.guildId.hasValue() ? state.guildId.get() : Snowflake::Invalid;
 
+        // Before anything is announced: whoever hears of the new channel reads these too.
+        bool wasMuted = selfMute;
+        bool wasDeaf = selfDeaf;
+        bool wasStreaming = selfStream;
+        bool hadVideo = selfVideo;
+        selfMute = state.selfMute.get();
+        selfDeaf = state.selfDeaf.get();
+        selfStream = state.selfStream.valueOr(false);
+        selfVideo = state.selfVideo.get();
+
         if (channelChanged) {
             if (!participants.isEmpty()) {
                 participants.clear();
@@ -161,17 +173,10 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
             emit channelVoiceMemberChanged(newChannelId, accountId, true);
         }
 
-        bool wasMuted = selfMute;
-        bool wasDeaf = selfDeaf;
-        bool wasStreaming = selfStream;
-        selfMute = state.selfMute.get();
-        selfDeaf = state.selfDeaf.get();
-        selfStream = state.selfStream.valueOr(false);
-
         qCInfo(LogVoice) << "Voice state: session =" << voiceSessionId
                          << "channel =" << channelId << "guild =" << guildId;
 
-        if (!channelChanged && channelId.isValid() && (selfMute != wasMuted || selfDeaf != wasDeaf || selfStream != wasStreaming))
+        if (!channelChanged && channelId.isValid() && (selfMute != wasMuted || selfDeaf != wasDeaf || selfStream != wasStreaming || selfVideo != hadVideo))
             emit participantVoiceStateChanged(channelId, accountId);
 
         if (audioPipeline && (selfMute != wasMuted || selfDeaf != wasDeaf)) {
@@ -501,6 +506,7 @@ std::optional<Discord::VoiceState> VoiceManager::voiceStateForUser(Snowflake use
         state.selfMute = selfMute;
         state.selfDeaf = selfDeaf;
         state.selfStream = selfStream;
+        state.selfVideo = selfVideo;
         state.sessionId = voiceSessionId;
         return state;
     }
@@ -548,17 +554,11 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
     params.sessionId = voiceSessionId;
     params.proxy = proxy;
 #ifdef ACHERON_HAVE_STREAM_VIEW
-    // Declares what the official client declares for a camera, though nothing is sent yet:
-    // without it the server does not forward other people's video.
+    // Declared whether or not the camera is ever turned on: without it the server does not
+    // forward other people's video.
     params.video = true;
-    for (const int quality : { 100, 50 }) {
-        Discord::Voice::StreamDescription layer;
-        layer.type = QStringLiteral("video");
-        layer.rid = QString::number(quality);
-        layer.quality = quality;
-        params.streams.append(layer);
-    }
-    params.videoCodecs = Media::offeredVideoCodecs();
+    params.streams = Discord::Voice::cameraStreams();
+    params.videoCodecs = Media::offeredVideoCodecs(encodableVideoCodecs);
 #endif
 
     voiceConnection = new VoiceConnection(params, this);
@@ -566,6 +566,7 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
 #ifdef ACHERON_HAVE_STREAM_VIEW
     callVideo->attach(voiceClient);
 #endif
+    emit rtcClientCreated(voiceClient);
     audioPipeline = new AudioPipeline;
 
 #ifdef Q_OS_WIN
@@ -744,11 +745,21 @@ void VoiceManager::setAudioSourceVolume(quint32 source, float volume)
         QMetaObject::invokeMethod(audioPipeline, [p = audioPipeline, source, volume]() { p->setSourceVolume(source, volume); });
 }
 
+void VoiceManager::setEncodableVideoCodecs(const QList<Discord::Voice::VideoCodec> &codecs)
+{
+    if (codecs == encodableVideoCodecs)
+        return;
+    encodableVideoCodecs = codecs;
+    if (voiceClient)
+        QMetaObject::invokeMethod(voiceClient, [client = voiceClient, codecs] { client->offerVideoEncoding(codecs); });
+}
+
 void VoiceManager::stopVoiceThread()
 {
     if (!voiceConnection)
         return;
 
+    emit rtcClientClosing();
     voiceGeneration++;
     bool hadParticipants = !participants.isEmpty();
     participants.clear();

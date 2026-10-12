@@ -128,6 +128,8 @@ public:
     // frame, so rates that change in quick succession (a viewer dragging a window's edge) are
     // gathered into one.
     static constexpr int BITRATE_SETTLE_MS = 2000;
+    // How long the server is given to name another codec once the one in use has been withdrawn.
+    static constexpr int CODEC_TIMEOUT_MS = 8000;
 
 signals:
     // Also sent when the capture stalls or resumes, when the sound starts being captured or
@@ -146,6 +148,7 @@ private slots:
     void onStartTimedOut();
     void onConnectTimedOut();
     void onReconnectDelayOver();
+    void onCodecTimedOut();
 
 private:
     // From the RTC connection and the pipeline now in use. Neither is connected to these as
@@ -176,6 +179,7 @@ private:
     void deliverFromRtc(quint64 serial, std::function<void()> deliver);
     void startSoundCapture();
 
+    void withdrawCodecsUnfitFor(const QSize &size);
     void startPipeline();
     void stopPipeline();
     void sendFramesToRtc();
@@ -202,7 +206,11 @@ private:
     bool audioWanted = false;
     Video::SendQuality sendQuality;
     QString preferredRegion;
-    QList<Discord::Voice::VideoCodec> encodableCodecs;
+    // What this share offers to send with: the codecs this machine encodes, less those whose
+    // encoder would have added black to a size the share has had. One that is withdrawn stays
+    // so until the share ends, or a window dragged by its edge would have the server change
+    // the codec back and forth.
+    QList<Discord::Voice::VideoCodec> offeredCodecs;
     // Told apart from the attempt that a late answer about the encoders belongs to.
     quint64 attempt = 0;
     bool createSent = false;
@@ -254,6 +262,7 @@ private:
     QTimer startTimeout;
     QTimer connectTimeout;
     QTimer reconnectDelay;
+    QTimer codecTimeout;
     QTimer bitrateSettle;
     QElapsedTimer sinceBitrateApplied;
     int appliedBitrate = 0;

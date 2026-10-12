@@ -2,6 +2,8 @@
 // desktop client's JSON.stringify produces for the same values (key order included), taken from
 // the canary client's RTC control socket; see docs/video-re/re-voice-gateway-video.md.
 
+#include "Discord/Enums.hpp"
+#include "Discord/Outbound.hpp"
 #include "Discord/Voice/VoiceEntities.hpp"
 
 #include <QJsonDocument>
@@ -58,7 +60,7 @@ class TestVoicePayloads : public QObject
     Q_OBJECT
 private slots:
     void identifyWithoutVideoOmitsVideoKeys();
-    void identifyVoiceConnectionOffersTwoCameraLayers();
+    void identifyVoiceConnectionOffersOneCameraLayer();
     void identifyStreamConnectionOffersOneScreenLayer();
 
     void selectProtocolAudioOnly();
@@ -77,6 +79,10 @@ private slots:
     void videoFromServerParsesUserSsrcs();
     void sessionDescriptionParsesVideoFields();
     void sessionUpdateParsesOnlyWhatIsPresent();
+
+    void voiceStateUpdateSaysWhetherTheCameraIsOn();
+    void voiceStateUpdateForAPrivateCallAndForLeaving();
+    void voiceStateUpdateKeyOrderWithFlags();
 };
 
 void TestVoicePayloads::identifyWithoutVideoOmitsVideoKeys()
@@ -85,14 +91,16 @@ void TestVoicePayloads::identifyWithoutVideoOmitsVideoKeys()
              QByteArray(R"({"server_id":"100","channel_id":"200","user_id":"300","session_id":"session","token":"token","max_dave_protocol_version":1})"));
 }
 
-void TestVoicePayloads::identifyVoiceConnectionOffersTwoCameraLayers()
+// What the official client declares with its simulcast switch off. With it on a second layer
+// follows, `rid` "50" at quality 50.
+void TestVoicePayloads::identifyVoiceConnectionOffersOneCameraLayer()
 {
     VoiceIdentifyData identify = identifyFor(100, 200);
     identify.video = true;
-    identify.streams = QList<StreamDescription>{ offeredStream("video", "100", 100), offeredStream("video", "50", 50) };
+    identify.streams = QList<StreamDescription>{ offeredStream("video", "100", 100) };
 
     QCOMPARE(identify.toJson().toBytes(),
-             QByteArray(R"({"server_id":"100","channel_id":"200","user_id":"300","session_id":"session","token":"token","max_dave_protocol_version":1,"video":true,"streams":[{"type":"video","rid":"100","quality":100},{"type":"video","rid":"50","quality":50}]})"));
+             QByteArray(R"({"server_id":"100","channel_id":"200","user_id":"300","session_id":"session","token":"token","max_dave_protocol_version":1,"video":true,"streams":[{"type":"video","rid":"100","quality":100}]})"));
 }
 
 void TestVoicePayloads::identifyStreamConnectionOffersOneScreenLayer()
@@ -295,6 +303,40 @@ void TestVoicePayloads::sessionUpdateParsesOnlyWhatIsPresent()
     const SessionUpdate interval = SessionUpdate::fromJson(parse(R"({"keyframe_interval":5000})"));
     QCOMPARE(interval.keyframeInterval.get(), 5000);
     QVERIFY(!interval.videoCodec.hasValue());
+}
+
+// The main gateway's opcode 4. The official client's keys are guild_id, channel_id, self_mute,
+// self_deaf, self_video, flags, in that order (docs/video-re/re-main-gateway.md).
+void TestVoicePayloads::voiceStateUpdateSaysWhetherTheCameraIsOn()
+{
+    using Discord::voiceStateUpdate;
+    const Core::Snowflake guild(100);
+    const Core::Snowflake channel(200);
+
+    QCOMPARE(voiceStateUpdate(guild, channel, false, false, true).toJson().toBytes(),
+             QByteArray(R"({"op":4,"d":{"guild_id":"100","channel_id":"200","self_mute":false,"self_deaf":false,"self_video":true}})"));
+    // Off is said as well, not left out.
+    QCOMPARE(voiceStateUpdate(guild, channel, true, true, false).toJson().toBytes(),
+             QByteArray(R"({"op":4,"d":{"guild_id":"100","channel_id":"200","self_mute":true,"self_deaf":true,"self_video":false}})"));
+}
+
+void TestVoicePayloads::voiceStateUpdateForAPrivateCallAndForLeaving()
+{
+    using Discord::voiceStateUpdate;
+
+    QCOMPARE(voiceStateUpdate(Core::Snowflake::Invalid, Core::Snowflake(200), false, false, true).toJson().toBytes(),
+             QByteArray(R"({"op":4,"d":{"guild_id":null,"channel_id":"200","self_mute":false,"self_deaf":false,"self_video":true}})"));
+    QCOMPARE(voiceStateUpdate(Core::Snowflake(100), Core::Snowflake::Invalid, false, false, false).toJson().toBytes(),
+             QByteArray(R"({"op":4,"d":{"guild_id":"100","channel_id":null,"self_mute":false,"self_deaf":false,"self_video":false}})"));
+}
+
+void TestVoicePayloads::voiceStateUpdateKeyOrderWithFlags()
+{
+    Discord::UpdateVoiceState update = Discord::voiceStateUpdate(Core::Snowflake(100), Core::Snowflake(200), false, false, true);
+    update.flags = Discord::VoiceFlags(Discord::VoiceFlag::ALLOW_VOICE_RECORDINGS);
+
+    QCOMPARE(update.toJson().toBytes(),
+             QByteArray(R"({"op":4,"d":{"guild_id":"100","channel_id":"200","self_mute":false,"self_deaf":false,"self_video":true,"flags":2}})"));
 }
 
 QTEST_GUILESS_MAIN(TestVoicePayloads)

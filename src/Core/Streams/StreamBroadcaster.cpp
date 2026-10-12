@@ -5,8 +5,10 @@
 #include "Core/Audio/VoiceManager.hpp"
 #include "Core/Logging.hpp"
 #include "Core/Media/VideoDecoder.hpp"
+#include "Core/Media/VideoEncoder.hpp"
 #include "Core/Streams/StreamAudio.hpp"
 #include "Core/Streams/StreamPreviews.hpp"
+#include "Core/Video/ScreenCapture.hpp"
 #include "Discord/Client.hpp"
 
 #include <QCoreApplication>
@@ -97,6 +99,10 @@ StreamBroadcaster::StreamBroadcaster(Discord::Client *client, StreamManager *str
     reconnectDelay.setSingleShot(true);
     reconnectDelay.setInterval(RECONNECT_DELAY_MS);
     connect(&reconnectDelay, &QTimer::timeout, this, &StreamBroadcaster::onReconnectDelayOver);
+
+    codecTimeout.setSingleShot(true);
+    codecTimeout.setInterval(CODEC_TIMEOUT_MS);
+    connect(&codecTimeout, &QTimer::timeout, this, &StreamBroadcaster::onCodecTimedOut);
 
     bitrateSettle.setSingleShot(true);
     connect(&bitrateSettle, &QTimer::timeout, this, &StreamBroadcaster::applyBitrate);
@@ -206,7 +212,11 @@ void StreamBroadcaster::sendCreate(const QList<VideoCodec> &codecs)
         return;
     }
 
-    encodableCodecs = codecs;
+    // The size is known already unless the window is still on its way back from the taskbar.
+    const QSize size = Video::encodeSizeOf(source, sendQuality.height);
+    offeredCodecs = size.isEmpty() ? codecs : Media::shareCodecs(codecs, Media::videoEncoderFor(VideoCodec::AV1), size);
+    if (offeredCodecs != codecs)
+        qCInfo(LogVoice) << "Screen share" << streamKey.toString() << "does not offer AV1: its encoder would add black to" << size;
     createSent = true;
     client->sendStreamCreate(streamKey, preferredRegion);
     startTimeout.start();
@@ -286,6 +296,11 @@ void StreamBroadcaster::onReconnectDelayOver()
 {
     if (currentState == State::Reconnecting && !endpoint.isEmpty())
         connectRtc();
+}
+
+void StreamBroadcaster::onCodecTimedOut()
+{
+    fail(tr("Discord named no video codec this machine can share the screen with."));
 }
 
 void StreamBroadcaster::onVoiceConnected()
@@ -392,7 +407,7 @@ void StreamBroadcaster::connectRtc()
     screen.rid = QStringLiteral("100");
     screen.quality = 100;
     params.streams = { screen };
-    params.videoCodecs = Media::offeredVideoCodecs(encodableCodecs);
+    params.videoCodecs = Media::offeredVideoCodecs(offeredCodecs);
     params.sendsAudio = audioWanted && Audio::processLoopbackAvailable();
     params.streamContext = true;
 
@@ -443,6 +458,7 @@ void StreamBroadcaster::disconnectRtc(bool announceStop)
     rtcConnected = false;
     videoAnnounced = false;
     reconnectDelay.stop();
+    codecTimeout.stop();
     connectionSerial++;
 
     VoiceClient *rtc = connection->client();
@@ -537,6 +553,7 @@ void StreamBroadcaster::onSendCodecChanged(VideoCodec codec)
     if (!rtcConnected || codec == VideoCodec::Unknown)
         return;
 
+    codecTimeout.stop();
     if (pipeline && codec == sendCodec) {
         if (pipelineStarted && !videoAnnounced)
             announceVideo();
@@ -544,6 +561,24 @@ void StreamBroadcaster::onSendCodecChanged(VideoCodec codec)
     }
     sendCodec = codec;
     startPipeline();
+}
+
+// The pipeline encodes nothing of a size its encoder would add black to, so nothing of it is
+// sent while the server takes its time to name another codec.
+void StreamBroadcaster::withdrawCodecsUnfitFor(const QSize &size)
+{
+    const QList<VideoCodec> fit = Media::shareCodecs(offeredCodecs, Media::videoEncoderFor(VideoCodec::AV1), size);
+    if (fit == offeredCodecs)
+        return;
+
+    qCInfo(LogVoice) << "Screen share" << streamKey.toString() << "withdraws AV1: its encoder would add black to" << size;
+    offeredCodecs = fit;
+    if (!connection)
+        return;
+    VoiceClient *rtc = connection->client();
+    QMetaObject::invokeMethod(rtc, [rtc, fit] { rtc->offerVideoEncoding(fit); });
+    if (!fit.contains(sendCodec))
+        codecTimeout.start();
 }
 
 void StreamBroadcaster::onSendStats(const VideoSendStats &sent)
@@ -655,6 +690,7 @@ void StreamBroadcaster::onPipelineStarted(const QSize &size, int framerate)
     pipelineStarted = true;
     encodedSize = size;
     encodedFramerate = framerate;
+    withdrawCodecsUnfitFor(size);
     refreshLimits();
 
     if (rtcConnected && !videoAnnounced)

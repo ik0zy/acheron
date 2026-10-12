@@ -16,6 +16,8 @@
 #include "Streams/StreamPreviews.hpp"
 #ifdef ACHERON_HAVE_STREAM_VIEW
 #include "Streams/StreamBroadcaster.hpp"
+#include "Video/CameraPipeline.hpp"
+#include "Video/CameraSender.hpp"
 #include "Streams/StreamWatcher.hpp"
 #endif
 #include "Discord/Enums.hpp"
@@ -106,6 +108,8 @@ ClientInstance::ClientInstance(const AccountInfo &info,
     streamWatch = new StreamWatcher(client, streamManager, voiceManager, info.id, info.proxy, this);
     streamBroadcast = new StreamBroadcaster(
             client, streamManager, voiceManager, info.id, info.proxy, [this] { return screenShareTerms(); }, this);
+    cameraSend = new CameraSender(
+            client, voiceManager, streamBroadcast, [this] { return screenShareTerms().allowed; }, this);
 #endif
 
     connect(client, &Discord::Client::stateChanged, this, &ClientInstance::stateChanged);
@@ -123,6 +127,11 @@ ClientInstance::ClientInstance(const AccountInfo &info,
         streamWatch->reset();
         streamWatch->setGatewaySessionId(gatewaySessionId);
         streamBroadcast->reset();
+        cameraSend->reset();
+        // A voice connection can only offer to send video with the codecs known when it is
+        // made, and finding them out takes a while the first time.
+        if (Video::cameraCaptureAvailable())
+            StreamBroadcaster::whenEncodersKnown(voiceManager, [voice = voiceManager](const QList<Discord::Voice::VideoCodec> &codecs) { voice->setEncodableVideoCodecs(CameraSender::codecsToOffer(codecs)); });
         streamBroadcast->setGatewaySessionId(gatewaySessionId);
 #endif
         streamManager->reset();
@@ -1462,6 +1471,9 @@ void ClientInstance::markCategoryAsRead(Snowflake guildId, Snowflake categoryId)
 ClientInstance::~ClientInstance()
 {
 #ifdef ACHERON_HAVE_STREAM_VIEW
+    // It sends on the voice manager's connection and asks the broadcaster what is shared.
+    delete cameraSend;
+    cameraSend = nullptr;
     // Its sessions feed the voice manager's mixer, so they go before it does.
     delete streamWatch;
     streamWatch = nullptr;
@@ -1482,7 +1494,7 @@ void ClientInstance::stop()
     emojiManager->savePendingUsage();
 
     if (isInVoice()) {
-        discord()->sendVoiceStateUpdate(currentVoiceGuildId, Snowflake::Invalid, false, false);
+        discord()->sendVoiceStateUpdate(currentVoiceGuildId, Snowflake::Invalid, false, false, selfVideoIn(Snowflake::Invalid));
 #ifndef ACHERON_NO_VOICE
         voiceManager->disconnect();
 #endif
@@ -1571,6 +1583,11 @@ StreamBroadcaster *ClientInstance::streamBroadcaster() const
     return streamBroadcast;
 }
 
+CameraSender *ClientInstance::cameraSender() const
+{
+    return cameraSend;
+}
+
 ShareTerms ClientInstance::screenShareTerms()
 {
     ShareTerms shareTerms;
@@ -1602,6 +1619,16 @@ ShareTerms ClientInstance::screenShareTerms()
     return shareTerms;
 }
 #endif
+
+bool ClientInstance::selfVideoIn(Snowflake channelId) const
+{
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    return cameraSend && cameraSend->isOnIn(channelId);
+#else
+    Q_UNUSED(channelId);
+    return false;
+#endif
+}
 
 #ifndef ACHERON_NO_VOICE
 Audio::VoiceManager *ClientInstance::voice() const

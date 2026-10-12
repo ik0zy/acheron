@@ -2,6 +2,10 @@
 // bitrates announced for each, how the bitrates follow the size viewers show the stream at, and
 // the controller that moves the encoder's bitrate by reported loss. The quality rules are the
 // official client's (docs/video-re/re-voice-gateway-video.md).
+//
+// And for what the account's own camera is encoded at: the ladder of sizes by how much of the
+// picture its viewers want, the lower frame rate of an owner who is not heard, and the plan
+// that puts those together with the loss the server reports.
 
 #include "Core/Video/SendQuality.hpp"
 #include "Core/Video/SendRateController.hpp"
@@ -13,6 +17,7 @@ using namespace Acheron::Core::Video;
 // allowed[premium_type][premium_tier]
 using TierTable = std::array<std::array<bool, 4>, 4>;
 Q_DECLARE_METATYPE(TierTable)
+Q_DECLARE_METATYPE(CameraLayer)
 
 namespace {
 
@@ -26,6 +31,29 @@ constexpr TierTable EVERYONE{ { { true, true, true, true }, { true, true, true, 
 constexpr TierTable BOOST_ONE_OR_NITRO{ { { false, true, true, true }, { true, true, true, true }, { true, true, true, true }, { false, true, true, true } } };
 constexpr TierTable BOOST_TWO_OR_NITRO{ { { false, false, true, true }, { true, true, true, true }, { true, true, true, true }, { false, false, true, true } } };
 constexpr TierTable FULL_NITRO_ONLY{ { { false, false, false, false }, { false, false, false, false }, { true, true, true, true }, { false, false, false, false } } };
+
+const std::array<CameraLayer, 9> CAMERA_LADDER{ {
+        { 100, QSize(1280, 720), 2'500'000 },
+        { 90, QSize(896, 504), 1'225'000 },
+        { 80, QSize(672, 378), 689'062 },
+        { 70, QSize(640, 360), 625'000 },
+        { 60, QSize(512, 288), 400'000 },
+        { 50, QSize(416, 234), 264'062 },
+        { 40, QSize(384, 216), 225'000 },
+        { 30, QSize(320, 180), 156'250 },
+        { 20, QSize(256, 144), 150'000 },
+} };
+
+const QSize FULL_CAMERA(1280, 720);
+
+// A camera whose owner goes on speaking, so that only what a test does lowers its frame rate.
+CameraSendPlan planOfASpeaker()
+{
+    CameraSendPlan plan;
+    plan.start(0);
+    plan.setSpeaking(true, 0);
+    return plan;
+}
 
 } // namespace
 
@@ -69,6 +97,29 @@ private slots:
     void newLimitsKeepTheShareOfTheMaximum();
     void aMaximumUnderTheMinimumIsStillAMaximum();
     void restartGoesBackToTheMaximum();
+
+    void cameraLadderHasARowForEachWant_data();
+    void cameraLadderHasARowForEachWant();
+    void aWantBetweenRowsTakesTheRowBelow();
+    void aWantUnderTwentyTakesTheLowestRow();
+    void cameraMaxBitrateIsTheFullPicturesByShareOfTheArea();
+    void cameraFramerateIsLoweredForAMutedOwner_data();
+    void cameraFramerateIsLoweredForAMutedOwner();
+
+    void theCameraStartsWithTheWholePictureAtItsMaximum();
+    void selfMuteLowersTheFramerateAtOnce();
+    void fifteenSecondsOfSilenceLowerTheFramerate();
+    void silenceIsCountedFromTheLastWord();
+    void speakingRestoresTheFramerateAtOnce();
+    void aMutedCameraWantedAtTwentyOrLessIsSentAtTwelve();
+    void theFramerateIsNotLoweredWhileAScreenIsShared();
+    void aNewWantIsTakenUpTwoSecondsAfterTheLastChange();
+    void wantsInQuickSuccessionAreGatheredIntoOne();
+    void aWantWithinTheRowInUseChangesNothing();
+    void lossMovesTheCameraBitrateDownToItsMinimum();
+    void aBitrateChangeWaitsOutTheTwoSecondsToo();
+    void aNewRowKeepsTheBitratesShareOfItsMaximum();
+    void thePlanSaysWhenItNextChangesByItself();
 };
 
 void TestSendQuality::qualityIsGatedByNitroAndBoosts_data()
@@ -482,6 +533,364 @@ void TestSendQuality::restartGoesBackToTheMaximum()
     // The two seconds between decreases start over as well.
     QVERIFY(rate.report(0.5, 100));
     QCOMPARE(rate.bitrate(), 2'450'000);
+}
+
+void TestSendQuality::cameraLadderHasARowForEachWant_data()
+{
+    QTest::addColumn<CameraLayer>("row");
+
+    for (const CameraLayer &row : CAMERA_LADDER)
+        QTest::addRow("want %d", row.want) << row;
+}
+
+void TestSendQuality::cameraLadderHasARowForEachWant()
+{
+    QFETCH(CameraLayer, row);
+
+    const CameraLayer chosen = cameraLayerFor(row.want);
+    QCOMPARE(chosen.want, row.want);
+    QCOMPARE(chosen.size, row.size);
+    QCOMPARE(chosen.maxBitrate, row.maxBitrate);
+    QCOMPARE(chosen.size.width() * 9, chosen.size.height() * 16);
+}
+
+void TestSendQuality::aWantBetweenRowsTakesTheRowBelow()
+{
+    for (size_t i = 0; i + 1 < CAMERA_LADDER.size(); i++) {
+        const CameraLayer &row = CAMERA_LADDER[i];
+        const CameraLayer &below = CAMERA_LADDER[i + 1];
+        QCOMPARE(cameraLayerFor(row.want - 1), below);
+        QCOMPARE(cameraLayerFor(below.want + 1), below);
+    }
+
+    // More than everything is still everything.
+    QCOMPARE(cameraLayerFor(101), CAMERA_LADDER.front());
+}
+
+void TestSendQuality::aWantUnderTwentyTakesTheLowestRow()
+{
+    for (const int want : { 19, 10, 1, 0, -1 })
+        QCOMPARE(cameraLayerFor(want), CAMERA_LADDER.back());
+}
+
+void TestSendQuality::cameraMaxBitrateIsTheFullPicturesByShareOfTheArea()
+{
+    QCOMPARE(cameraMaxBitrate(1280 * 720), 2'500'000);
+    QCOMPARE(cameraMaxBitrate(640 * 360), 625'000);
+    // Whatever is left of a bit is dropped.
+    QCOMPARE(cameraMaxBitrate(672 * 378), 689'062);
+    QCOMPARE(cameraMaxBitrate(416 * 234), 264'062);
+    // The lowest row's share would be 100,000.
+    QCOMPARE(cameraMaxBitrate(256 * 144), 150'000);
+    QCOMPARE(cameraMaxBitrate(0), 150'000);
+
+    QCOMPARE(CAMERA_MIN_BITRATE, 150'000);
+    QCOMPARE(CAMERA_CAPTURE_SIZE, FULL_CAMERA);
+    QCOMPARE(CAMERA_FRAMERATE, 30);
+}
+
+void TestSendQuality::cameraFramerateIsLoweredForAMutedOwner_data()
+{
+    QTest::addColumn<int>("want");
+    QTest::addColumn<bool>("muted");
+    QTest::addColumn<int>("framerate");
+
+    QTest::newRow("heard, all wanted") << 100 << false << 30;
+    QTest::newRow("heard, little wanted") << 20 << false << 30;
+    QTest::newRow("heard, nothing wanted") << 0 << false << 30;
+    QTest::newRow("muted, all wanted") << 100 << true << 20;
+    QTest::newRow("muted, 30 wanted") << 30 << true << 20;
+    QTest::newRow("muted, 21 wanted") << 21 << true << 20;
+    QTest::newRow("muted, 20 wanted") << 20 << true << 12;
+    QTest::newRow("muted, 19 wanted") << 19 << true << 12;
+    QTest::newRow("muted, nothing wanted") << 0 << true << 12;
+}
+
+void TestSendQuality::cameraFramerateIsLoweredForAMutedOwner()
+{
+    QFETCH(int, want);
+    QFETCH(bool, muted);
+    QFETCH(int, framerate);
+
+    QCOMPARE(cameraFramerate(want, muted), framerate);
+}
+
+void TestSendQuality::theCameraStartsWithTheWholePictureAtItsMaximum()
+{
+    CameraSendPlan plan;
+    plan.start(1000);
+
+    const CameraEncoding first = plan.advance(1000);
+    QCOMPARE(first.size, FULL_CAMERA);
+    QCOMPARE(first.framerate, 30);
+    QCOMPARE(first.bitrate, 2'500'000);
+    QCOMPARE(plan.servedWant(), 100);
+    QCOMPARE(plan.maxBitrate(), 2'500'000);
+
+    // A camera turned on again starts over, whatever the last one was down to.
+    plan.setWant(20);
+    plan.reportLoss(0.5, 4000);
+    QCOMPARE(plan.advance(4000).size, QSize(256, 144));
+    plan.start(9000);
+    QCOMPARE(plan.advance(9000), first);
+}
+
+void TestSendQuality::selfMuteLowersTheFramerateAtOnce()
+{
+    CameraSendPlan plan = planOfASpeaker();
+    QCOMPARE(plan.advance(100).framerate, 30);
+
+    plan.setSelfMuted(true);
+    QVERIFY(plan.countsAsMuted(100));
+    const CameraEncoding muted = plan.advance(100);
+    QCOMPARE(muted.framerate, 20);
+    // Nothing else of the picture changes with it.
+    QCOMPARE(muted.size, FULL_CAMERA);
+    QCOMPARE(muted.bitrate, 2'500'000);
+
+    plan.setSelfMuted(false);
+    QVERIFY(!plan.countsAsMuted(101));
+    QCOMPARE(plan.advance(101).framerate, 30);
+}
+
+void TestSendQuality::fifteenSecondsOfSilenceLowerTheFramerate()
+{
+    // Nothing has been said since the camera was turned on.
+    CameraSendPlan plan;
+    plan.start(1000);
+
+    QCOMPARE(plan.advance(15'999).framerate, 30);
+    QVERIFY(!plan.countsAsMuted(15'999));
+    QCOMPARE(plan.advance(16'000).framerate, 20);
+    QVERIFY(plan.countsAsMuted(16'000));
+    QCOMPARE(plan.advance(600'000).framerate, 20);
+}
+
+void TestSendQuality::silenceIsCountedFromTheLastWord()
+{
+    CameraSendPlan plan;
+    plan.start(0);
+    plan.setSpeaking(true, 5000);
+    // Speaking, for however long, keeps the full rate.
+    QCOMPARE(plan.advance(60'000).framerate, 30);
+
+    plan.setSpeaking(false, 60'000);
+    QCOMPARE(plan.advance(74'999).framerate, 30);
+    QCOMPARE(plan.advance(75'000).framerate, 20);
+
+    // Being told again that nothing is said does not start the count over.
+    plan.setSpeaking(true, 80'000);
+    plan.setSpeaking(false, 81'000);
+    plan.setSpeaking(false, 90'000);
+    QCOMPARE(plan.advance(95'999).framerate, 30);
+    QCOMPARE(plan.advance(96'000).framerate, 20);
+}
+
+void TestSendQuality::speakingRestoresTheFramerateAtOnce()
+{
+    CameraSendPlan plan;
+    plan.start(0);
+    QCOMPARE(plan.advance(20'000).framerate, 20);
+
+    plan.setSpeaking(true, 20'001);
+    QCOMPARE(plan.advance(20'001).framerate, 30);
+
+    // Not while self-muted, though: what is said then is not heard.
+    plan.setSelfMuted(true);
+    QCOMPARE(plan.advance(20'002).framerate, 20);
+}
+
+void TestSendQuality::aMutedCameraWantedAtTwentyOrLessIsSentAtTwelve()
+{
+    CameraSendPlan plan = planOfASpeaker();
+    plan.setSelfMuted(true);
+
+    plan.setWant(21);
+    const CameraEncoding lowestRow = plan.advance(2000);
+    QCOMPARE(lowestRow.size, QSize(256, 144));
+    QCOMPARE(lowestRow.framerate, 20);
+
+    // The same row, and still a change for the encoder.
+    plan.setWant(20);
+    QCOMPARE(plan.advance(3999).framerate, 20);
+    const CameraEncoding slowest = plan.advance(4000);
+    QCOMPARE(slowest.size, QSize(256, 144));
+    QCOMPARE(slowest.framerate, 12);
+
+    plan.setSelfMuted(false);
+    QCOMPARE(plan.advance(4001).framerate, 30);
+}
+
+void TestSendQuality::theFramerateIsNotLoweredWhileAScreenIsShared()
+{
+    CameraSendPlan plan;
+    plan.start(0);
+    plan.setSelfMuted(true);
+    plan.setSharingScreen(true);
+
+    QVERIFY(!plan.countsAsMuted(60'000));
+    QCOMPARE(plan.advance(60'000).framerate, 30);
+
+    plan.setSharingScreen(false);
+    QCOMPARE(plan.advance(60'000).framerate, 20);
+
+    // Silence does not lower it either.
+    plan.setSelfMuted(false);
+    QCOMPARE(plan.advance(60'001).framerate, 20);
+    plan.setSharingScreen(true);
+    QCOMPARE(plan.advance(60'002).framerate, 30);
+}
+
+void TestSendQuality::aNewWantIsTakenUpTwoSecondsAfterTheLastChange()
+{
+    CameraSendPlan plan = planOfASpeaker();
+
+    plan.setWant(50);
+    QCOMPARE(plan.advance(1999).size, FULL_CAMERA);
+    QCOMPARE(plan.servedWant(), 100);
+
+    const CameraEncoding lowered = plan.advance(2000);
+    QCOMPARE(lowered.size, QSize(416, 234));
+    QCOMPARE(lowered.framerate, 30);
+    QCOMPARE(lowered.bitrate, 264'062);
+    QCOMPARE(plan.servedWant(), 50);
+    QCOMPARE(plan.maxBitrate(), 264'062);
+
+    // The two seconds start again with every change that is made.
+    plan.setWant(100);
+    QCOMPARE(plan.advance(3999), lowered);
+    const CameraEncoding raised = plan.advance(4000);
+    QCOMPARE(raised.size, FULL_CAMERA);
+    QCOMPARE(raised.bitrate, 2'500'000);
+}
+
+void TestSendQuality::wantsInQuickSuccessionAreGatheredIntoOne()
+{
+    CameraSendPlan plan = planOfASpeaker();
+
+    // Long after the last change, the first of them is taken up at once.
+    plan.setWant(50);
+    QCOMPARE(plan.advance(5000).size, QSize(416, 234));
+
+    plan.setWant(30);
+    QCOMPARE(plan.advance(5100).size, QSize(416, 234));
+    plan.setWant(70);
+    QCOMPARE(plan.advance(5500).size, QSize(416, 234));
+    plan.setWant(90);
+    QCOMPARE(plan.advance(6999).size, QSize(416, 234));
+
+    const CameraEncoding settled = plan.advance(7000);
+    QCOMPARE(settled.size, QSize(896, 504));
+    QCOMPARE(settled.bitrate, 1'225'000);
+
+    // A want that comes back to the one in use leaves nothing to do.
+    plan.setWant(40);
+    plan.setWant(90);
+    QVERIFY(!plan.nextChangeIn(7100));
+    QCOMPARE(plan.advance(20'000), settled);
+}
+
+void TestSendQuality::aWantWithinTheRowInUseChangesNothing()
+{
+    CameraSendPlan plan = planOfASpeaker();
+    plan.setWant(90);
+    const CameraEncoding atNinety = plan.advance(2000);
+
+    plan.setWant(95);
+    QCOMPARE(plan.servedWant(), 95);
+    QVERIFY(!plan.nextChangeIn(2100));
+    QCOMPARE(plan.advance(2100), atNinety);
+
+    // And does not put off a change that does matter to the encoder.
+    plan.setWant(80);
+    QCOMPARE(plan.nextChangeIn(2100), std::optional<qint64>(1900));
+    QCOMPARE(plan.advance(4000).size, QSize(672, 378));
+}
+
+void TestSendQuality::lossMovesTheCameraBitrateDownToItsMinimum()
+{
+    CameraSendPlan plan = planOfASpeaker();
+
+    plan.reportLoss(0.5, 3000);
+    QCOMPARE(plan.advance(3000).bitrate, 1'750'000);
+    plan.reportLoss(0.5, 5000);
+    const CameraEncoding lowered = plan.advance(5000);
+    QCOMPARE(lowered.bitrate, 1'225'000);
+    // The picture keeps its size: only the want changes that.
+    QCOMPARE(lowered.size, FULL_CAMERA);
+
+    // Before the server has said anything of loss there is nothing to act on.
+    plan.reportLoss(-1, 7000);
+    QCOMPARE(plan.advance(7000).bitrate, 1'225'000);
+
+    qint64 now = 7000;
+    for (int i = 0; i < 12; i++) {
+        now += 2000;
+        plan.reportLoss(0.5, now);
+        plan.advance(now);
+    }
+    QCOMPARE(plan.advance(now).bitrate, 150'000);
+}
+
+void TestSendQuality::aBitrateChangeWaitsOutTheTwoSecondsToo()
+{
+    CameraSendPlan plan = planOfASpeaker();
+
+    plan.reportLoss(0.5, 500);
+    QCOMPARE(plan.advance(500).bitrate, 2'500'000);
+    QCOMPARE(plan.advance(1999).bitrate, 2'500'000);
+    QCOMPARE(plan.advance(2000).bitrate, 1'750'000);
+}
+
+void TestSendQuality::aNewRowKeepsTheBitratesShareOfItsMaximum()
+{
+    CameraSendPlan plan = planOfASpeaker();
+    plan.reportLoss(0.5, 3000);
+    QCOMPARE(plan.advance(3000).bitrate, 1'750'000);
+
+    plan.setWant(70);
+    const CameraEncoding smaller = plan.advance(5000);
+    QCOMPARE(smaller.size, QSize(640, 360));
+    QCOMPARE(smaller.bitrate, 437'500);
+
+    // On the lowest row the minimum and the maximum are one and the same.
+    plan.setWant(20);
+    QCOMPARE(plan.advance(7000).bitrate, 150'000);
+    plan.reportLoss(0.5, 9000);
+    QCOMPARE(plan.advance(9000).bitrate, 150'000);
+}
+
+void TestSendQuality::thePlanSaysWhenItNextChangesByItself()
+{
+    CameraSendPlan plan;
+    plan.start(1000);
+
+    // Silent since the camera came on: the frame rate drops fifteen seconds after that.
+    QCOMPARE(plan.nextChangeIn(1000), std::optional<qint64>(15'000));
+    QCOMPARE(plan.nextChangeIn(10'000), std::optional<qint64>(6000));
+
+    // A want that waits for the two seconds comes first.
+    plan.setWant(50);
+    QCOMPARE(plan.nextChangeIn(1500), std::optional<qint64>(1500));
+    plan.advance(3000);
+    QCOMPARE(plan.nextChangeIn(3000), std::optional<qint64>(13'000));
+
+    // Once the rate has dropped, or while it cannot, nothing is due.
+    plan.advance(16'000);
+    QVERIFY(!plan.nextChangeIn(16'000));
+    plan.setSpeaking(true, 17'000);
+    QVERIFY(!plan.nextChangeIn(17'000));
+    plan.setSpeaking(false, 18'000);
+    QCOMPARE(plan.nextChangeIn(18'000), std::optional<qint64>(15'000));
+    plan.setSelfMuted(true);
+    QVERIFY(!plan.nextChangeIn(18'000));
+    plan.setSelfMuted(false);
+    plan.setSharingScreen(true);
+    QVERIFY(!plan.nextChangeIn(18'000));
+
+    // A change that is overdue is due now.
+    plan.setWant(100);
+    QCOMPARE(plan.nextChangeIn(30'000), std::optional<qint64>(0));
 }
 
 QTEST_GUILESS_MAIN(TestSendQuality)

@@ -804,21 +804,9 @@ void Gateway::queryGuildMembers(Core::Snowflake guildId, const QString &query, i
     sendPayload(request.toJson());
 }
 
-void Gateway::sendVoiceStateUpdate(Core::Snowflake guildId, Core::Snowflake channelId, bool selfMute, bool selfDeaf)
+void Gateway::sendVoiceStateUpdate(Core::Snowflake guildId, Core::Snowflake channelId, bool selfMute, bool selfDeaf, bool selfVideo)
 {
-    UpdateVoiceState msg;
-    if (guildId.isValid())
-        msg.guildId = guildId;
-    else
-        msg.guildId = nullptr;
-    if (channelId.isValid())
-        msg.channelId = channelId;
-    else
-        msg.channelId = nullptr;
-    msg.selfMute = selfMute;
-    msg.selfDeaf = selfDeaf;
-
-    sendPayload(msg.toJson());
+    sendPayload(voiceStateUpdate(guildId, channelId, selfMute, selfDeaf, selfVideo).toJson());
 }
 
 void Gateway::sendCallConnect(Core::Snowflake channelId)

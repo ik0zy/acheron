@@ -20,7 +20,9 @@
 #include <QUdpSocket>
 #include <QtEndian>
 
+#include <array>
 #include <memory>
+#include <utility>
 #include <vector>
 
 using namespace Acheron;
@@ -32,6 +34,8 @@ constexpr int VIDEO_PAYLOAD_TYPE = 101;
 constexpr int RTX_PAYLOAD_TYPE = 102;
 constexpr int H264_PAYLOAD_TYPE = 103;
 constexpr int H264_RTX_PAYLOAD_TYPE = 104;
+constexpr int H265_PAYLOAD_TYPE = 105;
+constexpr int AV1_PAYLOAD_TYPE = 107;
 constexpr uint8_t TRANSPORT_SEQUENCE_EXTENSION = 5;
 constexpr int PACKETS_PER_FRAME = 3;
 
@@ -211,6 +215,7 @@ public:
 
     // What READY and SESSION_DESCRIPTION say, for a test to set before the client gets there.
     QJsonArray readyStreams;
+    QString videoCodec = QStringLiteral("VP8");
     int daveProtocolVersion = 0;
 
     QList<RtpSeen> rtp;
@@ -307,7 +312,7 @@ private:
             for (char byte : key)
                 keyNumbers.append(static_cast<uint8_t>(byte));
             cipher = std::make_unique<VoiceEncryption>(EncryptionMode::AEAD_XCHACHA20_POLY1305_RTPSIZE, key);
-            send(4, QJsonObject{ { "mode", mode }, { "secret_key", keyNumbers }, { "audio_codec", "opus" }, { "video_codec", "VP8" }, { "dave_protocol_version", daveProtocolVersion } });
+            send(4, QJsonObject{ { "mode", mode }, { "secret_key", keyNumbers }, { "audio_codec", "opus" }, { "video_codec", videoCodec }, { "dave_protocol_version", daveProtocolVersion } });
         } else if (opcode == HEARTBEAT) {
             send(6, QJsonObject{ { "t", data["t"] } });
         }
@@ -458,9 +463,51 @@ EncodedVideoFrame h264Keyframe(quint32 timestamp)
     return frame;
 }
 
+// VPS, SPS and PPS, then the first slice segment of an IDR picture.
+EncodedVideoFrame h265Keyframe(quint32 timestamp)
+{
+    EncodedVideoFrame frame;
+    frame.data = { 0, 0, 0, 1, 0x40, 0x01, 0x11, 0, 0, 0, 1, 0x42, 0x01, 0x22, 0, 0, 0, 1, 0x44, 0x01, 0x33, 0, 0, 0, 1, 0x26, 0x01, 0x88 };
+    frame.data.resize(frame.data.size() + 3000, 0x5A);
+    frame.rtpTimestamp = timestamp;
+    frame.keyframe = true;
+    return frame;
+}
+
+constexpr std::array<uint8_t, 5> AV1_SEQUENCE_HEADER = { 0x0A, 3, 0x11, 0x22, 0x33 };
+constexpr size_t AV1_PICTURE_SIZE = 3000;
+
+// One temporal unit as an encoder writes it, every OBU with its size: a temporal delimiter, the
+// sequence header if it is a key frame, and the frame.
+EncodedVideoFrame av1Frame(bool keyframe, quint32 timestamp)
+{
+    EncodedVideoFrame frame;
+    frame.data = { 0x12, 0 };
+    if (keyframe)
+        frame.data.insert(frame.data.end(), AV1_SEQUENCE_HEADER.begin(), AV1_SEQUENCE_HEADER.end());
+    // The frame's header, and 3000 as LEB128.
+    frame.data.insert(frame.data.end(), { 0x32, 0xB8, 0x17 });
+    frame.data.resize(frame.data.size() + AV1_PICTURE_SIZE, 0x5A);
+    frame.rtpTimestamp = timestamp;
+    frame.keyframe = keyframe;
+    return frame;
+}
+
+// The same as it is assembled from its packets: the temporal delimiter is not sent, and the
+// last OBU has no size field.
+Bytes av1AsAssembled(bool keyframe)
+{
+    Bytes frame;
+    if (keyframe)
+        frame.assign(AV1_SEQUENCE_HEADER.begin(), AV1_SEQUENCE_HEADER.end());
+    frame.push_back(0x30);
+    frame.resize(frame.size() + AV1_PICTURE_SIZE, 0x5A);
+    return frame;
+}
+
 // A voice connection that offers VP8 and has reached the connected state. One that sends video
-// offers to encode it, and H264 besides. It can be a stream's connection as its owner has it
-// instead, with the sound that is shared or without.
+// offers to encode it, and H264, H265 and AV1 besides. It can be a stream's connection as its
+// owner has it instead, with the sound that is shared or without.
 struct Call
 {
     enum class Kind {
@@ -480,6 +527,8 @@ struct Call
         params.userId = Core::Snowflake(3);
         params.sessionId = QStringLiteral("session");
         params.video = true;
+        if (kind == Kind::Voice)
+            params.streams = cameraStreams();
         params.sendsAudio = kind == Kind::StreamWithSound;
         params.streamContext = kind != Kind::Voice;
 
@@ -493,15 +542,18 @@ struct Call
         vp8.decode = true;
         params.videoCodecs = { vp8 };
         if (sendsVideo) {
-            Codec h264;
-            h264.name = QStringLiteral("H264");
-            h264.type = QStringLiteral("video");
-            h264.priority = 2000;
-            h264.payloadType = H264_PAYLOAD_TYPE;
-            h264.rtxPayloadType = H264_RTX_PAYLOAD_TYPE;
-            h264.encode = true;
-            h264.decode = false;
-            params.videoCodecs.append(h264);
+            const std::pair<QString, int> sentOnly[] = { { QStringLiteral("H264"), H264_PAYLOAD_TYPE }, { QStringLiteral("H265"), H265_PAYLOAD_TYPE }, { QStringLiteral("AV1"), AV1_PAYLOAD_TYPE } };
+            for (const auto &[name, payloadType] : sentOnly) {
+                Codec codec;
+                codec.name = name;
+                codec.type = QStringLiteral("video");
+                codec.priority = 2000;
+                codec.payloadType = payloadType;
+                codec.rtxPayloadType = payloadType + 1;
+                codec.encode = true;
+                codec.decode = false;
+                params.videoCodecs.append(codec);
+            }
         }
 
         client = std::make_unique<VoiceClient>(params);
@@ -575,6 +627,7 @@ private slots:
     void initTestCase() { QVERIFY(VoiceEncryption::initialize()); }
 
     void connectsAndSaysWhatItCanReceive();
+    void aVoiceConnectionDeclaresOneCameraLayer();
     void usersTheServerNamesAreAnnounced();
     void framesReachTheHandlerUnderTheirSender();
     void aLostPacketIsAskedForAndTakenFromTheRetransmission();
@@ -594,6 +647,11 @@ private slots:
     void whatViewersWantIsPassedOn();
     void aSenderReportAndStatisticsFollowEverySecond();
     void aChangeOfCodecIsTakenUp();
+    void h265AndAv1AreSentWhenTheServerNamesThem();
+    void aChangeToAv1WaitsForItsKeyframe();
+    void encodersFoundLateAreOfferedInASessionUpdate();
+    void encodersFoundBeforeTheProtocolIsChosenNeedNoUpdate();
+    void aCodecWithdrawnWhileInUseSendsNothingUntilAnotherIsNamed();
     void noVideoGoesOutWhileEndToEndKeysAreMissing();
 
     void sharedSoundIsAnnouncedOnceAndMarkedAtEveryRun();
@@ -619,6 +677,16 @@ void TestVoiceClient::connectsAndSaysWhatItCanReceive()
     QCOMPARE(codecs[1].toObject()["payload_type"].toInt(), VIDEO_PAYLOAD_TYPE);
     QCOMPARE(codecs[1].toObject()["rtx_payload_type"].toInt(), RTX_PAYLOAD_TYPE);
     QCOMPARE(selectProtocol[0]["data"].toObject()["mode"].toString(), encryptionModeToString(EncryptionMode::AEAD_XCHACHA20_POLY1305_RTPSIZE));
+}
+
+void TestVoiceClient::aVoiceConnectionDeclaresOneCameraLayer()
+{
+    Call call;
+    QTRY_VERIFY(call.isUp());
+
+    QCOMPARE(call.server.receivedText(0).size(), 1);
+    QVERIFY2(call.server.receivedText(0)[0].endsWith(R"("video":true,"streams":[{"type":"video","rid":"100","quality":100}]}})"), call.server.receivedText(0)[0].constData());
+    QCOMPARE(call.server.received(0)[0]["streams"].toArray().size(), 1);
 }
 
 void TestVoiceClient::usersTheServerNamesAreAnnounced()
@@ -1136,12 +1204,225 @@ void TestVoiceClient::aChangeOfCodecIsTakenUp()
     QCOMPARE(int(call.server.rtp[4].header.payloadType), H264_RTX_PAYLOAD_TYPE);
 
     // A codec this client never offered to encode: there is nothing to send video with.
-    call.server.send(SESSION_UPDATE, QJsonObject{ { "video_codec", "AV1" } });
+    call.server.send(SESSION_UPDATE, QJsonObject{ { "video_codec", "VP9" } });
     QTRY_COMPARE(codecs.count(), 2);
     QCOMPARE(codecs[1][0].value<VideoCodec>(), VideoCodec::Unknown);
     call.client->sendVideoFrame(keyframe);
     QTest::qWait(150);
     QCOMPARE(call.server.rtp.size(), 5);
+}
+
+void TestVoiceClient::h265AndAv1AreSentWhenTheServerNamesThem()
+{
+    constexpr int SESSION_UPDATE = 14;
+    constexpr int H265_AGGREGATION_PACKET = 48;
+    constexpr int H265_FRAGMENTATION_UNIT = 49;
+    constexpr int AV1_NEW_SEQUENCE = 0x08;
+
+    Call call(true);
+    call.server.videoCodec = QStringLiteral("H265");
+    QTRY_VERIFY(call.isUp());
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::H265);
+    call.startVideo();
+    QSignalSpy codecs(call.client.get(), &VoiceClient::videoSendCodecChanged);
+    QSignalSpy statistics(call.client.get(), &VoiceClient::videoSendStatsUpdated);
+
+    const EncodedVideoFrame h265 = h265Keyframe(3000);
+    call.client->sendVideoFrame(h265);
+    QTRY_COMPARE(call.server.rtp.size(), 4);
+    for (const RtpSeen &packet : call.server.rtp) {
+        QCOMPARE(packet.header.ssrc, OWN_VIDEO_SSRC);
+        QCOMPARE(int(packet.header.payloadType), H265_PAYLOAD_TYPE);
+        QCOMPARE(packet.header.timestamp, 3000u);
+        QVERIFY(packet.size <= VideoSendStream::MAX_PACKET_SIZE);
+    }
+    // The parameter sets travel together, ahead of the picture's fragments.
+    QCOMPARE((call.server.rtp[0].payload[0] >> 1) & 0x3F, H265_AGGREGATION_PACKET);
+    for (int i = 1; i < 4; i++)
+        QCOMPARE((call.server.rtp[i].payload[0] >> 1) & 0x3F, H265_FRAGMENTATION_UNIT);
+    QVERIFY(call.server.rtp[3].header.marker);
+    QCOMPARE(call.reassembled(VideoCodec::H265, OWN_VIDEO_SSRC), h265.data);
+
+    call.server.sendFeedback({ nack(OWN_VIDEO_SSRC, call.server.rtp[1].header.sequence) });
+    QTRY_COMPARE(call.server.rtp.size(), 5);
+    QCOMPARE(call.server.rtp[4].header.ssrc, OWN_RTX_SSRC);
+    QCOMPARE(int(call.server.rtp[4].header.payloadType), H265_PAYLOAD_TYPE + 1);
+
+    call.server.send(SESSION_UPDATE, QJsonObject{ { "video_codec", "AV1" } });
+    QTRY_COMPARE(codecs.count(), 1);
+    QCOMPARE(codecs[0][0].value<VideoCodec>(), VideoCodec::AV1);
+    call.server.rtp.clear();
+
+    call.client->sendVideoFrame(av1Frame(true, 6000));
+    QTRY_COMPARE(call.server.rtp.size(), 3);
+    for (int i = 0; i < 3; i++) {
+        const RtpSeen &packet = call.server.rtp[i];
+        QCOMPARE(packet.header.ssrc, OWN_VIDEO_SSRC);
+        QCOMPARE(int(packet.header.payloadType), AV1_PAYLOAD_TYPE);
+        QCOMPARE(packet.header.timestamp, 6000u);
+        QCOMPARE(packet.header.marker, i == 2);
+        QVERIFY(packet.size <= VideoSendStream::MAX_PACKET_SIZE);
+        // Only the first packet of the key frame says that a sequence begins.
+        QCOMPARE((packet.payload[0] & AV1_NEW_SEQUENCE) != 0, i == 0);
+    }
+    QCOMPARE(call.reassembled(VideoCodec::AV1, OWN_VIDEO_SSRC), av1AsAssembled(true));
+    QCOMPARE(call.server.undecryptable, 0);
+
+    statistics.clear();
+    QTRY_VERIFY_WITH_TIMEOUT(statistics.count() >= 1, 1500);
+    QCOMPARE(statistics[0][0].value<VideoSendStats>().codec, QStringLiteral("AV1"));
+}
+
+void TestVoiceClient::aChangeToAv1WaitsForItsKeyframe()
+{
+    constexpr int SESSION_UPDATE = 14;
+
+    Call call(true);
+    call.server.videoCodec = QStringLiteral("H264");
+    QTRY_VERIFY(call.isUp());
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::H264);
+    call.startVideo();
+    QSignalSpy codecs(call.client.get(), &VoiceClient::videoSendCodecChanged);
+
+    const EncodedVideoFrame h264 = h264Keyframe(3000);
+    call.client->sendVideoFrame(h264);
+    QTRY_COMPARE(call.server.rtp.size(), 4);
+    QCOMPARE(int(call.server.rtp[0].header.payloadType), H264_PAYLOAD_TYPE);
+    QCOMPARE(call.reassembled(VideoCodec::H264, OWN_VIDEO_SSRC), h264.data);
+    const quint16 lastOfH264 = call.server.rtp[3].header.sequence;
+    call.server.rtp.clear();
+
+    call.server.send(SESSION_UPDATE, QJsonObject{ { "video_codec", "AV1" } });
+    QTRY_COMPARE(codecs.count(), 1);
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::AV1);
+
+    // A frame that builds on pictures nobody was sent in this codec stays here.
+    call.client->sendVideoFrame(av1Frame(false, 6000));
+    QTest::qWait(150);
+    QVERIFY(call.server.rtp.isEmpty());
+
+    call.client->sendVideoFrame(av1Frame(true, 9000));
+    call.client->sendVideoFrame(av1Frame(false, 12000));
+    QTRY_COMPARE(call.server.rtp.size(), 6);
+    for (int i = 0; i < 6; i++) {
+        const RtpSeen &packet = call.server.rtp[i];
+        QCOMPARE(int(packet.header.payloadType), AV1_PAYLOAD_TYPE);
+        QCOMPARE(packet.header.timestamp, i < 3 ? 9000u : 12000u);
+        QCOMPARE(packet.header.sequence, static_cast<quint16>(lastOfH264 + 1 + i));
+        QCOMPARE(packet.header.marker, i == 2 || i == 5);
+    }
+    QVERIFY(startsKeyframe(VideoCodec::AV1, call.server.rtp[0].payload));
+    QVERIFY(!startsKeyframe(VideoCodec::AV1, call.server.rtp[3].payload));
+
+    const QList<RtpSeen> both = call.server.rtp;
+    call.server.rtp = both.mid(0, 3);
+    QCOMPARE(call.reassembled(VideoCodec::AV1, OWN_VIDEO_SSRC), av1AsAssembled(true));
+    call.server.rtp = both.mid(3);
+    QCOMPARE(call.reassembled(VideoCodec::AV1, OWN_VIDEO_SSRC), av1AsAssembled(false));
+    QCOMPARE(call.server.undecryptable, 0);
+}
+
+void TestVoiceClient::encodersFoundLateAreOfferedInASessionUpdate()
+{
+    constexpr int SESSION_UPDATE = 14;
+
+    // Connected while it was not known what this machine encodes: VP8 is offered for decoding
+    // alone, and the codec the server names cannot be taken up.
+    Call call;
+    QTRY_VERIFY(call.isUp());
+    QCOMPARE(call.server.received(1)[0]["codecs"].toArray()[1].toObject()["encode"].toBool(), false);
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::Unknown);
+    QSignalSpy codecs(call.client.get(), &VoiceClient::videoSendCodecChanged);
+
+    // H264 was never offered on this connection, so it is not offered now either.
+    call.client->offerVideoEncoding({ VideoCodec::H264, VideoCodec::VP8 });
+    QTRY_COMPARE(call.server.receivedText(SESSION_UPDATE).size(), 1);
+    QCOMPARE(call.server.receivedText(SESSION_UPDATE)[0],
+             QByteArray(R"({"op":14,"d":{"codecs":[{"name":"opus","type":"audio","priority":1000,"payload_type":120},{"name":"VP8","type":"video","priority":1000,"payload_type":101,"rtx_payload_type":102,"encode":true,"decode":true}]}})"));
+
+    // The codec the server had named at the start is the one to send with after all.
+    QCOMPARE(codecs.count(), 1);
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::VP8);
+
+    // Nothing more to offer, nothing more said.
+    call.client->offerVideoEncoding({ VideoCodec::VP8 });
+    QTest::qWait(100);
+    QCOMPARE(call.server.receivedText(SESSION_UPDATE).size(), 1);
+
+    // And video goes out on the connection as it is.
+    call.startVideo();
+    QTRY_COMPARE(call.server.receivedText(12).size(), 1);
+    call.client->sendVideoFrame(videoFrame(3000, true, 0));
+    QTRY_VERIFY(!call.server.rtp.isEmpty());
+    QCOMPARE(int(call.server.rtp[0].header.payloadType), VIDEO_PAYLOAD_TYPE);
+    QCOMPARE(call.server.rtp[0].header.ssrc, OWN_VIDEO_SSRC);
+}
+
+void TestVoiceClient::encodersFoundBeforeTheProtocolIsChosenNeedNoUpdate()
+{
+    Call call;
+    call.client->offerVideoEncoding({ VideoCodec::VP8 });
+    QTRY_VERIFY(call.isUp());
+
+    QCOMPARE(call.server.received(1)[0]["codecs"].toArray()[1].toObject()["encode"].toBool(), true);
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::VP8);
+    QTest::qWait(100);
+    QVERIFY(call.server.received(14).isEmpty());
+}
+
+void TestVoiceClient::aCodecWithdrawnWhileInUseSendsNothingUntilAnotherIsNamed()
+{
+    constexpr int SESSION_UPDATE = 14;
+
+    Call call(true);
+    call.server.videoCodec = QStringLiteral("AV1");
+    QTRY_VERIFY(call.isUp());
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::AV1);
+    call.startVideo();
+    QTRY_COMPARE(call.server.receivedText(12).size(), 1);
+    call.client->sendVideoFrame(av1Frame(true, 3000));
+    QTRY_COMPARE(call.server.rtp.size(), 3);
+    QCOMPARE(int(call.server.rtp[0].header.payloadType), AV1_PAYLOAD_TYPE);
+    call.server.rtp.clear();
+    QSignalSpy codecs(call.client.get(), &VoiceClient::videoSendCodecChanged);
+
+    // The server hears of the codecs that are left. AV1 was offered for sending alone, and a
+    // codec that is neither sent nor received is not offered at all.
+    call.client->offerVideoEncoding({ VideoCodec::H265, VideoCodec::H264, VideoCodec::VP8 });
+    QTRY_COMPARE(call.server.receivedText(SESSION_UPDATE).size(), 1);
+    const QJsonArray offered = call.server.received(SESSION_UPDATE)[0]["codecs"].toArray();
+    QStringList names;
+    for (const auto &each : offered) {
+        names.append(each.toObject()["name"].toString());
+        if (each.toObject()["type"].toString() == QStringLiteral("video"))
+            QCOMPARE(each.toObject()["encode"].toBool(), true);
+    }
+    QCOMPARE(names, QStringList({ QStringLiteral("opus"), QStringLiteral("VP8"), QStringLiteral("H264"), QStringLiteral("H265") }));
+
+    // Until the server answers there is nothing to send with, and nothing is sent.
+    QCOMPARE(codecs.count(), 1);
+    QCOMPARE(codecs[0][0].value<VideoCodec>(), VideoCodec::Unknown);
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::Unknown);
+    call.client->sendVideoFrame(av1Frame(true, 6000));
+    QTest::qWait(150);
+    QVERIFY(call.server.rtp.isEmpty());
+
+    // A server that names the withdrawn codec again is not followed either.
+    call.server.send(SESSION_UPDATE, QJsonObject{ { "video_codec", "AV1" } });
+    QTest::qWait(150);
+    QCOMPARE(codecs.count(), 1);
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::Unknown);
+
+    call.server.send(SESSION_UPDATE, QJsonObject{ { "video_codec", "H265" } });
+    QTRY_COMPARE(codecs.count(), 2);
+    QCOMPARE(call.client->videoSendCodec(), VideoCodec::H265);
+    const EncodedVideoFrame h265 = h265Keyframe(9000);
+    call.client->sendVideoFrame(h265);
+    QTRY_VERIFY(!call.server.rtp.isEmpty());
+    QCOMPARE(int(call.server.rtp[0].header.payloadType), H265_PAYLOAD_TYPE);
+    QCOMPARE(call.server.rtp[0].header.timestamp, 9000u);
+    QTRY_COMPARE(call.reassembled(VideoCodec::H265, OWN_VIDEO_SSRC), h265.data);
+    QCOMPARE(call.server.undecryptable, 0);
 }
 
 void TestVoiceClient::noVideoGoesOutWhileEndToEndKeysAreMissing()

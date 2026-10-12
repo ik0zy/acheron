@@ -1108,7 +1108,7 @@ void MainWindow::setupPermanentConnections(Core::ClientInstance *instance)
                 QPushButton *reconnect = box->addButton(tr("Reconnect"), QMessageBox::AcceptRole);
                 connect(reconnect, &QPushButton::clicked, box, [instance, channelId, guildId]() {
                     if (instance)
-                        instance->discord()->sendVoiceStateUpdate(guildId, channelId, false, false);
+                        instance->discord()->sendVoiceStateUpdate(guildId, channelId, false, false, instance->selfVideoIn(channelId));
                 });
                 box->open();
             });
@@ -1217,7 +1217,7 @@ CallView *MainWindow::ensureCallView(Core::ClientInstance *instance)
     };
 
     ChannelNode *channel = channelTreeModel->findChannelTreeNode(instance->voiceChannelId());
-    auto *view = new CallView(instance->voice(), instance->streamWatcher(), instance->streamBroadcaster(), session->getImageManager(), instance->accountId(), names, avatars, channel ? channel->name : tr("Call"), callHost);
+    auto *view = new CallView(instance->voice(), instance->streamWatcher(), instance->streamBroadcaster(), instance->cameraSender(), session->getImageManager(), instance->accountId(), names, avatars, channel ? channel->name : tr("Call"), callHost);
     callViews.insert(accountId, view);
     connect(view, &CallView::presenceChanged, this, &MainWindow::updateCallHost);
     updateCallHost();
@@ -1322,7 +1322,7 @@ void MainWindow::setupUi()
     connect(voiceStatusBar, &VoiceStatusBar::disconnectRequested, this, [this]() {
         for (const auto &inst : session->getClients()) {
             if (inst && inst->isInVoice()) {
-                inst->discord()->sendVoiceStateUpdate(inst->voiceGuildId(), Snowflake::Invalid, false, false);
+                inst->discord()->sendVoiceStateUpdate(inst->voiceGuildId(), Snowflake::Invalid, false, false, inst->selfVideoIn(Snowflake::Invalid));
                 break;
             }
         }
@@ -1874,7 +1874,7 @@ void MainWindow::setupUi()
 
                 if (isDM) {
                     qCInfo(LogVoice) << "Joining DM call" << node->name << node->id;
-                    instance->discord()->sendVoiceStateUpdate(Snowflake::Invalid, node->id, false, false);
+                    instance->discord()->sendVoiceStateUpdate(Snowflake::Invalid, node->id, false, false, instance->selfVideoIn(node->id));
                 } else {
                     ChannelNode *guildNode = ChannelTreeModel::findGuildNode(node);
                     if (!guildNode)
@@ -1882,7 +1882,7 @@ void MainWindow::setupUi()
 
                     qCInfo(LogVoice) << "Joining voice channel" << node->name << node->id
                                      << "in guild" << guildNode->id;
-                    instance->discord()->sendVoiceStateUpdate(guildNode->id, node->id, false, false);
+                    instance->discord()->sendVoiceStateUpdate(guildNode->id, node->id, false, false, instance->selfVideoIn(node->id));
                 }
             });
 
@@ -1902,7 +1902,7 @@ void MainWindow::setupUi()
                     return;
 
                 qCInfo(LogVoice) << "Disconnecting from voice";
-                instance->discord()->sendVoiceStateUpdate(instance->voiceGuildId(), Snowflake::Invalid, false, false);
+                instance->discord()->sendVoiceStateUpdate(instance->voiceGuildId(), Snowflake::Invalid, false, false, instance->selfVideoIn(Snowflake::Invalid));
             });
 #endif
 

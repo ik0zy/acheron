@@ -4,6 +4,9 @@
 #include <QtGlobal>
 
 #include <array>
+#include <optional>
+
+#include "Core/Video/SendRateController.hpp"
 
 namespace Acheron {
 namespace Core {
@@ -76,6 +79,94 @@ public:
 
 private:
     qint64 adopted = 0;
+};
+
+// The account's own camera. It is captured at one size and rate, and what is encoded of it
+// follows how much of it the viewers want, which the server relays as a number from 0 to 100.
+inline constexpr QSize CAMERA_CAPTURE_SIZE(1280, 720);
+inline constexpr int CAMERA_FRAMERATE = 30;
+inline constexpr int CAMERA_MIN_BITRATE = 150'000;
+inline constexpr int CAMERA_MAX_BITRATE = 2'500'000;
+
+// One row of the camera's ladder.
+struct CameraLayer
+{
+    // The least want the row is used for.
+    int want = 0;
+    QSize size;
+    // Bits per second.
+    int maxBitrate = 0;
+
+    bool operator==(const CameraLayer &other) const = default;
+};
+
+// The most a camera picture of this many pixels is sent at: the full picture's bitrate by its
+// share of the area, and never under the minimum.
+[[nodiscard]] int cameraMaxBitrate(qint64 pixels);
+// The row with the highest want not above `want`, and the lowest row for less than any.
+[[nodiscard]] CameraLayer cameraLayerFor(int want);
+// A camera whose owner is not heard is sent at fewer frames a second, and at fewer still when
+// no more than the lowest row is wanted of it.
+[[nodiscard]] int cameraFramerate(int want, bool muted);
+
+// What the camera's encoder is asked for.
+struct CameraEncoding
+{
+    QSize size;
+    int framerate = 0;
+    // Bits per second.
+    int bitrate = 0;
+
+    bool operator==(const CameraEncoding &other) const = default;
+};
+
+// Decides what the camera is encoded at from what the viewers want, whether its owner is heard,
+// and what the server says is lost on the way. It has no clock: the owner passes the time in.
+//
+// The owner counts as muted while self-muted, or once nothing has been said for
+// SILENCE_BEFORE_MUTED_MS, unless a screen is being shared as well. The frame rate follows
+// that at once. A new size or bitrate is taken up only SETTLE_MS after the last one, because
+// each costs the encoder a key frame and wants arrive in quick succession.
+class CameraSendPlan
+{
+public:
+    // The camera is turned on: all of it is wanted until the server says otherwise, it is sent
+    // at the most the full picture may be, and the silence is counted from now.
+    void start(qint64 nowMs);
+
+    void setWant(int wanted);
+    void setSelfMuted(bool muted);
+    void setSpeaking(bool nowSpeaking, qint64 nowMs);
+    void setSharingScreen(bool sharing);
+    // One of the server's reports, as SendRateController::report takes it.
+    void reportLoss(double lossFraction, qint64 nowMs);
+
+    // Takes up what has become due by `nowMs` and returns what the encoder is to be doing.
+    CameraEncoding advance(qint64 nowMs);
+    // How long after `nowMs` advance() would first answer differently with nothing new having
+    // been said. Empty when it would not.
+    [[nodiscard]] std::optional<qint64> nextChangeIn(qint64 nowMs) const;
+
+    // The want the size and frame rate in use were chosen for.
+    [[nodiscard]] int servedWant() const { return wantInUse; }
+    [[nodiscard]] int maxBitrate() const { return cameraLayerFor(wantInUse).maxBitrate; }
+    [[nodiscard]] bool countsAsMuted(qint64 nowMs) const;
+
+    static constexpr qint64 SETTLE_MS = 2000;
+    static constexpr qint64 SILENCE_BEFORE_MUTED_MS = 15000;
+
+private:
+    [[nodiscard]] bool changeIsWaiting() const;
+
+    int want = 100;
+    int wantInUse = 100;
+    bool selfMuted = false;
+    bool speaking = false;
+    bool sharingScreen = false;
+    qint64 silentSinceMs = 0;
+    SendRateController rate;
+    int bitrateInUse = 0;
+    qint64 changedAtMs = 0;
 };
 
 } // namespace Video

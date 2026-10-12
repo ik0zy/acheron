@@ -6,14 +6,18 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <climits>
 #include <cstring>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <thread>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
 }
@@ -53,12 +57,22 @@ struct VideoEncoderCandidate
 
 namespace {
 
-// In the order they are tried. Media Foundation is the graphics card's encoder or Microsoft's
-// software one, by an option. The software one runs pictures behind (sixteen, where it was
-// measured) whatever it is told through ffmpeg, so the trial turns it down. libopenh264 and
-// x264 are left out on Windows on purpose.
+// In the order they are tried, each codec's by themselves. AV1 and H265 are encoded by the
+// graphics card or not at all, as in the official client: ffmpeg's software encoders for them
+// are left alone. Media Foundation is the graphics card's encoder or Microsoft's software one,
+// by an option. The software one runs pictures behind (sixteen, where it was measured) whatever
+// it is told through ffmpeg, so the trial turns it down. libopenh264 and x264 are left out on
+// Windows on purpose.
 #if defined(Q_OS_WIN)
 constexpr std::array CANDIDATES = {
+    VideoEncoderCandidate{ "av1_amf", "av1_amf", VideoCodec::AV1, EncoderFamily::Amf, true, true, true, false },
+    VideoEncoderCandidate{ "av1_nvenc", "av1_nvenc", VideoCodec::AV1, EncoderFamily::Nvenc, true, true, true, true },
+    VideoEncoderCandidate{ "av1_qsv", "av1_qsv", VideoCodec::AV1, EncoderFamily::Qsv, true, false, false, true },
+    VideoEncoderCandidate{ "av1_mf hardware", "av1_mf", VideoCodec::AV1, EncoderFamily::MediaFoundation, true, true, false, false },
+    VideoEncoderCandidate{ "hevc_amf", "hevc_amf", VideoCodec::H265, EncoderFamily::Amf, true, true, true, false },
+    VideoEncoderCandidate{ "hevc_nvenc", "hevc_nvenc", VideoCodec::H265, EncoderFamily::Nvenc, true, true, true, true },
+    VideoEncoderCandidate{ "hevc_qsv", "hevc_qsv", VideoCodec::H265, EncoderFamily::Qsv, true, false, false, true },
+    VideoEncoderCandidate{ "hevc_mf hardware", "hevc_mf", VideoCodec::H265, EncoderFamily::MediaFoundation, true, true, false, false },
     VideoEncoderCandidate{ "h264_amf", "h264_amf", VideoCodec::H264, EncoderFamily::Amf, true, true, true, false },
     VideoEncoderCandidate{ "h264_nvenc", "h264_nvenc", VideoCodec::H264, EncoderFamily::Nvenc, true, true, true, true },
     VideoEncoderCandidate{ "h264_qsv", "h264_qsv", VideoCodec::H264, EncoderFamily::Qsv, true, false, false, true },
@@ -68,6 +82,10 @@ constexpr std::array CANDIDATES = {
 };
 #else
 constexpr std::array CANDIDATES = {
+    VideoEncoderCandidate{ "av1_vaapi", "av1_vaapi", VideoCodec::AV1, EncoderFamily::Vaapi, true, false, false, false },
+    VideoEncoderCandidate{ "av1_nvenc", "av1_nvenc", VideoCodec::AV1, EncoderFamily::Nvenc, true, false, false, true },
+    VideoEncoderCandidate{ "hevc_vaapi", "hevc_vaapi", VideoCodec::H265, EncoderFamily::Vaapi, true, false, false, false },
+    VideoEncoderCandidate{ "hevc_nvenc", "hevc_nvenc", VideoCodec::H265, EncoderFamily::Nvenc, true, false, false, true },
     VideoEncoderCandidate{ "h264_vaapi", "h264_vaapi", VideoCodec::H264, EncoderFamily::Vaapi, true, false, false, false },
     VideoEncoderCandidate{ "h264_nvenc", "h264_nvenc", VideoCodec::H264, EncoderFamily::Nvenc, true, false, false, true },
     VideoEncoderCandidate{ "libx264", "libx264", VideoCodec::H264, EncoderFamily::X264, false, false, false, false },
@@ -76,29 +94,61 @@ constexpr std::array CANDIDATES = {
 };
 #endif
 
+// The order the voice server prefers them in when every viewer decodes them.
+constexpr std::array CODECS_BEST_FIRST = { VideoCodec::AV1, VideoCodec::H265, VideoCodec::H264, VideoCodec::VP8 };
+
 constexpr int RTP_CLOCK = 90000;
 
 // ffmpeg's numbers for the profiles, which it has renamed between versions.
 constexpr int H264_PROFILE_MAIN = 77;
 constexpr int H264_PROFILE_HIGH = 100;
 constexpr std::array H264_PROFILES = { H264_PROFILE_HIGH, H264_PROFILE_MAIN };
+constexpr int H265_PROFILE_MAIN = 1;
+constexpr int AV1_PROFILE_MAIN = 0;
 
-// The official client stops its encoders at 56 of VP8's 63 quantizer steps. This is the same
-// share of H264's 51.
+// The official client stops its encoders at 56 of VP8's 63 quantizer steps. These are the same
+// share of the 51 of H264 and H265, and the place AV1's 255 have for that step.
 constexpr int VP8_MIN_QUANTIZER = 2;
 constexpr int VP8_MAX_QUANTIZER = 56;
-constexpr int H264_MAX_QP = 45;
+constexpr int H26X_MAX_QP = 45;
+constexpr int AV1_MAX_QUANTIZER_INDEX = 224;
 
-constexpr int NAL_IDR = 5;
-constexpr int NAL_SPS = 7;
-constexpr int NAL_PPS = 8;
-constexpr int NAL_ACCESS_UNIT_DELIMITER = 9;
 constexpr std::array<uint8_t, 4> START_CODE = { 0, 0, 0, 1 };
+
+constexpr int OBU_SEQUENCE_HEADER = 1;
+constexpr int OBU_TEMPORAL_DELIMITER = 2;
+constexpr int OBU_FRAME_HEADER = 3;
+constexpr int OBU_FRAME = 6;
+constexpr uint8_t OBU_HAS_EXTENSION = 0x04;
+constexpr uint8_t OBU_HAS_SIZE = 0x02;
+// ISO/IEC 14496-15's wrapping of a sequence header, which some encoders give as extradata,
+// opens with a marker bit and a version of one, and has the OBUs after four bytes.
+constexpr uint8_t AV1_CONFIGURATION_MARKER = 0x81;
+constexpr size_t AV1_CONFIGURATION_SIZE = 4;
+
+const QLatin1String AMF_AV1_ENCODER("av1_amf");
+// The blocks AMD's hardware codes AV1 in where it is not free to code any size. Rows that stop
+// half a block short are made up with two and not eight, so that 1080 lines come out as 1082:
+// ffmpeg's amfenc_av1.c has the same exception in the crop it reports ("special processing
+// for crop_bottom equal to 8 in hardware").
+constexpr QSize AMF_AV1_BLOCK(64, 16);
+constexpr int AMF_AV1_ROWS_FOR_HALF_A_BLOCK = 2;
+// Sizes that an encoder which codes in whole blocks changes: the rows of the first and the
+// columns of the second are no whole number of any block in use.
+constexpr std::array SIZES_NOT_OF_WHOLE_BLOCKS = { QSize(640, 360), QSize(1000, 700) };
 
 constexpr int TRIAL_WIDTH = 640;
 constexpr int TRIAL_HEIGHT = 360;
-constexpr int TRIAL_PICTURES = 3;
+constexpr int TRIAL_PICTURES = 30;
 constexpr int TRIAL_BITRATE = 1'000'000;
+// The pictures the rate is measured over: the ones after rate control has got over the key frame.
+constexpr int TRIAL_SETTLING = 10;
+// Rate control drops a picture now and then, even one of these.
+constexpr int TRIAL_DROPS_ALLOWED = 3;
+constexpr double TRIAL_MOST_OF_THE_RATE = 2.0;
+constexpr double TRIAL_LEAST_OF_THE_RATE = 0.25;
+// Many times what opening the slowest encoder and encoding the trial's pictures takes.
+constexpr std::chrono::seconds TRIAL_TIME_ALLOWED(10);
 
 struct Nal
 {
@@ -128,15 +178,136 @@ bool startsWithStartCode(std::span<const uint8_t> data, const std::vector<Nal> &
     return !nals.empty() && (nals.front().begin == 3 || (nals.front().begin == 4 && data[0] == 0));
 }
 
-int nalType(std::span<const uint8_t> data, const Nal &nal)
+// The parameter sets come first, in the order a key frame has them in.
+enum class NalKind {
+    Vps,
+    Sps,
+    Pps,
+    AccessUnitDelimiter,
+    // A picture that needs none before it: an IDR in H264, any IRAP picture in H265.
+    KeyPicture,
+    Other,
+};
+
+bool isParameterSet(NalKind kind)
 {
-    return nal.begin < nal.end ? data[nal.begin] & 0x1F : -1;
+    return kind <= NalKind::Pps;
+}
+
+NalKind nalKind(VideoCodec codec, std::span<const uint8_t> data, const Nal &nal)
+{
+    if (nal.begin >= nal.end)
+        return NalKind::Other;
+    if (codec == VideoCodec::H265) {
+        const int type = (data[nal.begin] >> 1) & 0x3F;
+        switch (type) {
+        case 32:
+            return NalKind::Vps;
+        case 33:
+            return NalKind::Sps;
+        case 34:
+            return NalKind::Pps;
+        case 35:
+            return NalKind::AccessUnitDelimiter;
+        default:
+            return type >= 16 && type <= 23 ? NalKind::KeyPicture : NalKind::Other;
+        }
+    }
+    switch (data[nal.begin] & 0x1F) {
+    case 5:
+        return NalKind::KeyPicture;
+    case 7:
+        return NalKind::Sps;
+    case 8:
+        return NalKind::Pps;
+    case 9:
+        return NalKind::AccessUnitDelimiter;
+    default:
+        return NalKind::Other;
+    }
+}
+
+// The parameter sets a key frame opens with: H264 has no VPS.
+std::span<const NalKind> parameterSetKinds(VideoCodec codec)
+{
+    static constexpr std::array KINDS = { NalKind::Vps, NalKind::Sps, NalKind::Pps };
+    return std::span<const NalKind>(KINDS).subspan(codec == VideoCodec::H265 ? 0 : 1);
 }
 
 void appendNal(std::vector<uint8_t> &to, std::span<const uint8_t> nal)
 {
     to.insert(to.end(), START_CODE.begin(), START_CODE.end());
     to.insert(to.end(), nal.begin(), nal.end());
+}
+
+struct Obu
+{
+    int type;
+    // The header is one byte, or two with its extension, and the size comes between it and
+    // the payload when the OBU says its size.
+    size_t header;
+    size_t headerSize;
+    size_t payload;
+    size_t end;
+    bool saysItsSize;
+};
+
+// The OBUs of a temporal unit, or none when it is not one. Only the last may leave its size
+// out, and then runs to the end.
+std::vector<Obu> splitObus(std::span<const uint8_t> data)
+{
+    std::vector<Obu> obus;
+    for (size_t at = 0; at < data.size();) {
+        const uint8_t header = data[at];
+        const size_t headerSize = (header & OBU_HAS_EXTENSION) ? 2 : 1;
+        size_t payload = at + headerSize;
+        if ((header & 0x80) || payload > data.size())
+            return {};
+
+        uint64_t size = data.size() - payload;
+        const bool saysItsSize = header & OBU_HAS_SIZE;
+        if (saysItsSize) {
+            size = 0;
+            bool more = true;
+            for (int shift = 0; more && shift < 56; shift += 7) {
+                if (payload == data.size())
+                    return {};
+                size |= uint64_t(data[payload] & 0x7F) << shift;
+                more = data[payload++] & 0x80;
+            }
+            if (more || size > data.size() - payload)
+                return {};
+        }
+        obus.push_back({ (header >> 3) & 0x0F, at, headerSize, payload, payload + static_cast<size_t>(size), saysItsSize });
+        at = obus.back().end;
+    }
+    return obus;
+}
+
+void appendObu(std::vector<uint8_t> &to, std::span<const uint8_t> header, std::span<const uint8_t> payload)
+{
+    to.push_back(header[0] | OBU_HAS_SIZE);
+    to.insert(to.end(), header.begin() + 1, header.end());
+    size_t size = payload.size();
+    do {
+        to.push_back(static_cast<uint8_t>((size & 0x7F) | (size > 0x7F ? 0x80 : 0)));
+        size >>= 7;
+    } while (size > 0);
+    to.insert(to.end(), payload.begin(), payload.end());
+}
+
+// Whether a frame header, which is what a frame OBU opens with too, is that of a key frame
+// that is shown. A sequence header whose fifth bit is set makes every frame one.
+bool isAv1KeyFrame(std::span<const uint8_t> frameHeader, std::span<const uint8_t> sequenceHeader)
+{
+    if (!sequenceHeader.empty() && (sequenceHeader[0] & 0x08))
+        return true;
+    if (frameHeader.empty())
+        return false;
+    const bool showsExistingFrame = frameHeader[0] & 0x80;
+    const int frameType = (frameHeader[0] >> 5) & 0x03;
+    const bool shown = frameHeader[0] & 0x10;
+    return !showsExistingFrame && frameType == 0 && shown;
 }
 
 // The thread counts libwebrtc gives libvpx, short of the eight it uses on the largest machines.
@@ -149,6 +320,37 @@ int vpxThreads(int width, int height)
     if (pixels > 640 * 480 && cores >= 3)
         return 2;
     return 1;
+}
+
+QSize inWholeAmfAv1Blocks(const QSize &size)
+{
+    const int columns = (AMF_AV1_BLOCK.width() - size.width() % AMF_AV1_BLOCK.width()) % AMF_AV1_BLOCK.width();
+    int rows = (AMF_AV1_BLOCK.height() - size.height() % AMF_AV1_BLOCK.height()) % AMF_AV1_BLOCK.height();
+    if (rows == AMF_AV1_BLOCK.height() / 2)
+        rows = AMF_AV1_ROWS_FOR_HALF_A_BLOCK;
+    return size + QSize(columns, rows);
+}
+
+// A drifting gradient, a patch of texture that slides over it, and a band of noise that is new
+// in every picture: more than the trial's bit rate pays for, so that rate control has to hold
+// the encoder to it.
+void paintTrialPicture(AVFrame *picture, int index)
+{
+    uint32_t noise = 12345u + static_cast<uint32_t>(index) * 2654435761u;
+    for (int y = 0; y < TRIAL_HEIGHT; y++) {
+        uint8_t *row = picture->data[0] + y * picture->linesize[0];
+        for (int x = 0; x < TRIAL_WIDTH; x++) {
+            row[x] = static_cast<uint8_t>((x + y) / 4 + index * 3);
+            if (x >= TRIAL_WIDTH / 4 && x < TRIAL_WIDTH * 3 / 4 && y >= TRIAL_HEIGHT / 3 && y < TRIAL_HEIGHT * 2 / 3)
+                row[x] = static_cast<uint8_t>(((x + 3 * index) * 7) ^ ((y + 2 * index) * 5));
+            if (x < TRIAL_WIDTH / 4 && y < TRIAL_HEIGHT / 6) {
+                noise = noise * 1664525u + 1013904223u;
+                row[x] = static_cast<uint8_t>(96 + (noise >> 26));
+            }
+        }
+    }
+    for (int plane = 1; plane < AV_NUM_DATA_POINTERS && picture->data[plane]; plane++)
+        memset(picture->data[plane], 128, static_cast<size_t>(picture->linesize[plane]) * (TRIAL_HEIGHT / 2));
 }
 
 bool encodesTrialPictures(const VideoEncoderCandidate &candidate)
@@ -169,24 +371,46 @@ bool encodesTrialPictures(const VideoEncoderCandidate &candidate)
     bool worked = av_frame_get_buffer(picture, 0) >= 0;
 
     std::vector<EncodedVideoFrame> frames;
+    size_t settledBytes = 0;
     for (int index = 0; worked && index < TRIAL_PICTURES; index++) {
         av_frame_make_writable(picture);
-        for (int y = 0; y < TRIAL_HEIGHT; y++)
-            memset(picture->data[0] + y * picture->linesize[0], (y + index * 16) & 0xFF, TRIAL_WIDTH);
-        for (int plane = 1; plane < AV_NUM_DATA_POINTERS && picture->data[plane]; plane++)
-            memset(picture->data[plane], 128, static_cast<size_t>(picture->linesize[plane]) * (TRIAL_HEIGHT / 2));
+        paintTrialPicture(picture, index);
 
         const int64_t timestamp = int64_t(index) * RTP_CLOCK / settings.framerate;
         const size_t before = frames.size();
         worked = encoder.encode(picture, timestamp, frames) == VideoEncoder::Outcome::Encoded;
         // A frame that comes out a picture late would stay late for as long as the stream runs.
-        for (size_t i = before; i < frames.size(); i++)
+        for (size_t i = before; i < frames.size(); i++) {
             worked = worked && frames[i].rtpTimestamp == static_cast<uint32_t>(timestamp);
+            settledBytes += index >= TRIAL_SETTLING ? frames[i].data.size() : 0;
+        }
     }
     av_frame_free(&picture);
+    if (!worked || frames.empty() || !frames.front().keyframe || frames.size() + TRIAL_DROPS_ALLOWED < TRIAL_PICTURES)
+        return false;
 
-    // Rate control may drop a picture, even one of these.
-    return worked && !frames.empty() && frames.front().keyframe && frames.size() + 1 >= TRIAL_PICTURES;
+    // An encoder that takes no notice of the rate it is given would send several times what
+    // the connection was measured to carry, or a fraction of what it could.
+    const double rate = static_cast<double>(settledBytes) * 8.0 * settings.framerate / (TRIAL_PICTURES - TRIAL_SETTLING);
+    if (rate > TRIAL_BITRATE * TRIAL_MOST_OF_THE_RATE || rate < TRIAL_BITRATE * TRIAL_LEAST_OF_THE_RATE) {
+        qCWarning(LogVideo) << "Encoder" << candidate.label << "was asked for" << TRIAL_BITRATE / 1000 << "kbps and made" << qRound(rate / 1000);
+        return false;
+    }
+    return true;
+}
+
+// An encoder may also take its first picture and never answer, inside ffmpeg, where nothing
+// can call it back: Media Foundation's AV1 encoder for a Radeon does. So the trial has a thread
+// of its own, which is left to itself when it has not finished in time.
+bool encodesTrialPicturesInTime(const VideoEncoderCandidate &candidate)
+{
+    const auto verdict = std::make_shared<std::promise<bool>>();
+    std::future<bool> finished = verdict->get_future();
+    std::thread([verdict, &candidate] { verdict->set_value(encodesTrialPictures(candidate)); }).detach();
+    if (finished.wait_for(TRIAL_TIME_ALLOWED) == std::future_status::ready)
+        return finished.get();
+    qCWarning(LogVideo) << "Encoder" << candidate.label << "has not finished its trial after" << TRIAL_TIME_ALLOWED.count() << "seconds";
+    return false;
 }
 
 // Whether the encoder opens and encodes on this machine: tried once, and remembered.
@@ -207,7 +431,7 @@ bool candidateWorks(const VideoEncoderCandidate &candidate)
     std::lock_guard lock(verdicts.mutex);
     Verdict &verdict = verdicts.of[static_cast<size_t>(&candidate - CANDIDATES.data())];
     if (verdict == Verdict::Untried) {
-        verdict = encodesTrialPictures(candidate) ? Verdict::Works : Verdict::Broken;
+        verdict = encodesTrialPicturesInTime(candidate) ? Verdict::Works : Verdict::Broken;
         qCInfo(LogVideo) << "Encoder" << candidate.label << (verdict == Verdict::Works ? "works" : "does not work on this machine");
     }
     return verdict == Verdict::Works;
@@ -219,7 +443,7 @@ QList<Discord::Voice::VideoCodec> encodableVideoCodecs()
 {
     static const QList<VideoCodec> codecs = [] {
         QList<VideoCodec> found;
-        for (VideoCodec codec : { VideoCodec::H264, VideoCodec::VP8 }) {
+        for (VideoCodec codec : CODECS_BEST_FIRST) {
             if (std::any_of(CANDIDATES.begin(), CANDIDATES.end(), [codec](const VideoEncoderCandidate &each) { return each.codec == codec && candidateWorks(each); }))
                 found.append(codec);
         }
@@ -243,8 +467,40 @@ bool videoEncoderWorks(const QString &name)
     return std::any_of(CANDIDATES.begin(), CANDIDATES.end(), [&name](const VideoEncoderCandidate &each) { return name == QLatin1String(each.label) && candidateWorks(each); });
 }
 
+QString videoEncoderFor(Discord::Voice::VideoCodec codec)
+{
+    const auto chosen = std::find_if(CANDIDATES.begin(), CANDIDATES.end(), [codec](const VideoEncoderCandidate &each) { return each.codec == codec && candidateWorks(each); });
+    return chosen == CANDIDATES.end() ? QString() : QString::fromLatin1(chosen->label);
+}
+
+QSize codedSize(const QString &encoderName, const QSize &size)
+{
+    return encoderName == AMF_AV1_ENCODER ? inWholeAmfAv1Blocks(size) : size;
+}
+
+bool paddingIsAcceptable(const QSize &size, const QSize &coded)
+{
+    return coded.width() == size.width() && coded.height() >= size.height() && coded.height() - size.height() <= MOST_ROWS_ADDED;
+}
+
+QList<Discord::Voice::VideoCodec> shareCodecs(const QList<Discord::Voice::VideoCodec> &encodable, const QString &av1Encoder, const QSize &size)
+{
+    QList<VideoCodec> codecs = encodable;
+    if (!paddingIsAcceptable(size, codedSize(av1Encoder, size)))
+        codecs.removeAll(VideoCodec::AV1);
+    return codecs;
+}
+
+QList<Discord::Voice::VideoCodec> cameraCodecs(const QList<Discord::Voice::VideoCodec> &encodable, const QString &av1Encoder)
+{
+    QList<VideoCodec> codecs = encodable;
+    if (std::any_of(SIZES_NOT_OF_WHOLE_BLOCKS.begin(), SIZES_NOT_OF_WHOLE_BLOCKS.end(), [&av1Encoder](const QSize &size) { return codedSize(av1Encoder, size) != size; }))
+        codecs.removeAll(VideoCodec::AV1);
+    return codecs;
+}
+
 VideoEncoder::VideoEncoder(const Settings &settings)
-    : settings(settings), uploaded(av_frame_alloc()), packet(av_packet_alloc())
+    : settings(settings), uploaded(av_frame_alloc()), packet(av_packet_alloc()), asEncoded(av_packet_alloc())
 {
     for (const VideoEncoderCandidate &each : CANDIDATES) {
         if (each.codec != settings.codec)
@@ -261,6 +517,12 @@ VideoEncoder::~VideoEncoder()
     close();
     av_frame_free(&uploaded);
     av_packet_free(&packet);
+    av_packet_free(&asEncoded);
+}
+
+QSize VideoEncoder::codedSize(const QSize &size) const
+{
+    return candidate && QLatin1String(candidate->label) == AMF_AV1_ENCODER ? inWholeAmfAv1Blocks(size) : size;
 }
 
 bool VideoEncoder::takesCardFrames() const
@@ -417,6 +679,8 @@ bool VideoEncoder::collect(std::vector<EncodedVideoFrame> &out)
         }
         if (received < 0)
             return false;
+        if (colourDescriber && packet->size > 0)
+            describeColours();
 
         EncodedVideoFrame encoded;
         encoded.data.assign(packet->data, packet->data + packet->size);
@@ -426,80 +690,160 @@ bool VideoEncoder::collect(std::vector<EncodedVideoFrame> &out)
 
         if (encoded.data.empty())
             continue;
-        if (candidate->codec == VideoCodec::H264) {
-            if (!finishH264(encoded))
-                return false;
-        } else {
-            // VP8 says so itself, in the lowest bit of its first byte.
-            encoded.keyframe = !(encoded.data[0] & 1);
-        }
+        if (!finisher.finish(encoded))
+            return false;
         out.push_back(std::move(encoded));
     }
 }
 
-// Whether a frame is a key frame is read from the frame, and one that does not open with its
-// parameter sets is given them: which encoders repeat them, and when, differs by encoder and
-// by how it was asked.
-bool VideoEncoder::finishH264(EncodedVideoFrame &frame)
+// Which encoders repeat their parameter sets, and when, differs by encoder and by how it was
+// asked, and so does what each takes a key frame to be.
+bool EncodedFrameFinisher::finish(EncodedVideoFrame &frame)
+{
+    if (frame.data.empty())
+        return false;
+    switch (codec) {
+    case VideoCodec::H264:
+    case VideoCodec::H265:
+        return finishAnnexB(frame);
+    case VideoCodec::AV1:
+        return finishAv1(frame);
+    case VideoCodec::VP8:
+        // It says so itself, in the lowest bit of its first byte.
+        frame.keyframe = !(frame.data[0] & 1);
+        return true;
+    case VideoCodec::Unknown:
+        break;
+    }
+    return false;
+}
+
+bool EncodedFrameFinisher::finishAnnexB(EncodedVideoFrame &frame)
 {
     const std::span<const uint8_t> data(frame.data);
     const std::vector<Nal> nals = splitNals(data);
     if (!startsWithStartCode(data, nals))
         return false;
 
-    bool hasIdr = false;
+    frame.keyframe = false;
     for (const Nal &nal : nals) {
-        const int type = nalType(data, nal);
-        hasIdr = hasIdr || type == NAL_IDR;
-        if (type == NAL_SPS)
-            sps.assign(data.begin() + nal.begin, data.begin() + nal.end);
-        if (type == NAL_PPS)
-            pps.assign(data.begin() + nal.begin, data.begin() + nal.end);
+        const NalKind kind = nalKind(codec, data, nal);
+        frame.keyframe = frame.keyframe || kind == NalKind::KeyPicture;
+        if (isParameterSet(kind))
+            parameterSets[static_cast<size_t>(kind)].assign(data.begin() + nal.begin, data.begin() + nal.end);
     }
-    frame.keyframe = hasIdr;
-    if (!hasIdr || (nals.size() > 2 && nalType(data, nals[0]) == NAL_SPS && nalType(data, nals[1]) == NAL_PPS))
+    if (!frame.keyframe)
         return true;
-    if (sps.empty() || pps.empty())
-        return false;
+
+    const std::span<const NalKind> opening = parameterSetKinds(codec);
+    bool opensWithParameterSets = nals.size() > opening.size();
+    for (size_t i = 0; opensWithParameterSets && i < opening.size(); i++)
+        opensWithParameterSets = nalKind(codec, data, nals[i]) == opening[i];
+    if (opensWithParameterSets)
+        return true;
 
     std::vector<uint8_t> ordered;
-    ordered.reserve(frame.data.size() + sps.size() + pps.size() + 2 * START_CODE.size());
-    appendNal(ordered, sps);
-    appendNal(ordered, pps);
+    ordered.reserve(frame.data.size() + 256);
+    for (NalKind kind : opening) {
+        const std::vector<uint8_t> &parameterSet = parameterSets[static_cast<size_t>(kind)];
+        if (parameterSet.empty())
+            return false;
+        appendNal(ordered, parameterSet);
+    }
     for (const Nal &nal : nals) {
-        const int type = nalType(data, nal);
-        if (type != NAL_SPS && type != NAL_PPS && type != NAL_ACCESS_UNIT_DELIMITER)
+        const NalKind kind = nalKind(codec, data, nal);
+        if (!isParameterSet(kind) && kind != NalKind::AccessUnitDelimiter)
             appendNal(ordered, data.subspan(nal.begin, nal.end - nal.begin));
     }
     frame.data = std::move(ordered);
     return true;
 }
 
-void VideoEncoder::rememberParameterSets(const uint8_t *data, size_t size)
+bool EncodedFrameFinisher::finishAv1(EncodedVideoFrame &frame)
 {
-    sps.clear();
-    pps.clear();
+    const std::span<const uint8_t> data(frame.data);
+    const std::vector<Obu> obus = splitObus(data);
+    const auto payloadOf = [&data](const Obu &obu) { return data.subspan(obu.payload, obu.end - obu.payload); };
+
+    bool everyOneSaysItsSize = !obus.empty();
+    bool hasSequenceHeader = false;
+    const Obu *picture = nullptr;
+    for (const Obu &obu : obus) {
+        everyOneSaysItsSize = everyOneSaysItsSize && obu.saysItsSize;
+        if (picture)
+            continue;
+        if (obu.type == OBU_SEQUENCE_HEADER) {
+            const std::span<const uint8_t> payload = payloadOf(obu);
+            sequenceHeader.assign(payload.begin(), payload.end());
+            hasSequenceHeader = true;
+        }
+        if (obu.type == OBU_FRAME || obu.type == OBU_FRAME_HEADER)
+            picture = &obu;
+    }
+    if (!picture)
+        return false;
+
+    frame.keyframe = isAv1KeyFrame(payloadOf(*picture), sequenceHeader);
+    const bool lacksSequenceHeader = frame.keyframe && !hasSequenceHeader;
+    if (everyOneSaysItsSize && !lacksSequenceHeader)
+        return true;
+    if (lacksSequenceHeader && sequenceHeader.empty())
+        return false;
+
+    std::vector<uint8_t> whole;
+    whole.reserve(frame.data.size() + sequenceHeader.size() + 16);
+    bool sequenceHeaderDue = lacksSequenceHeader;
+    for (const Obu &obu : obus) {
+        // A temporal delimiter, where there is one, stays in front of everything.
+        if (sequenceHeaderDue && obu.type != OBU_TEMPORAL_DELIMITER) {
+            const uint8_t header = OBU_SEQUENCE_HEADER << 3;
+            appendObu(whole, std::span<const uint8_t>(&header, 1), sequenceHeader);
+            sequenceHeaderDue = false;
+        }
+        appendObu(whole, data.subspan(obu.header, obu.headerSize), payloadOf(obu));
+    }
+    frame.data = std::move(whole);
+    return true;
+}
+
+void EncodedFrameFinisher::rememberParameterSets(const uint8_t *data, size_t size)
+{
     if (!data)
         return;
 
-    const std::span<const uint8_t> extradata(data, size);
+    std::span<const uint8_t> extradata(data, size);
+    if (codec == VideoCodec::AV1) {
+        if (extradata.size() > AV1_CONFIGURATION_SIZE && extradata[0] == AV1_CONFIGURATION_MARKER)
+            extradata = extradata.subspan(AV1_CONFIGURATION_SIZE);
+        for (const Obu &obu : splitObus(extradata)) {
+            if (obu.type == OBU_SEQUENCE_HEADER)
+                sequenceHeader.assign(extradata.begin() + obu.payload, extradata.begin() + obu.end);
+        }
+        return;
+    }
+
     const std::vector<Nal> nals = splitNals(extradata);
     if (!startsWithStartCode(extradata, nals))
         return;
     for (const Nal &nal : nals) {
-        if (nalType(extradata, nal) == NAL_SPS)
-            sps.assign(extradata.begin() + nal.begin, extradata.begin() + nal.end);
-        if (nalType(extradata, nal) == NAL_PPS)
-            pps.assign(extradata.begin() + nal.begin, extradata.begin() + nal.end);
+        const NalKind kind = nalKind(codec, extradata, nal);
+        if (isParameterSet(kind))
+            parameterSets[static_cast<size_t>(kind)].assign(extradata.begin() + nal.begin, extradata.begin() + nal.end);
     }
 }
 
-// The official client gives its encoders a buffer of about one frame. libvpx is the exception:
-// it drops pictures whenever its buffer runs low, and gets the second libwebrtc gives it.
+// The official client gives its encoders a buffer of about one frame. libvpx drops pictures
+// whenever its buffer runs low, and gets the second libwebrtc gives it. Media Foundation's
+// encoders keep to the buffer they are given by leaving pictures out, which they cannot be
+// told not to: a Radeon's H265 one then shows nothing new for a second and more after a key
+// frame of a screen full of text. Zero leaves them the buffer they choose themselves, with
+// which they hold the rate as well and leave nothing out.
 int VideoEncoder::bufferBits() const
 {
     if (candidate->family == EncoderFamily::Vpx)
         return settings.bitrate;
+    if (candidate->family == EncoderFamily::MediaFoundation)
+        return 0;
     return settings.bitrate / std::max(1, settings.framerate);
 }
 
@@ -536,11 +880,26 @@ AVCodecContext *VideoEncoder::configured(const AVFrame *frame, int h264Profile) 
     made->gop_size = INT_MAX;
     made->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
+    // The official client's profiles: High, Main and Main, all of eight bits and 4:2:0.
     void *options = made->priv_data;
-    if (candidate->codec == VideoCodec::H264) {
+    switch (candidate->codec) {
+    case VideoCodec::H264:
         made->profile = h264Profile;
         av_opt_set(options, "profile", h264Profile == H264_PROFILE_HIGH ? "high" : "main", 0);
-        made->qmax = H264_MAX_QP;
+        made->qmax = H26X_MAX_QP;
+        break;
+    case VideoCodec::H265:
+        made->profile = H265_PROFILE_MAIN;
+        av_opt_set(options, "profile", "main", 0);
+        made->qmax = H26X_MAX_QP;
+        break;
+    case VideoCodec::AV1:
+        made->profile = AV1_PROFILE_MAIN;
+        av_opt_set(options, "profile", "main", 0);
+        made->qmax = AV1_MAX_QUANTIZER_INDEX;
+        break;
+    default:
+        break;
     }
 
     // An option an encoder does not have, in this ffmpeg or at all, is left unset.
@@ -548,9 +907,28 @@ AVCodecContext *VideoEncoder::configured(const AVFrame *frame, int h264Profile) 
     case EncoderFamily::Amf:
         av_opt_set(options, "usage", "lowlatency", 0);
         av_opt_set(options, "rc", "cbr", 0);
-        av_opt_set_int(options, "bf", 0, 0);
         av_opt_set_int(options, "async_depth", 1, 0);
         av_opt_set_int(options, "forced_idr", 1, 0);
+        // The usage's own preset is the fastest one. This one took no longer over a picture
+        // where it was measured, and left H264 and H265 a decibel and more closer to what
+        // went in. AV1 came out the same with either.
+        av_opt_set(options, "quality", "balanced", 0);
+        // The usage also has rate control leave out a picture that the buffer has no room
+        // for, as a frame that says nothing changed. H265 does that for a second and more
+        // after a key frame of a screen full of text. H264 calls the option by another name.
+        av_opt_set_int(options, "skip_frame", 0, 0);
+        av_opt_set_int(options, "frame_skipping", 0, 0);
+        if (candidate->codec == VideoCodec::AV1) {
+            av_opt_set(options, "header_insertion_mode", "frame", 0);
+        } else {
+            av_opt_set(options, "header_insertion_mode", "idr", 0);
+            // AV1 has no B-frames unless asked, and warns on every opening when it is told so
+            // on a card that has none at all.
+            av_opt_set_int(options, "bf", 0, 0);
+            // The encoder's own low latency mode, which took up to a third off the time a
+            // picture takes. AV1 has four modes under this name, none of which changed anything.
+            av_opt_set_int(options, "latency", 1, 0);
+        }
         // Its count of frames between key frames, where none is zero.
         made->gop_size = 0;
         break;
@@ -563,7 +941,7 @@ AVCodecContext *VideoEncoder::configured(const AVFrame *frame, int h264Profile) 
         av_opt_set_int(options, "forced-idr", 1, 0);
         break;
     case EncoderFamily::Qsv:
-        av_opt_set(options, "scenario", "displayremoting", 0);
+        av_opt_set(options, "scenario", settings.content == Content::Camera ? "videoconference" : "displayremoting", 0);
         av_opt_set_int(options, "async_depth", 1, 0);
         av_opt_set_int(options, "forced_idr", 1, 0);
         // It keeps the count in sixteen bits.
@@ -624,7 +1002,10 @@ bool VideoEncoder::open(const AVFrame *frame)
     if (!context)
         return false;
 
-    rememberParameterSets(context->extradata, static_cast<size_t>(context->extradata_size));
+    if (candidate->family == EncoderFamily::MediaFoundation && frame->colorspace != AVCOL_SPC_UNSPECIFIED)
+        openColourDescriber(frame);
+    finisher = EncodedFrameFinisher(candidate->codec);
+    finisher.rememberParameterSets(context->extradata, static_cast<size_t>(context->extradata_size));
     awaited = 0;
 
     counters.encoderName = QString::fromLatin1(candidate->label);
@@ -636,6 +1017,49 @@ bool VideoEncoder::open(const AVFrame *frame)
     counters.opened++;
     qCInfo(LogVideo) << "Encoding" << Discord::Voice::videoCodecName(candidate->codec) << "with" << counters.encoderName << "at" << frame->width << "x" << frame->height << settings.bitrate / 1000 << "kbps";
     return true;
+}
+
+// ffmpeg has no way to tell Media Foundation what colours the pictures are in, and a Radeon's
+// encoders then call whatever they are given BT.709. The description is written into such a
+// stream afterwards, by the filter ffmpeg has for rewriting it.
+void VideoEncoder::openColourDescriber(const AVFrame *frame)
+{
+    const bool av1 = candidate->codec == VideoCodec::AV1;
+    const AVBitStreamFilter *filter = av_bsf_get_by_name(av1 ? "av1_metadata" : candidate->codec == VideoCodec::H265 ? "hevc_metadata"
+                                                                                                                     : "h264_metadata");
+    if (!filter || av_bsf_alloc(filter, &colourDescriber) < 0)
+        return;
+
+    void *options = colourDescriber->priv_data;
+    av_opt_set_int(options, "matrix_coefficients", frame->colorspace, 0);
+    if (frame->color_primaries != AVCOL_PRI_UNSPECIFIED)
+        av_opt_set_int(options, av1 ? "color_primaries" : "colour_primaries", frame->color_primaries, 0);
+    if (frame->color_trc != AVCOL_TRC_UNSPECIFIED)
+        av_opt_set_int(options, "transfer_characteristics", frame->color_trc, 0);
+    if (frame->color_range != AVCOL_RANGE_UNSPECIFIED)
+        av_opt_set_int(options, av1 ? "color_range" : "video_full_range_flag", frame->color_range == AVCOL_RANGE_JPEG ? 1 : 0, 0);
+
+    // The filter is given the frames only. Media Foundation's extradata for H265 is an SPS
+    // without the VPS it refers to, which the filter will not start on.
+    colourDescriber->time_base_in = context->time_base;
+    colourDescriber->par_in->codec_type = AVMEDIA_TYPE_VIDEO;
+    colourDescriber->par_in->codec_id = context->codec_id;
+    if (av_bsf_init(colourDescriber) < 0)
+        av_bsf_free(&colourDescriber);
+}
+
+// A frame the filter cannot read goes out as the encoder made it, and so do the ones after it.
+void VideoEncoder::describeColours()
+{
+    if (av_packet_ref(asEncoded, packet) < 0)
+        return;
+    if (av_bsf_send_packet(colourDescriber, packet) < 0 || av_bsf_receive_packet(colourDescriber, packet) < 0) {
+        qCWarning(LogVideo) << "The colours of" << candidate->label << "frames could not be written into them";
+        av_packet_unref(packet);
+        av_packet_move_ref(packet, asEncoded);
+        av_bsf_free(&colourDescriber);
+    }
+    av_packet_unref(asEncoded);
 }
 
 // An encoder that only takes pictures from its own kind of device gets them copied there.
@@ -673,6 +1097,7 @@ AVFrame *VideoEncoder::uploadedCopy(const AVFrame *frame)
 void VideoEncoder::close()
 {
     avcodec_free_context(&context);
+    av_bsf_free(&colourDescriber);
     av_buffer_unref(&uploadFrames);
     framesSinceOpen = 0;
 }

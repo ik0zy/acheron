@@ -1,6 +1,7 @@
 #include "Core/Video/ScreenCapture.hpp"
 
 #include "Core/Logging.hpp"
+#include "Core/Video/CardScaler.hpp"
 
 #include <QByteArray>
 #include <QCoreApplication>
@@ -131,6 +132,9 @@ constexpr QSize SMALLEST_WINDOW_PICTURE(160, 120);
 // How far a window may reach past the edge of its screen and still be cut out of it, as the
 // official client has it.
 constexpr int REACH_PAST_SCREEN = 15;
+// How long after a window was last seen hidden its pictures are read back and looked at. The
+// empty ones came within a few hundredths of a second of the window showing again.
+constexpr int EMPTY_PICTURES_FOR_MS = 500;
 constexpr int THUMBNAIL_DRAWING_LIMIT_MS = 500;
 
 // DwmGetWindowAttribute's DWMWA_EXTENDED_FRAME_BOUNDS and DWMWA_CLOAKED, and PrintWindow's
@@ -139,9 +143,6 @@ constexpr DWORD FRAME_BOUNDS_ATTRIBUTE = 9;
 constexpr DWORD CLOAKED_ATTRIBUTE = 14;
 constexpr UINT RENDER_FULL_CONTENT = 2;
 
-// Whether scale_d3d11 was found not to work on this machine. It asks the card for an array of
-// NV12 render targets, which a Radeon RX 7800 XT for one refuses to make.
-std::atomic<bool> cardScalingRuledOut{ false };
 // Set when graphics capture turned out to be missing something only a capture finds out.
 std::atomic<bool> graphicsCaptureRuledOut{ false };
 
@@ -667,6 +668,35 @@ bool prepareBgra(AVFrame *frame, const QSize &size)
     return av_frame_get_buffer(frame, 0) >= 0;
 }
 
+bool showsItself(HWND window)
+{
+    return IsWindow(window) && IsWindowVisible(window) && !IsIconic(window);
+}
+
+// What is captured of a window whose inside measures `client`, before any scaling.
+QSize windowPictureSize(const QSize &client)
+{
+    return evenSize(client).expandedTo(SMALLEST_WINDOW_PICTURE);
+}
+
+// Whether a BGRA picture on the card is transparent wherever it is looked at, which no picture
+// of a window that has drawn itself is. `scratch` is what it is read back into.
+bool isEmptyPicture(const AVFrame *onCard, AVFrame *scratch)
+{
+    constexpr int POINTS_ACROSS = 4;
+    if (!prepareBgra(scratch, QSize(onCard->width, onCard->height)) || av_hwframe_transfer_data(scratch, onCard, 0) < 0)
+        return false;
+
+    for (int row = 0; row < POINTS_ACROSS; row++) {
+        const uint8_t *line = scratch->data[0] + (scratch->height * (2 * row + 1) / (2 * POINTS_ACROSS)) * scratch->linesize[0];
+        for (int column = 0; column < POINTS_ACROSS; column++) {
+            if (line[(scratch->width * (2 * column + 1) / (2 * POINTS_ACROSS)) * 4 + 3] != 0)
+                return false;
+        }
+    }
+    return true;
+}
+
 // The bitmap from its top left corner, with black where it does not reach.
 void copyTopLeft(const Bitmap &from, AVFrame *bgra)
 {
@@ -933,6 +963,26 @@ UINT sliceOf(const AVFrame *card)
     return static_cast<UINT>(reinterpret_cast<quintptr>(card->data[1]));
 }
 
+QRect wholeOf(const AVFrame *picture)
+{
+    return QRect(0, 0, picture->width, picture->height);
+}
+
+// Where `part` of a picture lies once the picture is scaled from one size to another.
+QRect scaledPart(const QRect &part, const QSize &from, const QSize &to)
+{
+    const QPoint corner(part.left() * to.width() / from.width(), part.top() * to.height() / from.height());
+    const QPoint opposite((part.left() + part.width()) * to.width() / from.width(), (part.top() + part.height()) * to.height() / from.height());
+    return QRect(corner, QSize(opposite.x() - corner.x(), opposite.y() - corner.y()));
+}
+
+// The description the capture filters give their pictures is that of the screen's own RGB.
+void markColours(AVFrame *picture, bool bt601)
+{
+    picture->colorspace = bt601 ? AVCOL_SPC_SMPTE170M : AVCOL_SPC_BT709;
+    picture->color_range = AVCOL_RANGE_MPEG;
+}
+
 void clearToBlack(AVFrame *card)
 {
     AVD3D11VADeviceContext *device = deviceOf(card);
@@ -956,7 +1006,27 @@ void copyOnCard(const AVFrame *from, const QRect &area, AVFrame *to, const QPoin
     device->unlock(device->lock_ctx);
 }
 
+// `area` of one picture on the graphics card as a picture of its own from `pool`: at `at` of
+// it, with black wherever the area does not reach.
+bool cutOntoCard(const AVFrame *from, const QRect &area, AVBufferRef *pool, const QPoint &at, AVFrame *to)
+{
+    if (av_hwframe_get_buffer(pool, to, 0) < 0)
+        return false;
+    if (area.size() != QSize(to->width, to->height))
+        clearToBlack(to);
+    copyOnCard(from, area, to, at);
+    return true;
+}
+
 } // namespace
+
+// The part of its screen's picture that shows a window, and where in the window's own picture
+// that part belongs. They differ in size only where the window reaches past its screen.
+struct ScreenCapture::CutOut
+{
+    QRect onScreen;
+    QRect inPicture;
+};
 
 struct ScreenCapture::Backends
 {
@@ -977,6 +1047,8 @@ struct ScreenCapture::Backends
     std::shared_ptr<GraphicsCaptureSession> session;
     // Not before this is a capture made again that ended by itself.
     Clock::time_point remakeAt;
+    // Until then the window was hidden a moment ago, and a picture of it may have nothing in it.
+    Clock::time_point emptyPicturesUntil;
 
     // For a window by duplication: the screen it is on, the card that screen is on, and the
     // pictures of the window on that card, which both ways of capturing it fill.
@@ -995,6 +1067,7 @@ struct ScreenCapture::Backends
 
     PictureConverter converter;
     PictureConverter rescaler;
+    CardScaler scaler;
     FramePointer captured{ av_frame_alloc() };
     FramePointer wholeScreen{ av_frame_alloc() };
     FramePointer bgra{ av_frame_alloc() };
@@ -1078,6 +1151,17 @@ void restoreIfMinimised(const CaptureSource &window)
         ShowWindowAsync(handle, SW_RESTORE);
 }
 
+QSize encodeSizeOf(const CaptureSource &source, int maxHeight)
+{
+    if (source.kind == CaptureSource::Kind::Screen)
+        return source.geometry.isEmpty() ? QSize() : encodeSizeFor(evenSize(source.geometry.size()), maxHeight);
+
+    const UnscaledCoordinates unscaled;
+    const HWND window = windowOf(source.id);
+    const QSize inside = window && showsItself(window) ? clientOnScreen(window).size() : QSize();
+    return inside.isEmpty() ? QSize() : encodeSizeFor(windowPictureSize(inside), maxHeight);
+}
+
 ScreenCapture::ScreenCapture() : backends(std::make_unique<Backends>()) {}
 
 ScreenCapture::~ScreenCapture()
@@ -1093,6 +1177,7 @@ void ScreenCapture::configure(const Request &wanted)
     retryAt = {};
     closed = false;
     failed = false;
+    cardScalingFailed = false;
     failureText.clear();
 
     backends = std::make_unique<Backends>();
@@ -1168,6 +1253,7 @@ ScreenCapture::Status ScreenCapture::watchWindow()
             state.session.reset();
         dropDuplication();
         state.clientSize = QSize();
+        state.emptyPicturesUntil = Clock::now() + std::chrono::milliseconds(EMPTY_PICTURES_FOR_MS);
         failingSince.reset();
         std::this_thread::sleep_for(std::chrono::milliseconds(STALLED_WAIT_MS));
         return Status::Hidden;
@@ -1178,7 +1264,7 @@ ScreenCapture::Status ScreenCapture::watchWindow()
         state.clientSize = client.size();
         state.sizeChangedAt = now;
     }
-    const QSize wanted = evenSize(client.size()).expandedTo(SMALLEST_WINDOW_PICTURE);
+    const QSize wanted = windowPictureSize(client.size());
     const bool held = now - state.sizeChangedAt >= std::chrono::milliseconds(RESIZE_SETTLE_MS);
     if (wanted != state.pictureSize && (state.pictureSize.isEmpty() || held)) {
         state.pictureSize = wanted;
@@ -1190,15 +1276,28 @@ ScreenCapture::Status ScreenCapture::watchWindow()
     return Status::Frame;
 }
 
-void ScreenCapture::delivered(AVFrame *picture, bool bt601)
+void ScreenCapture::delivered()
 {
-    picturesFromGraph++;
     everDelivered = true;
     failingSince.reset();
+}
 
-    // The scaling filters hand on the description of the source's own RGB picture.
-    picture->colorspace = bt601 ? AVCOL_SPC_SMPTE170M : AVCOL_SPC_BT709;
-    picture->color_range = AVCOL_RANGE_MPEG;
+// Whether pictures that have to be scaled, or converted for an encoder that takes none of the
+// screen's own, stay on the card for it.
+bool ScreenCapture::scalesOnCard() const
+{
+    return request.keepOnCard && !cardScalingFailed && CardScaler::usable();
+}
+
+// `area` of a picture on the card made `placed` of the one that is sent, which stays on the
+// card. False when the card would not, after which this capture scales in software.
+bool ScreenCapture::scaleOnCard(const AVFrame *from, const QRect &area, const QSize &size, const QRect &placed, AVFrame *into)
+{
+    const CardScaler::Output output = { size, request.bt601Only || size.height() < HD_HEIGHT, request.rgbOnCard };
+    if (backends->scaler.scale(from, area, output, placed, into))
+        return true;
+    cardScalingFailed = true;
+    return false;
 }
 
 ScreenCapture::Status ScreenCapture::readDuplication(AVFrame *into)
@@ -1211,20 +1310,26 @@ ScreenCapture::Status ScreenCapture::readDuplication(AVFrame *into)
             return afterFailure(built);
     }
 
-    const int got = av_buffersink_get_frame(sink, into);
+    AVFrame *captured = graphScalesOnCard ? backends->captured.get() : into;
+    const int got = av_buffersink_get_frame(sink, captured);
     if (got == AVERROR(EAGAIN))
         return Status::NoFrame;
     if (got < 0)
         return afterFailure(got);
 
-    if (cardScaling == CardScaling::Suspected) {
-        qCInfo(LogVideo) << "Scaling the screen on the graphics card failed; reading it back and scaling it in software";
-        cardScaling = CardScaling::Untried;
-        cardScalingRuledOut = true;
-    } else if (graphScalesOnCard) {
-        cardScaling = CardScaling::Works;
+    if (graphScalesOnCard) {
+        const QSize size = encodeSizeFor(QSize(captured->width, captured->height), request.maxHeight);
+        const bool scaled = scaleOnCard(captured, wholeOf(captured), size, QRect(QPoint(0, 0), size), into);
+        av_frame_unref(captured);
+        if (!scaled) {
+            // The next read makes a capture that scales in software.
+            dropDuplication();
+            return Status::NoFrame;
+        }
+    } else {
+        markColours(into, graphIsBt601);
     }
-    delivered(into, graphIsBt601);
+    delivered();
     return Status::Frame;
 }
 
@@ -1261,13 +1366,26 @@ ScreenCapture::Status ScreenCapture::readGraphicsCapture(AVFrame *into)
     if (taken == GraphicsCaptureSession::Taken::Nothing)
         return Status::NoFrame;
     state.pictureDue = std::max(state.pictureDue + interval, Clock::now() + interval / 2);
+    // Graphics capture hands over a picture with nothing in it, transparent all over, as a
+    // window is hidden or closed, and another as it is shown, before the window has drawn
+    // itself. Sent on, it is black for as long as the window stays away.
+    if (state.window && (!showsItself(state.window) || (Clock::now() < state.emptyPicturesUntil && isEmptyPicture(state.captured.get(), state.bgra.get())))) {
+        av_frame_unref(state.captured.get());
+        return Status::NoFrame;
+    }
 
     AVFrame *captured = state.captured.get();
     const QSize ownSize(captured->width, captured->height);
     const QSize size = encodeSizeFor(ownSize, request.maxHeight);
     if (request.keepOnCard && request.rgbOnCard && size == ownSize) {
         av_frame_move_ref(into, captured);
-        delivered(into, false);
+        markColours(into, false);
+        delivered();
+        return Status::Frame;
+    }
+    if (scalesOnCard() && scaleOnCard(captured, wholeOf(captured), size, QRect(QPoint(0, 0), size), into)) {
+        av_frame_unref(captured);
+        delivered();
         return Status::Frame;
     }
 
@@ -1278,7 +1396,8 @@ ScreenCapture::Status ScreenCapture::readGraphicsCapture(AVFrame *into)
         converted = state.converter.convert(state.bgra.get(), size, request.softwareFormat, bt601, into);
     if (converted < 0)
         return afterFailure(converted);
-    delivered(into, bt601);
+    markColours(into, bt601);
+    delivered();
     return Status::Frame;
 }
 
@@ -1295,27 +1414,41 @@ ScreenCapture::Status ScreenCapture::readWindowByDuplication(AVFrame *into)
     const QRect client = clientOnScreen(state.window);
     const bool screenDuplicated = duplicateScreenOf(client);
     const QSize size = encodeSizeFor(state.pictureSize, request.maxHeight);
-    const bool staysOnCard = state.pool && request.keepOnCard && request.rgbOnCard && size == state.pictureSize;
-    const bool bt601 = !staysOnCard && (request.bt601Only || size.height() < HD_HEIGHT);
+    const bool asCaptured = state.pool && request.keepOnCard && request.rgbOnCard && size == state.pictureSize;
+    const bool scaledOnCard = state.pool && !asCaptured && scalesOnCard();
+    const bool staysOnCard = asCaptured || scaledOnCard;
 
+    AVFrame *whole = state.wholeScreen.get();
     AVFrame *card = state.captured.get();
     AVFrame *bgra = state.bgra.get();
-    av_frame_unref(card);
+    CutOut cut;
     state.drawnBecause = "its screen cannot be duplicated";
-    const bool cutOut = screenDuplicated && cutOutOfScreen(client, card);
+    const bool cutOut = screenDuplicated && cutOutOfScreen(client, &cut);
     if (!cutOut && !drawnByItself(client))
         return Status::NoFrame;
 
     bool ready = true;
-    if (cutOut && !staysOnCard)
-        ready = prepareBgra(bgra, state.pictureSize) && av_hwframe_transfer_data(bgra, card, 0) >= 0;
-    else if (!cutOut && staysOnCard)
-        ready = av_hwframe_get_buffer(state.pool, card, 0) >= 0 && av_hwframe_transfer_data(card, bgra, 0) >= 0;
-    if (ready && staysOnCard)
-        av_frame_move_ref(into, card);
-    else if (ready)
-        ready = state.converter.convert(bgra, size, request.softwareFormat, bt601, into) >= 0;
+    if (cutOut && scaledOnCard) {
+        ready = scaleOnCard(whole, cut.onScreen, size, scaledPart(cut.inPicture, state.pictureSize, size), into);
+    } else {
+        // The window's own picture first: on the card if that is where it stays, in memory if not.
+        if (cutOut)
+            ready = cutOntoCard(whole, cut.onScreen, state.pool, cut.inPicture.topLeft(), card) && (staysOnCard || (prepareBgra(bgra, state.pictureSize) && av_hwframe_transfer_data(bgra, card, 0) >= 0));
+        else if (staysOnCard)
+            ready = av_hwframe_get_buffer(state.pool, card, 0) >= 0 && av_hwframe_transfer_data(card, bgra, 0) >= 0;
+
+        const bool bt601 = !staysOnCard && (request.bt601Only || size.height() < HD_HEIGHT);
+        if (ready && scaledOnCard)
+            ready = scaleOnCard(card, wholeOf(card), size, QRect(QPoint(0, 0), size), into);
+        else if (ready && staysOnCard)
+            av_frame_move_ref(into, card);
+        else if (ready)
+            ready = state.converter.convert(bgra, size, request.softwareFormat, bt601, into) >= 0;
+        if (ready && !scaledOnCard)
+            markColours(into, bt601);
+    }
     av_frame_unref(card);
+    av_frame_unref(whole);
     if (!ready)
         return Status::NoFrame;
 
@@ -1324,7 +1457,7 @@ ScreenCapture::Status ScreenCapture::readWindowByDuplication(AVFrame *into)
         qCInfo(LogVideo) << "Capturing" << request.sourceId << "as" << size.width() << "x" << size.height() << (staysOnCard ? "on the graphics card," : "scaled in software,") << (cutOut ? "cut out of its screen" : "drawn by itself, as") << (cutOut ? "" : state.drawnBecause);
     }
     (cutOut ? state.cutOutPictures : state.drawnPictures)++;
-    delivered(into, bt601);
+    delivered();
     return Status::Frame;
 }
 
@@ -1378,9 +1511,10 @@ bool ScreenCapture::duplicateScreenOf(const QRect &client)
     return built >= 0;
 }
 
-// The window's picture out of the screen's, onto `card`. False when the screen does not show
-// the window by itself, or not where it was when the screen was read.
-bool ScreenCapture::cutOutOfScreen(const QRect &client, AVFrame *card)
+// Where the window's picture is in the screen's, which is then the picture read last. False
+// when the screen does not show the window by itself, or not where it was when the screen was
+// read.
+bool ScreenCapture::cutOutOfScreen(const QRect &client, CutOut *cut)
 {
     Backends &state = *backends;
     // While its size is changing, and where it is smaller than what is sent, the window does
@@ -1415,14 +1549,12 @@ bool ScreenCapture::cutOutOfScreen(const QRect &client, AVFrame *card)
     // The read waits for the screen, and a window moved or covered meanwhile has left its
     // place there to something else.
     state.drawnBecause = "it moved or was covered while its screen was read";
-    const bool cut = clientOnScreen(state.window) == client && !isCoveredOnScreen(state.window, client) && av_hwframe_get_buffer(state.pool, card, 0) >= 0;
-    if (cut) {
-        if (inPicture.size() != state.pictureSize)
-            clearToBlack(card);
-        copyOnCard(whole, inPicture.translated(client.topLeft() - screen.topLeft()), card, inPicture.topLeft());
+    if (clientOnScreen(state.window) != client || isCoveredOnScreen(state.window, client)) {
+        av_frame_unref(whole);
+        return false;
     }
-    av_frame_unref(whole);
-    return cut;
+    *cut = { inPicture.translated(client.topLeft() - screen.topLeft()), inPicture };
+    return true;
 }
 
 // The window's picture as the window draws it, into the BGRA picture kept for it. False when
@@ -1459,15 +1591,7 @@ bool ScreenCapture::drawnByItself(const QRect &client)
 // has to be made again, and until Windows gives the source back that fails.
 ScreenCapture::Status ScreenCapture::afterFailure(int error)
 {
-    const bool scalingSuspected = graphScalesOnCard && picturesFromGraph == 0 && cardScaling == CardScaling::Untried;
     tearDown();
-    if (scalingSuspected) {
-        cardScaling = CardScaling::Suspected;
-        return Status::Stalled;
-    }
-    // The capture without it failed as well, so the fault lies elsewhere.
-    if (cardScaling == CardScaling::Suspected)
-        cardScaling = CardScaling::Untried;
 
     const auto now = Clock::now();
     // Access is denied for as long as the secure desktop shows, which is as long as the
@@ -1489,7 +1613,6 @@ ScreenCapture::Status ScreenCapture::afterFailure(int error)
 int ScreenCapture::buildDuplication()
 {
     graphScalesOnCard = false;
-    picturesFromGraph = 0;
     const std::vector<Monitor> monitors = attachedMonitors();
     const Monitor *monitor = numberedMonitor(monitors, request.sourceId);
     if (!monitor)
@@ -1504,37 +1627,27 @@ int ScreenCapture::buildDuplication()
     const QSize ownSize = monitor->onItsSide ? monitor->geometry.size().transposed() : monitor->geometry.size();
     const QSize size = encodeSizeFor(ownSize, request.maxHeight);
     const bool asCaptured = request.keepOnCard && request.rgbOnCard && size == ownSize;
-    graphScalesOnCard = !asCaptured && !cardScalingRuledOut && cardScaling != CardScaling::Suspected && avfilter_get_by_name("scale_d3d11");
-    // The card's video processor converts to BT.601 unless told otherwise, and scale_d3d11
-    // does not tell it. An encoder converting for itself is asked for BT.709 at any size:
-    // AMF makes something else of a request for BT.601.
-    graphIsBt601 = !asCaptured && (graphScalesOnCard || request.bt601Only || size.height() < HD_HEIGHT);
+    graphScalesOnCard = !asCaptured && scalesOnCard();
+    // An encoder converting for itself is asked for BT.709 at any size: AMF makes something
+    // else of a request for BT.601.
+    graphIsBt601 = !asCaptured && (request.bt601Only || size.height() < HD_HEIGHT);
 
     QByteArray chain = "ddagrab=output_idx=" + QByteArray::number(monitor->output) + ":framerate=" + QByteArray::number(request.framerate);
-    if (asCaptured) {
-        // Nothing to scale, and the encoder converts.
-    } else if (graphScalesOnCard) {
-        chain += ",scale_d3d11=width=" + QByteArray::number(size.width()) + ":height=" + QByteArray::number(size.height()) + ":format=nv12";
-        if (!request.keepOnCard)
-            chain += ",hwdownload,format=nv12,format=" + QByteArray(av_get_pix_fmt_name(static_cast<AVPixelFormat>(request.softwareFormat)));
-    } else {
+    if (!asCaptured && !graphScalesOnCard)
         chain += ",hwdownload,format=bgra," + softwareScaling(size, graphIsBt601, request.softwareFormat);
-    }
 
     result = assemble(chain, device, &graph, &sink);
     av_buffer_unref(&device);
 
     if (result >= 0)
-        qCInfo(LogVideo) << "Capturing" << request.sourceId << "as" << size.width() << "x" << size.height() << (asCaptured ? "kept on the graphics card as it is" : !graphScalesOnCard ? "read back and scaled in software"
-                                                                                                                                                            : request.keepOnCard       ? "scaled and kept on the graphics card"
-                                                                                                                                                                                       : "scaled on the graphics card and read back");
+        qCInfo(LogVideo) << "Capturing" << request.sourceId << "as" << size.width() << "x" << size.height() << (asCaptured ? "kept on the graphics card as it is" : graphScalesOnCard ? "scaled on the graphics card and kept there"
+                                                                                                                                                                                      : "read back and scaled in software");
     return result;
 }
 
 int ScreenCapture::buildGraphicsCapture()
 {
     Backends &state = *backends;
-    picturesFromGraph = 0;
 
     QSize ownSize = state.pictureSize;
     QByteArray source;
@@ -1551,14 +1664,26 @@ int ScreenCapture::buildGraphicsCapture()
         adapter = QByteArray::number(monitor->adapter);
     }
 
+    // Graphics capture scales by itself, into BGRA pictures an encoder has to take as they are.
+    // It stretches whatever it has captured over the whole picture, which is right for a source
+    // that fills its picture, and a window smaller than the smallest picture does not.
+    const QSize size = encodeSizeFor(ownSize, request.maxHeight);
+    const bool asCaptured = request.keepOnCard && request.rgbOnCard && size == ownSize;
+    const bool fillsItsPicture = !state.window || evenSize(state.clientSize) == ownSize;
+    const bool scalesByItself = request.keepOnCard && request.rgbOnCard && size != ownSize && fillsItsPicture;
+    const QSize captured = scalesByItself ? size : ownSize;
+
     // The size is given because the filter otherwise fixes it before the first picture, from
     // what Windows says the window measures, which is not always what it then hands over.
-    const QByteArray chain = "gfxcapture=max_framerate=" + QByteArray::number(request.framerate) + source + ":width=" + QByteArray::number(ownSize.width()) + ":height=" + QByteArray::number(ownSize.height());
+    QByteArray chain = "gfxcapture=max_framerate=" + QByteArray::number(request.framerate) + source + ":width=" + QByteArray::number(captured.width()) + ":height=" + QByteArray::number(captured.height());
+    if (scalesByItself)
+        chain += ":resize_mode=scale";
     int result = 0;
     state.session = GraphicsCaptureSession::start(chain, adapter, &result);
     if (result >= 0) {
-        const QSize size = encodeSizeFor(ownSize, request.maxHeight);
-        qCInfo(LogVideo) << "Capturing" << request.sourceId << "by graphics capture as" << size.width() << "x" << size.height() << (request.keepOnCard && request.rgbOnCard && size == ownSize ? "kept on the graphics card as it is" : "read back and scaled in software");
+        qCInfo(LogVideo) << "Capturing" << request.sourceId << "by graphics capture as" << size.width() << "x" << size.height() << (asCaptured ? "kept on the graphics card as it is" : scalesByItself ? "scaled by graphics capture and kept on the graphics card"
+                                                                                                                                                                                : scalesOnCard()       ? "scaled on the graphics card and kept there"
+                                                                                                                                                                                                       : "read back and scaled in software");
         return result;
     }
 
@@ -1628,6 +1753,11 @@ QImage captureThumbnail(const CaptureSource &, const QSize &)
 
 void restoreIfMinimised(const CaptureSource &)
 {
+}
+
+QSize encodeSizeOf(const CaptureSource &, int)
+{
+    return {};
 }
 
 ScreenCapture::ScreenCapture() = default;

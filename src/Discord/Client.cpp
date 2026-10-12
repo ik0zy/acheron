@@ -1380,9 +1380,9 @@ qint64 Client::getMaxUploadSize(Snowflake channelId) const
     return qMax(userLimit, guildLimit);
 }
 
-void Client::sendVoiceStateUpdate(Snowflake guildId, Snowflake channelId, bool selfMute, bool selfDeaf)
+void Client::sendVoiceStateUpdate(Snowflake guildId, Snowflake channelId, bool selfMute, bool selfDeaf, bool selfVideo)
 {
-    gateway->sendVoiceStateUpdate(guildId, channelId, selfMute, selfDeaf);
+    gateway->sendVoiceStateUpdate(guildId, channelId, selfMute, selfDeaf, selfVideo);
 }
 
 void Client::sendCallConnect(Snowflake channelId)

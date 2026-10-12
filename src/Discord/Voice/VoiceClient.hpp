@@ -87,6 +87,11 @@ struct VideoSendStats
     int receivers = -1;
 };
 
+// What a voice connection's IDENTIFY declares for the account's camera. The official client
+// adds a second layer, `rid` "50" at quality 50, while its simulcast switch is on; this client
+// sends one layer, as the official client does with the switch off.
+[[nodiscard]] QList<StreamDescription> cameraStreams();
+
 class VoiceClient : public QObject
 {
     Q_OBJECT
@@ -152,6 +157,12 @@ public:
 
     // Sending video. Like everything else here, these are called on this client's thread.
     //
+    // The codecs video can be sent with are these and no others from now on: encoders turned
+    // out to exist after the connection was made, or one is not to be used for what is being
+    // sent. The server is told in SELECT_PROTOCOL when that is still to come, and otherwise in
+    // a session update of this client's own, which it answers with the codec to use. Until it
+    // has, a codec that was withdrawn while in use leaves nothing to send with.
+    void offerVideoEncoding(const QList<VideoCodec> &encodable);
     // The codec the server has this client send with: one of those offered with `encode` set.
     // Unknown until the session is described.
     [[nodiscard]] VideoCodec videoSendCodec() const;
@@ -162,9 +173,11 @@ public:
     void describeVideo(const LocalVideoDescription &description);
     // Announces that the video is off and forgets what was queued.
     void stopVideo();
-    // One whole encoded frame in videoSendCodec(): Annex B for H264, with SPS and PPS in front
-    // of every key frame. `rtpTimestamp` is at 90 kHz from any origin. Frames are dropped while
-    // video is not started, and while end-to-end encryption has no key to send them under.
+    // One whole encoded frame in videoSendCodec(): Annex B for H264 and H265, with the parameter
+    // sets in front of every key frame, and for AV1 one temporal unit of OBUs that each have
+    // their size field, a key frame's opening with its sequence header. `keyframe` is taken at
+    // its word. `rtpTimestamp` is at 90 kHz from any origin. Frames are dropped while video is
+    // not started, and while end-to-end encryption has no key to send them under.
     void sendVideoFrame(const EncodedVideoFrame &frame);
 
 signals:
@@ -256,6 +269,8 @@ private:
 
     void takeLocalVideoStreams(const VoiceReady &ready);
     [[nodiscard]] quint32 localVideoSsrc() const;
+    [[nodiscard]] QList<Codec> offeredCodecs() const;
+    void sendOfferedCodecs();
     void setVideoSendCodec(const QString &name);
     // Points the sender at the codec in use, making it first if need be. False when video
     // cannot be sent with that codec.
@@ -350,6 +365,10 @@ private:
     QList<StreamDescription> localVideoStreams;
     int localVideoLayer = 0;
     VideoCodec sendCodec = VideoCodec::Unknown;
+    // The codec the server last named, which is taken up once this client offers to encode it.
+    QString serverVideoCodec;
+    // SELECT_PROTOCOL went out before the codecs offered for encoding were all known.
+    bool codecsChangedSinceOffered = false;
     // Set while video is started.
     std::optional<LocalVideoDescription> localVideo;
     // The layers as VIDEO last described them, which is how they are named again, inactive,

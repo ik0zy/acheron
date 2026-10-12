@@ -25,6 +25,25 @@ constexpr int SLOW_SOURCE_FRAMERATE = 10;
 // A scaled-down maximum still leaves a fiftieth of a bit for each pixel of each frame.
 constexpr int PIXEL_FRAMES_PER_BIT = 50;
 
+constexpr int CAMERA_MUTED_FRAMERATE = 20;
+constexpr int CAMERA_MUTED_LOWEST_FRAMERATE = 12;
+
+struct CameraRow
+{
+    int want;
+    int width;
+    int height;
+};
+
+// From the most wanted down. Every row keeps the full picture's shape.
+constexpr std::array<CameraRow, 9> CAMERA_LADDER{ { { 100, 1280, 720 }, { 90, 896, 504 }, { 80, 672, 378 }, { 70, 640, 360 }, { 60, 512, 288 }, { 50, 416, 234 }, { 40, 384, 216 }, { 30, 320, 180 }, { 20, 256, 144 } } };
+
+// Wants that give the encoder the same work are one want as far as it is concerned.
+bool encodeAlike(int want, int other)
+{
+    return cameraLayerFor(want) == cameraLayerFor(other) && cameraFramerate(want, true) == cameraFramerate(other, true);
+}
+
 template <typename Values>
 bool contains(const Values &values, int value)
 {
@@ -103,6 +122,104 @@ bool ViewerSize::offer(qint64 pixelCount)
         return false;
     adopted = pixelCount;
     return true;
+}
+
+int cameraMaxBitrate(qint64 pixels)
+{
+    const qint64 fullPixels = static_cast<qint64>(CAMERA_CAPTURE_SIZE.width()) * CAMERA_CAPTURE_SIZE.height();
+    return static_cast<int>(std::max<qint64>(CAMERA_MAX_BITRATE * pixels / fullPixels, CAMERA_MIN_BITRATE));
+}
+
+CameraLayer cameraLayerFor(int want)
+{
+    const auto row = std::find_if(CAMERA_LADDER.begin(), CAMERA_LADDER.end(), [want](const CameraRow &candidate) { return candidate.want <= want; });
+    const CameraRow &chosen = row != CAMERA_LADDER.end() ? *row : CAMERA_LADDER.back();
+    return { chosen.want, QSize(chosen.width, chosen.height), cameraMaxBitrate(static_cast<qint64>(chosen.width) * chosen.height) };
+}
+
+int cameraFramerate(int want, bool muted)
+{
+    if (!muted)
+        return CAMERA_FRAMERATE;
+    return want <= CAMERA_LADDER.back().want ? CAMERA_MUTED_LOWEST_FRAMERATE : CAMERA_MUTED_FRAMERATE;
+}
+
+void CameraSendPlan::start(qint64 nowMs)
+{
+    want = 100;
+    wantInUse = want;
+    rate.restart(CAMERA_MIN_BITRATE, maxBitrate());
+    bitrateInUse = rate.bitrate();
+    changedAtMs = nowMs;
+    silentSinceMs = nowMs;
+}
+
+void CameraSendPlan::setWant(int wanted)
+{
+    want = wanted;
+    if (encodeAlike(want, wantInUse))
+        wantInUse = want;
+}
+
+void CameraSendPlan::setSelfMuted(bool muted)
+{
+    selfMuted = muted;
+}
+
+void CameraSendPlan::setSpeaking(bool nowSpeaking, qint64 nowMs)
+{
+    if (speaking && !nowSpeaking)
+        silentSinceMs = nowMs;
+    speaking = nowSpeaking;
+}
+
+void CameraSendPlan::setSharingScreen(bool sharing)
+{
+    sharingScreen = sharing;
+}
+
+void CameraSendPlan::reportLoss(double lossFraction, qint64 nowMs)
+{
+    rate.report(lossFraction, nowMs);
+}
+
+bool CameraSendPlan::countsAsMuted(qint64 nowMs) const
+{
+    if (sharingScreen)
+        return false;
+    return selfMuted || (!speaking && nowMs - silentSinceMs >= SILENCE_BEFORE_MUTED_MS);
+}
+
+bool CameraSendPlan::changeIsWaiting() const
+{
+    return wantInUse != want || bitrateInUse != rate.bitrate();
+}
+
+CameraEncoding CameraSendPlan::advance(qint64 nowMs)
+{
+    if (changeIsWaiting() && nowMs - changedAtMs >= SETTLE_MS) {
+        if (wantInUse != want) {
+            wantInUse = want;
+            rate.setLimits(CAMERA_MIN_BITRATE, maxBitrate());
+        }
+        bitrateInUse = rate.bitrate();
+        changedAtMs = nowMs;
+    }
+    return { cameraLayerFor(wantInUse).size, cameraFramerate(wantInUse, countsAsMuted(nowMs)), bitrateInUse };
+}
+
+std::optional<qint64> CameraSendPlan::nextChangeIn(qint64 nowMs) const
+{
+    std::optional<qint64> soonest;
+    if (changeIsWaiting())
+        soonest = std::max<qint64>(changedAtMs + SETTLE_MS - nowMs, 0);
+
+    const bool silenceIsCounting = !sharingScreen && !selfMuted && !speaking && !countsAsMuted(nowMs);
+    if (silenceIsCounting) {
+        const qint64 untilMuted = silentSinceMs + SILENCE_BEFORE_MUTED_MS - nowMs;
+        soonest = soonest ? std::min(*soonest, untilMuted) : untilMuted;
+    }
+    return soonest;
 }
 
 } // namespace Video

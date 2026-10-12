@@ -5,6 +5,8 @@
 #include "Core/Streams/StreamWatcher.hpp"
 #include "Core/Theme/Icons.hpp"
 #include "Core/Video/CallVideo.hpp"
+#include "Core/Video/CameraPipeline.hpp"
+#include "Core/Video/CameraSender.hpp"
 #include "Core/Video/ScreenCapture.hpp"
 #include "UI/ElidedLabel.hpp"
 #include "UI/ScreenSharePicker.hpp"
@@ -36,6 +38,7 @@ extern "C" {
 namespace Acheron {
 namespace UI {
 
+using Core::CameraSender;
 using Core::Snowflake;
 using Core::StreamBroadcaster;
 using Core::StreamSession;
@@ -52,8 +55,45 @@ constexpr QSize TILE_WINDOW_SIZE(640, 360);
 const char *const COLLAPSED_WITHOUT_VIDEO_KEY = "video/call_view_collapsed_without_video";
 const char *const GEOMETRY_KEY = "video/call_view_geometry";
 
+const char *const CAMERA_DEVICE_KEY = "video/camera_device";
+
 const char *const SHARE_ICON = "screen-share";
 const char *const STOP_SHARING_ICON = "screen-share-off";
+const char *const CAMERA_ICON = "video";
+const char *const STOP_CAMERA_ICON = "video-off";
+
+// The camera last chosen, while it is attached. Empty leaves the choice to the pipeline, which
+// takes the first there is.
+QString rememberedCamera(const QList<Core::Video::CameraDevice> &attached)
+{
+    const QString remembered = QSettings().value(CAMERA_DEVICE_KEY).toString();
+    const bool stillAttached = std::any_of(attached.cbegin(), attached.cend(), [&remembered](const Core::Video::CameraDevice &device) { return device.id == remembered; });
+    return stillAttached ? remembered : QString();
+}
+
+// The official client mirrors the camera for its owner alone.
+QImage mirrored(const QImage &picture)
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
+    return picture.flipped(Qt::Horizontal);
+#else
+    return picture.mirrored(true, false);
+#endif
+}
+
+// What a screen share and a camera both have to say of what they send.
+QStringList sendStatsLines(const Core::Video::BroadcastStats &encoder, const Discord::Voice::VideoSendStats &network, int targetBitrate, int receivers)
+{
+    QStringList lines;
+    const QString encoderName = encoder.encoderName.isEmpty() ? CallView::tr("starting") : encoder.encoderName;
+    lines << (network.codec.isEmpty() ? CallView::tr("Encoder: %1").arg(encoderName) : CallView::tr("Encoder: %1 by %2").arg(network.codec, encoderName));
+    lines << CallView::tr("Resolution: %1x%2").arg(encoder.encodedSize.width()).arg(encoder.encodedSize.height());
+    lines << CallView::tr("Frame rate: %1 fps encoded, %2 captured").arg(encoder.encodedFps, 0, 'f', 1).arg(encoder.capturedFps, 0, 'f', 1);
+    lines << CallView::tr("Bitrate: %1 kbps sent, %2 kbps asked of the encoder").arg(network.bitrateBps / 1000).arg(targetBitrate / 1000);
+    lines << (receivers < 0 ? CallView::tr("Viewers: not reported yet") : CallView::tr("Viewers: %1").arg(receivers));
+    lines << (network.lossFraction < 0 ? CallView::tr("Loss: not reported yet") : CallView::tr("Loss: %1%").arg(network.lossFraction * 100.0, 0, 'f', 1));
+    return lines;
+}
 
 QString streamTileId(Snowflake userId)
 {
@@ -150,8 +190,8 @@ private:
 
 } // namespace
 
-CallView::CallView(Core::Audio::VoiceManager *voice, Core::StreamWatcher *watcher, StreamBroadcaster *broadcaster, Core::ImageManager *images, Snowflake accountId, NameResolver names, AvatarResolver avatars, const QString &title, QWidget *dock)
-    : QWidget(dock), voice(voice), watcher(watcher), broadcaster(broadcaster), video(voice->video()), images(images), accountId(accountId), names(std::move(names)), avatars(std::move(avatars)), dock(dock)
+CallView::CallView(Core::Audio::VoiceManager *voice, Core::StreamWatcher *watcher, StreamBroadcaster *broadcaster, CameraSender *camera, Core::ImageManager *images, Snowflake accountId, NameResolver names, AvatarResolver avatars, const QString &title, QWidget *dock)
+    : QWidget(dock), voice(voice), watcher(watcher), broadcaster(broadcaster), camera(camera), video(voice->video()), images(images), accountId(accountId), names(std::move(names)), avatars(std::move(avatars)), dock(dock)
 {
     setWindowTitle(title);
     collapsed = QSettings().value(COLLAPSED_WITHOUT_VIDEO_KEY, true).toBool();
@@ -176,6 +216,16 @@ CallView::CallView(Core::Audio::VoiceManager *voice, Core::StreamWatcher *watche
     connect(shareButton, &QToolButton::clicked, this, &CallView::onShareClicked);
     shareQualityMenu = new QMenu(shareButton);
     connect(shareQualityMenu, &QMenu::aboutToShow, this, [this] { fillQualityMenu(shareQualityMenu); });
+
+    cameraAvailable = camera && Core::Video::cameraCaptureAvailable();
+    cameraButton = new QToolButton(controls);
+    cameraButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    cameraButton->setPopupMode(QToolButton::MenuButtonPopup);
+    bar->addWidget(cameraButton);
+    connect(cameraButton, &QToolButton::clicked, this, &CallView::onCameraClicked);
+    cameraMenu = new QMenu(cameraButton);
+    cameraButton->setMenu(cameraMenu);
+    connect(cameraMenu, &QMenu::aboutToShow, this, &CallView::fillCameraMenu);
 
     nonVideoCheck = new QCheckBox(tr("Show Non-Video Participants"), controls);
     nonVideoCheck->setChecked(QSettings().value(settingsKey(), true).toBool());
@@ -240,6 +290,12 @@ CallView::CallView(Core::Audio::VoiceManager *voice, Core::StreamWatcher *watche
         connect(broadcaster, &StreamBroadcaster::stateChanged, this, &CallView::rebuild, Qt::QueuedConnection);
         connect(broadcaster, &StreamBroadcaster::previewChanged, this, &CallView::showOwnPreview);
         connect(broadcaster, &StreamBroadcaster::failed, this, &CallView::reveal);
+    }
+    if (camera) {
+        // Not at once: it may come from the own tile's menu, and takes the tile away.
+        connect(camera, &CameraSender::stateChanged, this, &CallView::rebuild, Qt::QueuedConnection);
+        connect(camera, &CameraSender::previewChanged, this, &CallView::showOwnCameraPreview);
+        connect(camera, &CameraSender::failed, this, &CallView::reveal);
     }
     if (images)
         connect(images, &Core::ImageManager::imageFetched, this, &CallView::onImageFetched);
@@ -306,7 +362,7 @@ void CallView::rebuild()
 
     const auto showsCamera = [this, &cameras](Snowflake userId) { return cameras.contains(userId) && !video->isVideoDisabled(userId); };
 
-    int videoCount = ownShareShown() ? 1 : 0;
+    int videoCount = (ownShareShown() ? 1 : 0) + (ownCameraShown() ? 1 : 0);
     QStringList participantNames;
     for (const Core::Audio::VoiceParticipant &participant : participants) {
         if (participant.userId == accountId)
@@ -328,6 +384,8 @@ void CallView::rebuild()
     const bool tilesShown = anyVideo || poppedOut || !collapsed;
     if (ownShareShown() && tilesShown)
         wanted.insert(streamTileId(accountId), { accountId, true });
+    if (ownCameraShown() && tilesShown)
+        wanted.insert(userTileId(accountId), { accountId, false });
     for (const Core::Audio::VoiceParticipant &participant : participants) {
         if (participant.userId == accountId || !tilesShown)
             continue;
@@ -378,6 +436,8 @@ void CallView::rebuild()
         tiles.insert(id, tile);
         if (isOwnShare(tile))
             showOwnPreview(broadcaster->preview());
+        else if (isOwnCamera(tile))
+            showOwnCameraPreview(camera->preview());
     }
 
     for (auto it = tiles.begin(); it != tiles.end(); ++it)
@@ -420,6 +480,11 @@ void CallView::refreshTile(Tile &tile)
     if (isOwnShare(tile)) {
         tile.surface->setCaption(name);
         applyOwnShareState(tile);
+        return;
+    }
+    if (isOwnCamera(tile)) {
+        tile.surface->setCaption(name);
+        applyOwnCameraState(tile);
         return;
     }
 
@@ -552,6 +617,93 @@ void CallView::showOwnPreview(const QImage &preview)
         presentPicture(tile->surface, preview);
 }
 
+bool CallView::ownCameraShown() const
+{
+    return camera && camera->state() != CameraSender::State::Off;
+}
+
+void CallView::applyOwnCameraState(Tile &tile)
+{
+    VideoSurface *surface = tile.surface;
+    if (!camera)
+        return;
+
+    switch (camera->state()) {
+    case CameraSender::State::Off:
+        break;
+    case CameraSender::State::Starting:
+        // The camera's picture is there before the call has been told of it, and stays while
+        // the voice connection is made again.
+        surface->setMessage(camera->preview().isNull() ? tr("Starting your camera...") : QString());
+        break;
+    case CameraSender::State::On:
+        surface->setMessage({});
+        break;
+    case CameraSender::State::Failed:
+        surface->clear();
+        surface->setMessage(tr("Camera stopped"), camera->failure());
+        break;
+    }
+}
+
+void CallView::showOwnCameraPreview(const QImage &preview)
+{
+    const auto tile = tiles.constFind(userTileId(accountId));
+    if (tile != tiles.constEnd() && !preview.isNull())
+        presentPicture(tile->surface, mirrored(preview));
+}
+
+void CallView::onCameraClicked()
+{
+    if (!camera)
+        return;
+    if (camera->isOn())
+        camera->turnOff();
+    else
+        camera->turnOn(rememberedCamera(Core::Video::cameraDevices()));
+}
+
+void CallView::fillCameraMenu()
+{
+    cameraMenu->clear();
+
+    const QList<Core::Video::CameraDevice> devices = Core::Video::cameraDevices();
+    if (devices.isEmpty()) {
+        cameraMenu->addAction(tr("No camera found"))->setEnabled(false);
+        return;
+    }
+
+    const QString remembered = rememberedCamera(devices);
+    auto *choices = new QActionGroup(cameraMenu);
+    for (const Core::Video::CameraDevice &device : devices) {
+        QAction *action = cameraMenu->addAction(device.name);
+        action->setCheckable(true);
+        action->setChecked(remembered.isEmpty() ? device.id == devices.first().id : device.id == remembered);
+        choices->addAction(action);
+        connect(action, &QAction::triggered, this, [this, id = device.id] { chooseCamera(id); });
+    }
+}
+
+void CallView::chooseCamera(const QString &deviceId)
+{
+    QSettings().setValue(CAMERA_DEVICE_KEY, deviceId);
+    if (camera && camera->isOn())
+        camera->turnOn(deviceId);
+}
+
+QStringList CallView::ownCameraStats() const
+{
+    const CameraSender::Stats stats = camera->stats();
+
+    QStringList lines = sendStatsLines(stats.encoder, stats.network, stats.targetBitrate, stats.receivers);
+    lines << tr("Wanted by viewers: %1%").arg(stats.servedWant);
+    if (stats.mutedFramerate)
+        lines << tr("Muted frame rate");
+    if (stats.encodingSuspended)
+        lines << tr("Encoding suspended: nobody is watching");
+    return lines;
+}
+
 void CallView::onShareClicked()
 {
     if (!broadcaster)
@@ -618,13 +770,7 @@ QStringList CallView::ownShareStats() const
 {
     const StreamBroadcaster::Stats stats = broadcaster->stats();
 
-    QStringList lines;
-    lines << tr("Encoder: %1").arg(stats.encoder.encoderName.isEmpty() ? tr("starting") : stats.encoder.encoderName);
-    lines << tr("Resolution: %1x%2").arg(stats.encoder.encodedSize.width()).arg(stats.encoder.encodedSize.height());
-    lines << tr("Frame rate: %1 fps encoded, %2 captured").arg(stats.encoder.encodedFps, 0, 'f', 1).arg(stats.encoder.capturedFps, 0, 'f', 1);
-    lines << tr("Bitrate: %1 kbps sent, %2 kbps asked of the encoder").arg(stats.network.bitrateBps / 1000).arg(stats.targetBitrate / 1000);
-    lines << (stats.receivers < 0 ? tr("Viewers: not reported yet") : tr("Viewers: %1").arg(stats.receivers));
-    lines << (stats.network.lossFraction < 0 ? tr("Loss: not reported yet") : tr("Loss: %1%").arg(stats.network.lossFraction * 100.0, 0, 'f', 1));
+    QStringList lines = sendStatsLines(stats.encoder, stats.network, stats.targetBitrate, stats.receivers);
     if (stats.audio == StreamBroadcaster::AudioState::Capturing)
         lines << tr("Sound: shared");
     else if (stats.audio == StreamBroadcaster::AudioState::Failed)
@@ -642,7 +788,7 @@ int CallView::rank(const Tile &tile) const
         return 0;
     if (tile.stream)
         return tile.session && !tile.session->isOver() ? 0 : 2;
-    return tile.camera ? 1 : 3;
+    return tile.camera || isOwnCamera(tile) ? 1 : 3;
 }
 
 void CallView::layoutTiles()
@@ -727,6 +873,11 @@ void CallView::onTileClicked(const QString &tileId)
             broadcaster->clearFailure();
         return;
     }
+    if (isOwnCamera(*tile)) {
+        if (camera)
+            camera->clearFailure();
+        return;
+    }
 
     // A stream not being watched is watched.
     if (tile->stream && (!tile->session || tile->session->isOver())) {
@@ -789,12 +940,15 @@ void CallView::showTileMenu(const QString &tileId, const QPoint &globalPos)
     QAction *disable = nullptr;
     QAction *focus = nullptr;
     QAction *stopSharing = nullptr;
+    QAction *stopCamera = nullptr;
     QAction *dismiss = nullptr;
 
     if (isOwnShare(tile) && broadcaster && broadcaster->isSharing()) {
         stopSharing = menu.addAction(tr("Stop Sharing"));
         fillQualityMenu(menu.addMenu(tr("Quality")));
-    } else if (isOwnShare(tile)) {
+    } else if (isOwnCamera(tile) && camera && camera->isOn()) {
+        stopCamera = menu.addAction(tr("Turn Off Camera"));
+    } else if (isOwnShare(tile) || isOwnCamera(tile)) {
         dismiss = menu.addAction(tr("Dismiss"));
     } else if (tile.stream && tile.session && !tile.session->isOver()) {
         stop = menu.addAction(tr("Stop Watching"));
@@ -836,7 +990,11 @@ void CallView::showTileMenu(const QString &tileId, const QPoint &globalPos)
 
     if (chosen == stopSharing && broadcaster) {
         broadcaster->stop();
-    } else if (chosen == dismiss && broadcaster) {
+    } else if (chosen == stopCamera && camera) {
+        camera->turnOff();
+    } else if (chosen == dismiss && isOwnCamera(tile) && camera) {
+        camera->clearFailure();
+    } else if (chosen == dismiss && isOwnShare(tile) && broadcaster) {
         broadcaster->clearFailure();
     } else if (chosen == stop) {
         watcher->stopWatching(streamKeyFor(tile.userId).toString());
@@ -879,6 +1037,8 @@ void CallView::refreshStats()
         QStringList lines;
         if (isOwnShare(it.value()) && broadcaster && broadcaster->isSharing()) {
             lines = ownShareStats();
+        } else if (isOwnCamera(it.value()) && camera && camera->isOn()) {
+            lines = ownCameraStats();
         } else if (it->stream && it->session) {
             const StreamSession::Stats stats = it->session->stats();
             lines << tr("Codec: %1 (%2)").arg(stats.network.codec, stats.decoder.decoderName);
@@ -1020,6 +1180,13 @@ void CallView::applyChrome()
     // While sharing, the arrow beside the button changes the quality without stopping.
     shareButton->setPopupMode(sharing ? QToolButton::MenuButtonPopup : QToolButton::DelayedPopup);
     shareButton->setMenu(sharing ? shareQualityMenu : nullptr);
+
+    const bool cameraOn = camera && camera->isOn();
+    cameraButton->setVisible(cameraAvailable && camera);
+    cameraButton->setEnabled(cameraOn || (camera && camera->canTurnOn()));
+    cameraButton->setText(cameraOn ? tr("Stop Camera") : tr("Camera"));
+    cameraButton->setToolTip(cameraOn ? tr("Turn Off Camera") : tr("Turn On Camera"));
+    cameraButton->setIcon(Core::Theme::Icons::icon(QLatin1String(cameraOn ? STOP_CAMERA_ICON : CAMERA_ICON), Core::Theme::Token::ButtonText));
 
     nonVideoCheck->setVisible(videoPresent && !barOnly);
     statsButton->setVisible(videoPresent && !barOnly);

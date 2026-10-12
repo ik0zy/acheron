@@ -6,6 +6,7 @@
 #include "Core/Media/VideoDecoder.hpp"
 #include "Core/Media/VideoEncoder.hpp"
 #include "Core/Video/BroadcastPipeline.hpp"
+#include "Core/Video/CardScaler.hpp"
 #include "Core/Video/ScreenCapture.hpp"
 
 #include <QElapsedTimer>
@@ -18,7 +19,10 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -51,6 +55,9 @@ constexpr int HEIGHT = 360;
 constexpr int FRAMERATE = 30;
 constexpr int TICKS_PER_FRAME = 90000 / FRAMERATE;
 constexpr int BITRATE = 1'500'000;
+
+// In the order the voice server prefers them.
+constexpr std::array CODECS = { VideoCodec::AV1, VideoCodec::H265, VideoCodec::H264, VideoCodec::VP8 };
 
 // The colour of the patch in the middle of a synthetic RGB picture.
 constexpr int PATCH_RED = 40;
@@ -93,6 +100,7 @@ double distance(const Yuv &a, const Yuv &b)
 }
 
 // Counts decoded pictures, and keeps the colours in the middle and at the top of the last one.
+// Each picture is shown to `inspect` with its place among them, on the decoder's thread.
 class CountingSink : public Core::Media::VideoFrameSink
 {
 public:
@@ -100,9 +108,15 @@ public:
 
     void present(const AVFrame *frame) override
     {
+        if (inspect)
+            inspect(frame, frames);
         width = frame->width;
         height = frame->height;
+        format = frame->format;
         colorspace = frame->colorspace;
+        range = frame->color_range;
+        shapeWidth = frame->sample_aspect_ratio.num;
+        shapeHeight = frame->sample_aspect_ratio.den;
         if (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P) {
             const int x = frame->width / 2;
             const int y = frame->height / 2;
@@ -116,10 +130,17 @@ public:
         frames++;
     }
 
+    std::function<void(const AVFrame *, int)> inspect;
     std::atomic<int> frames{ 0 };
     std::atomic<int> width{ 0 };
     std::atomic<int> height{ 0 };
+    std::atomic<int> format{ AV_PIX_FMT_NONE };
     std::atomic<int> colorspace{ AVCOL_SPC_UNSPECIFIED };
+    std::atomic<int> range{ AVCOL_RANGE_UNSPECIFIED };
+    // The frame's sample aspect ratio, which is how ffmpeg passes on the size AV1 says a
+    // picture is to be shown at when that is not the size it was coded at.
+    std::atomic<int> shapeWidth{ 0 };
+    std::atomic<int> shapeHeight{ 1 };
     std::atomic<int> middleY{ 0 };
     std::atomic<int> middleU{ 0 };
     std::atomic<int> middleV{ 0 };
@@ -192,6 +213,54 @@ void paint(AVFrame *picture, int index)
         paintYuv(picture, index);
 }
 
+// A page of text-like marks, dark on light, beside a coloured margin. All but its top third
+// moves up four lines with every picture, as a page that is being read does. It is flat and
+// sharp where the other picture is soft and noisy: what a shared screen mostly shows.
+void paintPage(AVFrame *picture, int index)
+{
+    constexpr int CELL_WIDTH = 6;
+    constexpr int CELL_HEIGHT = 14;
+    constexpr int MARK_WIDTH = 5;
+    constexpr int MARK_HEIGHT = 8;
+    const int width = picture->width;
+    const int height = picture->height;
+
+    av_frame_make_writable(picture);
+    for (int y = 0; y < height; y++) {
+        uint8_t *row = picture->data[0] + y * picture->linesize[0];
+        const int line = y < height / 3 ? y : y + 4 * index;
+        for (int x = 0; x < width; x++) {
+            uint32_t cell = (static_cast<uint32_t>(x / CELL_WIDTH) * 73856093u) ^ (static_cast<uint32_t>(line / CELL_HEIGHT) * 19349663u);
+            cell ^= cell >> 13;
+            cell *= 0x5bd1e995u;
+            cell ^= cell >> 15;
+            const int column = x % CELL_WIDTH;
+            const int rowOfCell = line % CELL_HEIGHT;
+            // One cell in five is the space between words.
+            const bool written = (cell >> 24) % 5 != 0 && column < MARK_WIDTH && rowOfCell < MARK_HEIGHT;
+            row[x] = written && ((cell >> (column + MARK_WIDTH * (rowOfCell / 2))) & 1) ? 30 : 225;
+        }
+    }
+
+    const bool interleaved = picture->format == AV_PIX_FMT_NV12;
+    for (int y = 0; y < height / 2; y++) {
+        for (int x = 0; x < width / 2; x++) {
+            const bool margin = x < width / 16;
+            const uint8_t u = margin ? 110 : 128;
+            const uint8_t v = margin ? 150 : 128;
+            if (interleaved) {
+                picture->data[1][y * picture->linesize[1] + 2 * x] = u;
+                picture->data[1][y * picture->linesize[1] + 2 * x + 1] = v;
+            } else {
+                picture->data[1][y * picture->linesize[1] + x] = u;
+                picture->data[2][y * picture->linesize[2] + x] = v;
+            }
+        }
+    }
+}
+
+using Painter = void (*)(AVFrame *picture, int index);
+
 AVFrame *allocatePicture(int format, int width, int height)
 {
     AVFrame *picture = av_frame_alloc();
@@ -201,6 +270,49 @@ AVFrame *allocatePicture(int format, int width, int height)
     av_frame_get_buffer(picture, 0);
     return picture;
 }
+
+// How close decoded pictures are to the ones that were encoded: the PSNR of their luma, over
+// the pictures from `from` on. A picture decoded larger than it was sent is compared over the
+// part that was sent.
+class Likeness
+{
+public:
+    Likeness(Painter painter, const QSize &size, int from) : painter(painter), from(from), source(allocatePicture(AV_PIX_FMT_YUV420P, size.width(), size.height())) {}
+    ~Likeness() { av_frame_free(&source); }
+
+    Likeness(const Likeness &) = delete;
+    Likeness &operator=(const Likeness &) = delete;
+
+    void compare(const AVFrame *decoded, int picture)
+    {
+        const bool lumaInBytes = decoded->format == AV_PIX_FMT_YUV420P || decoded->format == AV_PIX_FMT_YUVJ420P || decoded->format == AV_PIX_FMT_NV12;
+        if (picture < from || !lumaInBytes || decoded->width < source->width || decoded->height < source->height)
+            return;
+        painter(source, picture);
+        for (int y = 0; y < source->height; y++) {
+            const uint8_t *sent = source->data[0] + y * source->linesize[0];
+            const uint8_t *seen = decoded->data[0] + y * decoded->linesize[0];
+            for (int x = 0; x < source->width; x++)
+                squaredError += static_cast<double>((sent[x] - seen[x]) * (sent[x] - seen[x]));
+        }
+        samples += static_cast<double>(source->width) * source->height;
+    }
+
+    // Zero when nothing was compared.
+    [[nodiscard]] double psnr() const
+    {
+        if (samples == 0)
+            return 0;
+        return squaredError > 0 ? 10 * std::log10(255.0 * 255.0 * samples / squaredError) : 99;
+    }
+
+private:
+    Painter painter;
+    int from;
+    AVFrame *source;
+    double squaredError = 0;
+    double samples = 0;
+};
 
 VideoEncoder::Settings settingsFor(const EncoderCase &encoderCase, int bitrate, int keyframeIntervalMs = 0)
 {
@@ -306,9 +418,10 @@ public:
 
     [[nodiscard]] bool usable() const { return frames != nullptr; }
 
-    AVFrame *next(int index)
+    AVFrame *next(int index, Painter painter = paint)
     {
-        paint(inMemory, index);
+        av_frame_make_writable(inMemory);
+        painter(inMemory, index);
         av_frame_unref(onCard);
         if (av_hwframe_get_buffer(frames, onCard, 0) < 0 || av_hwframe_transfer_data(onCard, inMemory, 0) < 0)
             return nullptr;
@@ -323,6 +436,60 @@ private:
     AVFrame *inMemory;
     AVFrame *onCard;
 };
+
+// One colour to each quarter of a picture, strong enough that the two sets of coefficients make
+// something clearly different of three of them: top left, top right, bottom left, bottom right.
+constexpr std::array QUARTER_COLOURS = { RGB(200, 40, 40), RGB(40, 200, 60), RGB(40, 60, 220), RGB(128, 128, 128) };
+
+// A BGRA picture on the graphics card with one of the colours in each quarter. Its lower half
+// has no opacity, as the bitmaps have that windows draw themselves into. Null when the card
+// will not have it.
+AVFrame *quartersOnCard(AVBufferRef *device, const QSize &size)
+{
+    AVFrame *inMemory = allocatePicture(AV_PIX_FMT_BGRA, size.width(), size.height());
+    for (int y = 0; y < size.height(); y++) {
+        uint8_t *row = inMemory->data[0] + y * inMemory->linesize[0];
+        const bool lower = y >= size.height() / 2;
+        for (int x = 0; x < size.width(); x++) {
+            const COLORREF colour = QUARTER_COLOURS[(lower ? 2 : 0) + (x >= size.width() / 2 ? 1 : 0)];
+            row[4 * x] = GetBValue(colour);
+            row[4 * x + 1] = GetGValue(colour);
+            row[4 * x + 2] = GetRValue(colour);
+            row[4 * x + 3] = lower ? 0 : 255;
+        }
+    }
+
+    AVBufferRef *frames = av_hwframe_ctx_alloc(device);
+    auto *context = reinterpret_cast<AVHWFramesContext *>(frames->data);
+    context->format = AV_PIX_FMT_D3D11;
+    context->sw_format = AV_PIX_FMT_BGRA;
+    context->width = size.width();
+    context->height = size.height();
+    static_cast<AVD3D11VAFramesContext *>(context->hwctx)->BindFlags = D3D11_BIND_RENDER_TARGET;
+
+    AVFrame *onCard = av_frame_alloc();
+    if (av_hwframe_ctx_init(frames) < 0 || av_hwframe_get_buffer(frames, onCard, 0) < 0 || av_hwframe_transfer_data(onCard, inMemory, 0) < 0)
+        av_frame_free(&onCard);
+    av_buffer_unref(&frames);
+    av_frame_free(&inMemory);
+    return onCard;
+}
+
+AVPixelFormat formatOnCard(const AVFrame *card)
+{
+    return card->hw_frames_ctx ? reinterpret_cast<const AVHWFramesContext *>(card->hw_frames_ctx->data)->sw_format : AV_PIX_FMT_NONE;
+}
+
+Yuv colourAt(const AVFrame *nv12, int x, int y)
+{
+    const uint8_t *chroma = nv12->data[1] + (y / 2) * nv12->linesize[1] + (x / 2) * 2;
+    return { static_cast<double>(nv12->data[0][y * nv12->linesize[0] + x]), static_cast<double>(chroma[0]), static_cast<double>(chroma[1]) };
+}
+
+Yuv inYuv(COLORREF colour, bool bt709)
+{
+    return inYuv(GetRValue(colour), GetGValue(colour), GetBValue(colour), bt709);
+}
 
 // Whether the card makes NV12 textures of the kind a frames context of this shape asks for.
 bool cardMakesNv12Textures(int poolSize, unsigned bindFlags)
@@ -385,27 +552,106 @@ bool startsWithStartCode(const std::vector<uint8_t> &data)
     return data.size() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1;
 }
 
-std::vector<int> nalTypes(const std::vector<uint8_t> &data)
+// The types of an Annex B frame's NAL units, as H264 or as H265 numbers them.
+std::vector<int> nalTypes(VideoCodec codec, const std::vector<uint8_t> &data)
 {
     std::vector<int> types;
     for (size_t i = 0; i + 3 < data.size(); i++) {
         if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)
-            types.push_back(data[i + 3] & 0x1F);
+            types.push_back(codec == VideoCodec::H265 ? (data[i + 3] >> 1) & 0x3F : data[i + 3] & 0x1F);
     }
     return types;
 }
 
-// The profile_idc of the first SPS in the frame, or -1.
-int h264Profile(const std::vector<uint8_t> &data)
+constexpr int H264_SPS = 7;
+constexpr int H264_PPS = 8;
+constexpr int H264_IDR = 5;
+constexpr int H265_VPS = 32;
+constexpr int H265_SPS = 33;
+constexpr int H265_PPS = 34;
+constexpr int H265_FIRST_IRAP = 16;
+constexpr int H265_LAST_IRAP = 23;
+constexpr int OBU_SEQUENCE_HEADER = 1;
+constexpr int OBU_TEMPORAL_DELIMITER = 2;
+constexpr int OBU_FRAME_HEADER = 3;
+constexpr int OBU_FRAME = 6;
+
+struct Obu
 {
-    for (size_t i = 0; i + 4 < data.size(); i++) {
-        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && (data[i + 3] & 0x1F) == 7)
+    int type = 0;
+    bool saysItsSize = false;
+    size_t payload = 0;
+    size_t size = 0;
+};
+
+// The OBUs of an AV1 temporal unit, or none when it is not made of whole ones.
+std::vector<Obu> obusOf(const std::vector<uint8_t> &data)
+{
+    std::vector<Obu> obus;
+    for (size_t at = 0; at < data.size();) {
+        Obu obu;
+        obu.type = (data[at] >> 3) & 0x0F;
+        obu.saysItsSize = data[at] & 0x02;
+        obu.payload = at + ((data[at] & 0x04) ? 2 : 1);
+        if ((data[at] & 0x80) || obu.payload > data.size())
+            return {};
+        obu.size = data.size() - obu.payload;
+        if (obu.saysItsSize) {
+            obu.size = 0;
+            uint8_t byte = 0x80;
+            for (int shift = 0; byte & 0x80; shift += 7) {
+                if (obu.payload >= data.size() || shift > 28)
+                    return {};
+                byte = data[obu.payload++];
+                obu.size |= size_t(byte & 0x7F) << shift;
+            }
+        }
+        if (obu.size > data.size() - obu.payload)
+            return {};
+        obus.push_back(obu);
+        at = obu.payload + obu.size;
+    }
+    return obus;
+}
+
+QString unitTypes(VideoCodec codec, const EncodedVideoFrame &frame)
+{
+    QStringList types;
+    if (codec == VideoCodec::AV1) {
+        for (const Obu &obu : obusOf(frame.data))
+            types.append(QString::number(obu.type));
+    } else if (codec != VideoCodec::VP8) {
+        for (int type : nalTypes(codec, frame.data))
+            types.append(QString::number(type));
+    }
+    return types.join(QLatin1Char(' '));
+}
+
+// What a key frame says its profile is: the profile_idc of an H264 SPS, the general_profile_idc
+// of an H265 one, the seq_profile of an AV1 sequence header. Or -1.
+int profileOf(VideoCodec codec, const std::vector<uint8_t> &data)
+{
+    if (codec == VideoCodec::AV1) {
+        for (const Obu &obu : obusOf(data)) {
+            if (obu.type == OBU_SEQUENCE_HEADER && obu.size > 0)
+                return data[obu.payload] >> 5;
+        }
+        return -1;
+    }
+    for (size_t i = 0; i + 6 < data.size(); i++) {
+        if (data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1)
+            continue;
+        if (codec == VideoCodec::H264 && (data[i + 3] & 0x1F) == H264_SPS)
             return data[i + 4];
+        if (codec == VideoCodec::H265 && ((data[i + 3] >> 1) & 0x3F) == H265_SPS)
+            return data[i + 6] & 0x1F;
     }
     return -1;
 }
 
-// An H264 key frame is Annex B and opens with SPS and PPS; a VP8 frame says itself what it is.
+// A key frame of H264 or H265 is Annex B and opens with its parameter sets, one of AV1 has its
+// sequence header before its picture and every OBU says its size, and a VP8 frame says itself
+// what it is. Whether a frame is a key frame is checked against the frame.
 bool isWellFormed(VideoCodec codec, const EncodedVideoFrame &frame)
 {
     if (frame.data.empty())
@@ -413,11 +659,36 @@ bool isWellFormed(VideoCodec codec, const EncodedVideoFrame &frame)
     if (codec == VideoCodec::VP8)
         return !(frame.data[0] & 1) == frame.keyframe;
 
-    const std::vector<int> types = nalTypes(frame.data);
-    const bool hasIdr = std::find(types.begin(), types.end(), 5) != types.end();
-    if (!startsWithStartCode(frame.data) || hasIdr != frame.keyframe)
+    if (codec == VideoCodec::AV1) {
+        bool hasSequenceHeader = false;
+        const Obu *picture = nullptr;
+        const std::vector<Obu> obus = obusOf(frame.data);
+        for (const Obu &obu : obus) {
+            if (!obu.saysItsSize)
+                return false;
+            if (obu.type == OBU_SEQUENCE_HEADER && !picture)
+                hasSequenceHeader = true;
+            if ((obu.type == OBU_FRAME || obu.type == OBU_FRAME_HEADER) && !picture)
+                picture = &obu;
+        }
+        if (!picture || picture->size == 0)
+            return false;
+        // show_existing_frame, the two bits of frame_type, where zero is a key frame, and show_frame.
+        const uint8_t opening = frame.data[picture->payload];
+        const bool keyFrame = !(opening & 0x80) && ((opening >> 5) & 0x03) == 0 && (opening & 0x10);
+        return keyFrame == frame.keyframe && (!keyFrame || hasSequenceHeader);
+    }
+
+    const bool h265 = codec == VideoCodec::H265;
+    const std::vector<int> types = nalTypes(codec, frame.data);
+    const bool hasKeyPicture = std::any_of(types.begin(), types.end(), [h265](int type) { return h265 ? type >= H265_FIRST_IRAP && type <= H265_LAST_IRAP : type == H264_IDR; });
+    if (!startsWithStartCode(frame.data) || hasKeyPicture != frame.keyframe)
         return false;
-    return !frame.keyframe || (types.size() >= 3 && types[0] == 7 && types[1] == 8);
+    if (!frame.keyframe)
+        return true;
+    if (h265)
+        return types.size() >= 4 && types[0] == H265_VPS && types[1] == H265_SPS && types[2] == H265_PPS;
+    return types.size() >= 3 && types[0] == H264_SPS && types[1] == H264_PPS;
 }
 
 struct Decoded
@@ -427,16 +698,34 @@ struct Decoded
     int height = 0;
     quint64 errors = 0;
     quint64 dropped = 0;
+    int format = AV_PIX_FMT_NONE;
     int colorspace = AVCOL_SPC_UNSPECIFIED;
+    int range = AVCOL_RANGE_UNSPECIFIED;
+    // Of a sample: other than square when the stream wants its pictures shown at another size
+    // than they were coded at.
+    AVRational shape = { 0, 1 };
     Yuv middle;
     Yuv top;
 };
 
-// Decodes the frames in order, in software.
+// Whether what was decoded is the picture that was sent. A graphics card that codes AV1 only
+// in whole blocks, as a Radeon of the 7000 series does in ones of 64 by 16, sends the picture
+// with what fills its last blocks: larger than it was, and nothing in the stream says by how
+// much. See whatAnEncoderMakesOfASizeItCannotCode.
+bool isThePictureSent(VideoCodec codec, const Decoded &decoded, const QSize &sent)
+{
+    if (QSize(decoded.width, decoded.height) == sent)
+        return true;
+    return codec == VideoCodec::AV1 && decoded.width >= sent.width() && decoded.height >= sent.height() && decoded.width - sent.width() < 64 && decoded.height - sent.height() < 16;
+}
+
+// Decodes the frames in order, in software, and shows each picture to `inspect` with the
+// place among the frames of the one it was decoded from.
 template <typename Frames>
-Decoded decodeAll(VideoCodec codec, const Frames &frames)
+Decoded decodeAll(VideoCodec codec, const Frames &frames, std::function<void(const AVFrame *, int)> inspect = {})
 {
     auto sink = std::make_shared<CountingSink>();
+    sink->inspect = std::move(inspect);
     Core::Media::VideoDecoder decoder(false);
     decoder.setSink(sink);
 
@@ -460,18 +749,21 @@ Decoded decodeAll(VideoCodec codec, const Frames &frames)
     decoded.height = sink->height;
     decoded.errors = decoder.stats().errors;
     decoded.dropped = decoder.stats().dropped;
+    decoded.format = sink->format;
     decoded.colorspace = sink->colorspace;
+    decoded.range = sink->range;
+    decoded.shape = { sink->shapeWidth, sink->shapeHeight };
     decoded.middle = { static_cast<double>(sink->middleY), static_cast<double>(sink->middleU), static_cast<double>(sink->middleV) };
     decoded.top = { static_cast<double>(sink->topY), static_cast<double>(sink->topU), static_cast<double>(sink->topV) };
     return decoded;
 }
 
-Decoded decodeAll(VideoCodec codec, const std::vector<EncodedVideoFrame> &frames)
+Decoded decodeAll(VideoCodec codec, const std::vector<EncodedVideoFrame> &frames, std::function<void(const AVFrame *, int)> inspect = {})
 {
     std::vector<const EncodedVideoFrame *> pointers;
     for (const EncodedVideoFrame &frame : frames)
         pointers.push_back(&frame);
-    return decodeAll(codec, pointers);
+    return decodeAll(codec, pointers, std::move(inspect));
 }
 
 // What a pipeline said while it ran, and when each of its frames came.
@@ -533,11 +825,30 @@ PathCounts pathCounts(const Core::Video::BroadcastStats &stats)
     return match.hasMatch() ? PathCounts{ match.captured(1).toLongLong(), match.captured(2).toLongLong() } : PathCounts{};
 }
 
+// What a share whose pictures are this size offers to send with, best first: AV1's encoder is
+// given no size it would add black to (thePipelineHoldsBackWhatItsEncoderWouldPad).
+QList<VideoCodec> codecsSharedAt(const QSize &size)
+{
+    return Core::Media::shareCodecs(Core::Media::encodableVideoCodecs(), Core::Media::videoEncoderFor(VideoCodec::AV1), size);
+}
+
+// Whether a share's pictures reach the encoder the probe chose without leaving the graphics
+// card: as they were captured where it takes those, scaled by graphics capture itself, or
+// scaled and converted by the card's video processor.
+bool reachesTheEncoderOnTheCard(VideoCodec codec, bool scaled, bool byGraphicsCapture)
+{
+    const VideoEncoder chosen(settingsFor({ codec, {} }, BITRATE));
+    const bool withoutTheProcessor = chosen.takesRgbCardFrames() && (!scaled || byGraphicsCapture);
+    return chosen.takesCardFrames() && (withoutTheProcessor || Core::Video::CardScaler::usable());
+}
+
 #ifdef Q_OS_WIN
 // The two solid colours of the windows the tests put on the screen: one to share and one to
 // lay over it.
 constexpr COLORREF SHARED_COLOUR = RGB(PATCH_RED, PATCH_GREEN, PATCH_BLUE);
 constexpr COLORREF COVERING_COLOUR = RGB(220, 40, 200);
+// The luma under which a decoded picture is neither of those: black, at 16 or 0.
+constexpr int BLACK_AT_MOST = 40;
 
 // An encoder may have been told either set of coefficients, depending on the picture's size.
 bool looksLike(const Yuv &seen, COLORREF colour)
@@ -545,6 +856,17 @@ bool looksLike(const Yuv &seen, COLORREF colour)
     constexpr double CLOSE = 16;
     return distance(seen, inYuv(GetRValue(colour), GetGValue(colour), GetBValue(colour), true)) < CLOSE || distance(seen, inYuv(GetRValue(colour), GetGValue(colour), GetBValue(colour), false)) < CLOSE;
 }
+
+// How far a decoded colour is from what `colour` comes to under the coefficients the stream is
+// shown with: the ones it names, and failing that BT.709 from 720 lines up, as decoders have it.
+double offItsOwnCoefficients(const Decoded &decoded, const Yuv &seen, COLORREF colour)
+{
+    const bool named = decoded.colorspace == AVCOL_SPC_BT709 || decoded.colorspace == AVCOL_SPC_SMPTE170M || decoded.colorspace == AVCOL_SPC_BT470BG;
+    return distance(seen, inYuv(colour, named ? decoded.colorspace == AVCOL_SPC_BT709 : decoded.height >= 720));
+}
+// As far off as an encoder at a few megabits leaves a flat colour, and well short of the dozen
+// and more the wrong coefficients put it off by.
+constexpr double COLOUR_SURVIVES = 8;
 
 // Makes the calling thread measure in the desktop's own pixels, or in the scaled ones Windows
 // gives a program that knows nothing of display scaling.
@@ -815,6 +1137,9 @@ private slots:
     void aSourceIsFittedInsideTheSendSize();
     void theProbeGivesTheSameAnswerEveryTime();
     void encodableCodecsAreOfferedForSending();
+    void av1FromAmfIsCodedInWholeBlocks();
+    void blackColumnsAreNotAcceptableAndAFewRowsAre();
+    void av1IsOfferedOnlyWhereItAddsNoBlack();
     void theProbeTurnsDownWhatCannotKeepUp_data() { encoderCases(false); }
     void theProbeTurnsDownWhatCannotKeepUp();
 
@@ -828,14 +1153,30 @@ private slots:
     void aChangedPictureSizeStartsANewStream();
     void encodeTimes_data() { encoderCases(true); }
     void encodeTimes();
+    void aFrameIsMadeWholeWhateverItsEncoderLeftOut();
+    void noKeyFrameComesUnasked_data() { encoderCases(false); }
+    void noKeyFrameComesUnasked();
+    void theStreamSaysWhatColoursItIsIn_data();
+    void theStreamSaysWhatColoursItIsIn();
+    void whatAnEncoderMakesOfASizeItCannotCode_data() { encoderCases(false); }
+    void whatAnEncoderMakesOfASizeItCannotCode();
+    void whatTheEncodersMakeOfTheSameRate_data();
+    void whatTheEncodersMakeOfTheSameRate();
+    void cleanupTestCase();
 
     void picturesOnTheGraphicsCardAreEncodedThere_data();
     void picturesOnTheGraphicsCardAreEncodedThere();
     void whichTexturesTheCardMakes();
+    void theCardScalesAndConvertsPictures_data();
+    void theCardScalesAndConvertsPictures();
+    void picturesScaledOnTheCardAreEncodedThere_data();
+    void picturesScaledOnTheCardAreEncodedThere();
 
     void screensAreListedWithThumbnails();
     void thePipelineSharesTheScreen_data();
     void thePipelineSharesTheScreen();
+    void whatScalingAScreenCosts_data();
+    void whatScalingAScreenCosts();
     void aScreenThatIsNotThereFails();
 
     void theCaptureMethodIsRemembered();
@@ -846,6 +1187,7 @@ private slots:
     void aWindowHasAThumbnail();
     void thePipelineSharesAWindow_data();
     void thePipelineSharesAWindow();
+    void thePipelineHoldsBackWhatItsEncoderWouldPad();
     void whatCapturingAWindowCosts_data();
     void whatCapturingAWindowCosts();
 
@@ -854,6 +1196,8 @@ private:
 
     // Where the settings the tests write go, in place of the registry.
     QTemporaryDir settingsDirectory;
+    // What whatTheEncodersMakeOfTheSameRate measured, a line to each, for one table at the end.
+    QStringList comparison;
 };
 
 Q_DECLARE_METATYPE(Core::Video::CaptureMethod)
@@ -862,7 +1206,7 @@ void TestVideoEncode::encoderCases(bool withTheProbesChoice)
 {
     QTest::addColumn<EncoderCase>("encoderCase");
     const QList<VideoCodec> encodable = Core::Media::encodableVideoCodecs();
-    for (VideoCodec codec : { VideoCodec::H264, VideoCodec::VP8 }) {
+    for (VideoCodec codec : CODECS) {
         if (withTheProbesChoice && encodable.contains(codec))
             QTest::newRow(qPrintable(videoCodecName(codec) + QStringLiteral(" as the probe chose"))) << EncoderCase{ codec, {} };
         for (const QString &name : Core::Media::videoEncoderNames(codec))
@@ -889,7 +1233,7 @@ void TestVideoEncode::initTestCase()
     for (VideoCodec codec : Core::Media::encodableVideoCodecs())
         codecs.append(videoCodecName(codec));
     qInfo() << "encodable codecs:" << codecs;
-    for (VideoCodec codec : { VideoCodec::H264, VideoCodec::VP8 }) {
+    for (VideoCodec codec : CODECS) {
         for (const QString &name : Core::Media::videoEncoderNames(codec))
             qInfo().noquote() << videoCodecName(codec) << "encoder" << name << (Core::Media::videoEncoderWorks(name) ? "works" : "is turned down by the probe");
     }
@@ -911,6 +1255,19 @@ void TestVideoEncode::aSourceIsFittedInsideTheSendSize()
     // Both sides even, also when nothing is scaled.
     QCOMPARE(encodeSizeFor(QSize(1365, 767), 0), QSize(1364, 766));
     QCOMPARE(encodeSizeFor(QSize(1920, 1080), 480), QSize(852, 480));
+
+#ifdef Q_OS_WIN
+    // A screen is as large as it was listed, and a window that is not there has no size.
+    Core::Video::CaptureSource screen;
+    screen.geometry = QRect(1920, 0, 2560, 1440);
+    QCOMPARE(Core::Video::encodeSizeOf(screen, 1080), QSize(1920, 1080));
+    QCOMPARE(Core::Video::encodeSizeOf(screen, 0), QSize(2560, 1440));
+    QCOMPARE(Core::Video::encodeSizeOf(Core::Video::CaptureSource(), 720), QSize());
+    Core::Video::CaptureSource noWindow;
+    noWindow.kind = Core::Video::CaptureSource::Kind::Window;
+    noWindow.id = QStringLiteral("window:1");
+    QCOMPARE(Core::Video::encodeSizeOf(noWindow, 720), QSize());
+#endif
 }
 
 void TestVideoEncode::theProbeGivesTheSameAnswerEveryTime()
@@ -920,16 +1277,16 @@ void TestVideoEncode::theProbeGivesTheSameAnswerEveryTime()
         QVERIFY(Core::Media::encodableVideoCodecs() == first);
     QVERIFY(Core::Video::BroadcastPipeline::encodableCodecs() == first);
 
-    // Only what the RTP sender packetizes, H264 before VP8.
+    // Best first, as the voice server has them: AV1, H265, H264, VP8.
     QList<VideoCodec> expected;
-    for (VideoCodec codec : { VideoCodec::H264, VideoCodec::VP8 }) {
+    for (VideoCodec codec : CODECS) {
         if (first.contains(codec))
             expected.append(codec);
     }
     QVERIFY(first == expected);
 
     // A codec is encodable exactly when one of its encoders works, and then it can be encoded.
-    for (VideoCodec codec : { VideoCodec::H264, VideoCodec::VP8 }) {
+    for (VideoCodec codec : CODECS) {
         const QList<QString> names = Core::Media::videoEncoderNames(codec);
         const bool oneWorks = std::any_of(names.begin(), names.end(), [](const QString &name) { return Core::Media::videoEncoderWorks(name); });
         QCOMPARE(first.contains(codec), oneWorks);
@@ -937,9 +1294,27 @@ void TestVideoEncode::theProbeGivesTheSameAnswerEveryTime()
         EncodeRun run({ codec, {} }, WIDTH, HEIGHT, BITRATE);
         QCOMPARE(run.encoder.hasEncoder(), oneWorks);
         QCOMPARE(run.encodeNext(), oneWorks);
+
+        // The encoder its pictures go to is the first of them that works.
+        const QString chosen = Core::Media::videoEncoderFor(codec);
+        const auto firstThatWorks = std::find_if(names.begin(), names.end(), [](const QString &name) { return Core::Media::videoEncoderWorks(name); });
+        QCOMPARE(chosen, firstThatWorks == names.end() ? QString() : *firstThatWorks);
+        if (oneWorks)
+            QVERIFY2(run.encoder.stats().encoderName.startsWith(chosen), qPrintable(run.encoder.stats().encoderName));
     }
-    EncodeRun unsupported({ VideoCodec::AV1, {} }, WIDTH, HEIGHT, BITRATE);
+    EncodeRun unsupported({ VideoCodec::Unknown, {} }, WIDTH, HEIGHT, BITRATE);
     QVERIFY(!unsupported.encodeNext());
+
+    // AV1 and H265 are the graphics card's or nobody's.
+    for (VideoCodec codec : { VideoCodec::AV1, VideoCodec::H265 }) {
+        for (const QString &name : Core::Media::videoEncoderNames(codec)) {
+            if (!Core::Media::videoEncoderWorks(name))
+                continue;
+            EncodeRun run({ codec, name }, WIDTH, HEIGHT, BITRATE);
+            QVERIFY(run.encodeNext());
+            QVERIFY2(run.encoder.stats().hardware, qPrintable(name));
+        }
+    }
 }
 
 void TestVideoEncode::encodableCodecsAreOfferedForSending()
@@ -958,23 +1333,136 @@ void TestVideoEncode::encodableCodecsAreOfferedForSending()
         QCOMPARE(codec.encode.get(), false);
 }
 
-// The probe's verdict on an encoder is that it opens and gives every frame back with the
-// picture it was made from. Microsoft's software H264 encoder opens and then runs sixteen
-// pictures behind, which is why it is not used.
+// What a Radeon RX 7000 was measured to make of each size (whatAnEncoderMakesOfASizeItCannotCode
+// measures it again wherever the encoder works).
+void TestVideoEncode::av1FromAmfIsCodedInWholeBlocks()
+{
+    using Core::Media::codedSize;
+    const QString amf = QStringLiteral("av1_amf");
+    QCOMPARE(codedSize(amf, QSize(1920, 1080)), QSize(1920, 1082));
+    QCOMPARE(codedSize(amf, QSize(640, 360)), QSize(640, 362));
+    QCOMPARE(codedSize(amf, QSize(960, 540)), QSize(960, 544));
+    QCOMPARE(codedSize(amf, QSize(1000, 700)), QSize(1024, 704));
+    QCOMPARE(codedSize(amf, QSize(1280, 720)), QSize(1280, 720));
+    QCOMPARE(codedSize(amf, QSize(2560, 1440)), QSize(2560, 1440));
+    QCOMPARE(codedSize(amf, QSize(1452, 752)), QSize(1472, 752));
+
+    // Every other encoder codes what it is given.
+    QStringList others = { QString(), QStringLiteral("av1_nvenc"), QStringLiteral("av1_qsv"), QStringLiteral("av1_mf hardware"), QStringLiteral("av1_vaapi") };
+    for (VideoCodec codec : CODECS)
+        others.append(Core::Media::videoEncoderNames(codec));
+    others.removeAll(amf);
+    QVERIFY(others.contains(QStringLiteral("libvpx")));
+    for (const QString &name : std::as_const(others)) {
+        for (const QSize &size : { QSize(1920, 1080), QSize(640, 360), QSize(1000, 700), QSize(1452, 752) })
+            QVERIFY2(codedSize(name, size) == size, qPrintable(name));
+    }
+}
+
+void TestVideoEncode::blackColumnsAreNotAcceptableAndAFewRowsAre()
+{
+    using Core::Media::paddingIsAcceptable;
+    QVERIFY(paddingIsAcceptable(QSize(1280, 720), QSize(1280, 720)));
+    QVERIFY(paddingIsAcceptable(QSize(1280, 720), QSize(1280, 728)));
+    QVERIFY(!paddingIsAcceptable(QSize(1280, 720), QSize(1280, 730)));
+    QVERIFY(!paddingIsAcceptable(QSize(1280, 720), QSize(1282, 720)));
+    QVERIFY(!paddingIsAcceptable(QSize(1280, 720), QSize(1344, 722)));
+
+    const auto accepted = [](const QString &encoder, const QSize &size) { return paddingIsAcceptable(size, Core::Media::codedSize(encoder, size)); };
+    const QString amf = QStringLiteral("av1_amf");
+    QVERIFY(accepted(amf, QSize(1920, 1080)));
+    QVERIFY(accepted(amf, QSize(640, 360)));
+    QVERIFY(accepted(amf, QSize(960, 540)));
+    QVERIFY(accepted(amf, QSize(1280, 720)));
+    QVERIFY(accepted(amf, QSize(2560, 1440)));
+    QVERIFY(!accepted(amf, QSize(1000, 700)));
+    QVERIFY(!accepted(amf, QSize(1452, 752)));
+    // The right width, and fourteen rows short of a whole block.
+    QVERIFY(!accepted(amf, QSize(1280, 722)));
+
+    for (const QString &exact : { QStringLiteral("av1_nvenc"), QStringLiteral("av1_qsv"), QStringLiteral("hevc_amf"), QStringLiteral("libvpx") }) {
+        for (const QSize &size : { QSize(1920, 1080), QSize(1000, 700), QSize(1452, 752), QSize(1280, 722) })
+            QVERIFY2(accepted(exact, size), qPrintable(exact));
+    }
+}
+
+void TestVideoEncode::av1IsOfferedOnlyWhereItAddsNoBlack()
+{
+    using Core::Media::cameraCodecs;
+    using Core::Media::shareCodecs;
+    const QString amf = QStringLiteral("av1_amf");
+    const QString nvenc = QStringLiteral("av1_nvenc");
+    const QList<VideoCodec> all = { VideoCodec::AV1, VideoCodec::H265, VideoCodec::H264, VideoCodec::VP8 };
+    const QList<VideoCodec> withoutAv1 = { VideoCodec::H265, VideoCodec::H264, VideoCodec::VP8 };
+
+    QVERIFY(shareCodecs(all, amf, QSize(1920, 1080)) == all);
+    QVERIFY(shareCodecs(all, amf, QSize(1280, 720)) == all);
+    QVERIFY(shareCodecs(all, amf, QSize(1452, 752)) == withoutAv1);
+    QVERIFY(shareCodecs(all, amf, QSize(1000, 700)) == withoutAv1);
+    QVERIFY(shareCodecs(all, nvenc, QSize(1452, 752)) == all);
+    QVERIFY(shareCodecs(withoutAv1, amf, QSize(1452, 752)) == withoutAv1);
+    // Asked of what a share already offers, a codec that was left out once stays out.
+    QVERIFY(shareCodecs(shareCodecs(all, amf, QSize(1452, 752)), amf, QSize(1920, 1080)) == withoutAv1);
+
+    QVERIFY(cameraCodecs(all, amf) == withoutAv1);
+    QVERIFY(cameraCodecs(all, nvenc) == all);
+    QVERIFY(cameraCodecs(all, QStringLiteral("av1_qsv")) == all);
+    QVERIFY(cameraCodecs(withoutAv1, amf) == withoutAv1);
+    QVERIFY(cameraCodecs({ VideoCodec::VP8 }, amf) == QList<VideoCodec>{ VideoCodec::VP8 });
+}
+
+// The probe's verdict on an encoder is that it opens, gives every frame back with the picture
+// it was made from, and makes about the bit rate it was asked for. Microsoft's software H264
+// encoder opens and then runs sixteen pictures behind, which is why it is not used, and a
+// Radeon's AV1 encoder never answers at all when it is reached through Media Foundation.
 void TestVideoEncode::theProbeTurnsDownWhatCannotKeepUp()
 {
     QFETCH(EncoderCase, encoderCase);
     constexpr int PICTURES = 30;
+    constexpr int SETTLING = 10;
+    constexpr int PROBE_BITRATE = 1'000'000;
+    constexpr int ANSWERS_WITHIN_MS = 15000;
 
-    EncodeRun run(encoderCase, WIDTH, HEIGHT, BITRATE);
-    bool opens = true;
-    for (int index = 0; index < PICTURES && opens; index++)
-        opens = run.encodeNext();
-    const int withTheirPicture = static_cast<int>(std::count(run.producedItsOwnFrame.begin(), run.producedItsOwnFrame.end(), true));
-    qInfo().noquote() << encoderCase.encoderName << (opens ? "opens;" : "does not open;") << run.frames.size() << "frames from" << run.sent << "pictures," << withTheirPicture << "of them with the picture's own call";
+    struct Seen
+    {
+        bool opens = true;
+        int frames = 0;
+        int sent = 0;
+        int withTheirPicture = 0;
+        bool startsWithAKeyFrame = false;
+        double rate = 0;
+    };
+    // On a thread that is left behind should the encoder never come back.
+    const auto seen = std::make_shared<std::promise<Seen>>();
+    std::future<Seen> finished = seen->get_future();
+    std::thread([seen, encoderCase] {
+        Seen result;
+        EncodeRun run(encoderCase, WIDTH, HEIGHT, PROBE_BITRATE);
+        size_t settled = 0;
+        for (int index = 0; index < PICTURES && result.opens; index++) {
+            if (index == SETTLING)
+                settled = run.frames.size();
+            result.opens = run.encodeNext();
+        }
+        result.frames = static_cast<int>(run.frames.size());
+        result.sent = run.sent;
+        result.withTheirPicture = static_cast<int>(std::count(run.producedItsOwnFrame.begin(), run.producedItsOwnFrame.end(), true));
+        result.startsWithAKeyFrame = !run.frames.empty() && run.frames[0].keyframe;
+        result.rate = run.bitsPerSecond(settled, run.frames.size(), PICTURES - SETTLING);
+        seen->set_value(result);
+    }).detach();
 
-    const bool keepsUp = opens && withTheirPicture == PICTURES && run.frames[0].keyframe;
-    QCOMPARE(Core::Media::videoEncoderWorks(encoderCase.encoderName), keepsUp);
+    if (finished.wait_for(std::chrono::milliseconds(ANSWERS_WITHIN_MS)) != std::future_status::ready) {
+        qInfo().noquote() << encoderCase.encoderName << "never answers";
+        QVERIFY(!Core::Media::videoEncoderWorks(encoderCase.encoderName));
+        return;
+    }
+    const Seen result = finished.get();
+    qInfo().noquote() << encoderCase.encoderName << (result.opens ? "opens;" : "does not open;") << result.frames << "frames from" << result.sent << "pictures," << result.withTheirPicture << "of them with the picture's own call; asked" << PROBE_BITRATE << "made" << qRound(result.rate);
+
+    const bool keepsUp = result.opens && result.withTheirPicture == PICTURES && result.startsWithAKeyFrame;
+    const bool holdsTheRate = result.rate > PROBE_BITRATE * 0.25 && result.rate < PROBE_BITRATE * 2.0;
+    QCOMPARE(Core::Media::videoEncoderWorks(encoderCase.encoderName), keepsUp && holdsTheRate);
 }
 
 void TestVideoEncode::everyPictureComesOutAtOnceAndDecodes()
@@ -991,11 +1479,12 @@ void TestVideoEncode::everyPictureComesOutAtOnceAndDecodes()
         QVERIFY2(run.encodeNext(), qPrintable(QStringLiteral("picture %1 could not be encoded").arg(index)));
     }
     qInfo() << "encoder:" << run.encoder.stats().encoderName << "hardware:" << run.encoder.stats().hardware;
-    if (encoderCase.codec == VideoCodec::H264) {
-        // Main or High, as the official client sends: not Baseline.
-        const int profile = h264Profile(run.frames[0].data);
-        qInfo() << "H264 profile_idc:" << profile;
-        QVERIFY(profile == 77 || profile == 100);
+    qInfo().noquote() << "the first key frame is made of units" << unitTypes(encoderCase.codec, run.frames[0]) << "and the frame after it of" << unitTypes(encoderCase.codec, run.frames[1]);
+    if (encoderCase.codec != VideoCodec::VP8) {
+        // The official client's: Main or High for H264 and not Baseline, Main for the others.
+        const int profile = profileOf(encoderCase.codec, run.frames[0].data);
+        qInfo() << "profile:" << profile;
+        QVERIFY(encoderCase.codec == VideoCodec::H264 ? profile == 77 || profile == 100 : profile == (encoderCase.codec == VideoCodec::H265 ? 1 : 0));
     }
 
     // One picture in, its frame out of the same call: nothing is held back.
@@ -1017,8 +1506,9 @@ void TestVideoEncode::everyPictureComesOutAtOnceAndDecodes()
     QCOMPARE(whole.errors, quint64(0));
     QCOMPARE(whole.dropped, quint64(0));
     QCOMPARE(whole.pictures, PICTURES);
-    QCOMPARE(whole.width, WIDTH);
-    QCOMPARE(whole.height, HEIGHT);
+    QVERIFY2(isThePictureSent(encoderCase.codec, whole, QSize(WIDTH, HEIGHT)), qPrintable(QStringLiteral("%1x%2").arg(whole.width).arg(whole.height)));
+    // Eight bits and 4:2:0, as the official client sends.
+    QVERIFY(whole.format == AV_PIX_FMT_YUV420P || whole.format == AV_PIX_FMT_YUVJ420P);
 
     // A key frame needs nothing that came before it, and what follows needs only the key frame.
     for (size_t index = 0; index < run.frames.size(); index++) {
@@ -1027,7 +1517,7 @@ void TestVideoEncode::everyPictureComesOutAtOnceAndDecodes()
         const Decoded alone = decodeAll(encoderCase.codec, std::vector<EncodedVideoFrame>{ run.frames[index] });
         QCOMPARE(alone.errors, quint64(0));
         QCOMPARE(alone.pictures, 1);
-        QCOMPARE(alone.width, WIDTH);
+        QVERIFY(isThePictureSent(encoderCase.codec, alone, QSize(WIDTH, HEIGHT)));
 
         const std::vector<EncodedVideoFrame> fromHere(run.frames.begin() + static_cast<std::ptrdiff_t>(index), run.frames.end());
         const Decoded rest = decodeAll(encoderCase.codec, fromHere);
@@ -1123,8 +1613,7 @@ void TestVideoEncode::aChangedPictureSizeStartsANewStream()
     const Decoded decoded = decodeAll(encoderCase.codec, frames);
     QCOMPARE(decoded.errors, quint64(0));
     QCOMPARE(decoded.pictures, PICTURES);
-    QCOMPARE(decoded.width, 960);
-    QCOMPARE(decoded.height, 540);
+    QVERIFY2(isThePictureSent(encoderCase.codec, decoded, QSize(960, 540)), qPrintable(QStringLiteral("%1x%2").arg(decoded.width).arg(decoded.height)));
 }
 
 void TestVideoEncode::encodeTimes()
@@ -1151,10 +1640,451 @@ void TestVideoEncode::encodeTimes()
     }
 }
 
+namespace {
+
+std::vector<uint8_t> joined(const std::vector<std::vector<uint8_t>> &parts)
+{
+    std::vector<uint8_t> whole;
+    for (const std::vector<uint8_t> &part : parts)
+        whole.insert(whole.end(), part.begin(), part.end());
+    return whole;
+}
+
+std::vector<uint8_t> annexB(const std::vector<std::vector<uint8_t>> &nals)
+{
+    std::vector<uint8_t> frame;
+    for (const std::vector<uint8_t> &nal : nals) {
+        frame.insert(frame.end(), { 0, 0, 0, 1 });
+        frame.insert(frame.end(), nal.begin(), nal.end());
+    }
+    return frame;
+}
+
+// An OBU that says its size, or one that leaves it out, as the last of a temporal unit may.
+std::vector<uint8_t> obu(int type, const std::vector<uint8_t> &payload, bool saysItsSize = true)
+{
+    std::vector<uint8_t> whole = { static_cast<uint8_t>((type << 3) | (saysItsSize ? 0x02 : 0)) };
+    for (size_t size = payload.size(); saysItsSize; size >>= 7) {
+        whole.push_back(static_cast<uint8_t>((size & 0x7F) | (size > 0x7F ? 0x80 : 0)));
+        if (size <= 0x7F)
+            break;
+    }
+    whole.insert(whole.end(), payload.begin(), payload.end());
+    return whole;
+}
+
+struct Finished
+{
+    bool whole = false;
+    bool keyframe = false;
+    std::vector<uint8_t> data;
+};
+
+Finished finish(Core::Media::EncodedFrameFinisher &finisher, const std::vector<uint8_t> &data)
+{
+    EncodedVideoFrame frame;
+    frame.data = data;
+    Finished finished;
+    finished.whole = finisher.finish(frame);
+    finished.keyframe = frame.keyframe;
+    finished.data = frame.data;
+    return finished;
+}
+
+void remember(Core::Media::EncodedFrameFinisher &finisher, const std::vector<uint8_t> &extradata)
+{
+    finisher.rememberParameterSets(extradata.data(), extradata.size());
+}
+
+// Stamps one colour over the middle of a YUV picture.
+void stampPatch(AVFrame *picture, const Yuv &colour)
+{
+    const bool interleaved = picture->format == AV_PIX_FMT_NV12;
+    for (int y = picture->height * 3 / 8; y < picture->height * 5 / 8; y++) {
+        for (int x = picture->width * 3 / 8; x < picture->width * 5 / 8; x++) {
+            picture->data[0][y * picture->linesize[0] + x] = static_cast<uint8_t>(std::lround(colour.y));
+            if (interleaved) {
+                picture->data[1][(y / 2) * picture->linesize[1] + (x / 2) * 2] = static_cast<uint8_t>(std::lround(colour.u));
+                picture->data[1][(y / 2) * picture->linesize[1] + (x / 2) * 2 + 1] = static_cast<uint8_t>(std::lround(colour.v));
+            } else {
+                picture->data[1][(y / 2) * picture->linesize[1] + x / 2] = static_cast<uint8_t>(std::lround(colour.u));
+                picture->data[2][(y / 2) * picture->linesize[2] + x / 2] = static_cast<uint8_t>(std::lround(colour.v));
+            }
+        }
+    }
+}
+
+} // namespace
+
+// The encoders of the machine this was written on leave nothing out, so the frames here are
+// made by hand, of units that are little more than their first bytes: those are what say what
+// a unit is.
+void TestVideoEncode::aFrameIsMadeWholeWhateverItsEncoderLeftOut()
+{
+    using Core::Media::EncodedFrameFinisher;
+    {
+        const std::vector<uint8_t> sps = { 0x67, 0x64, 0x1F }, pps = { 0x68, 0xEE }, laterSps = { 0x67, 0x4D, 0x28 }, laterPps = { 0x68, 0xCE };
+        const std::vector<uint8_t> delimiter = { 0x09, 0x10 }, idr = { 0x65, 0x88, 0x80 }, slice = { 0x41, 0x9A, 0x20 };
+        EncodedFrameFinisher finisher(VideoCodec::H264);
+        // A key frame whose parameter sets were never seen cannot be sent.
+        QVERIFY(!finish(finisher, annexB({ idr })).whole);
+
+        remember(finisher, annexB({ sps, pps }));
+        Finished finished = finish(finisher, annexB({ delimiter, idr }));
+        QVERIFY(finished.whole && finished.keyframe);
+        QVERIFY(finished.data == annexB({ sps, pps, idr }));
+
+        finished = finish(finisher, annexB({ delimiter, slice }));
+        QVERIFY(finished.whole && !finished.keyframe);
+        QVERIFY(finished.data == annexB({ delimiter, slice }));
+
+        // A key frame that brings them is left as it is, and they are what the next one gets.
+        finished = finish(finisher, annexB({ laterSps, laterPps, idr }));
+        QVERIFY(finished.whole && finished.keyframe);
+        QVERIFY(finished.data == annexB({ laterSps, laterPps, idr }));
+        QVERIFY(finish(finisher, annexB({ idr })).data == annexB({ laterSps, laterPps, idr }));
+
+        // With lengths in place of start codes, as in an MP4 file.
+        QVERIFY(!finish(finisher, { 0, 0, 0, 3, 0x65, 0x88, 0x80 }).whole);
+        QVERIFY(!finish(finisher, {}).whole);
+    }
+    {
+        const std::vector<uint8_t> vps = { 0x40, 0x01, 0x0C }, sps = { 0x42, 0x01, 0x01 }, pps = { 0x44, 0x01, 0xC1 }, laterSps = { 0x42, 0x01, 0x02 }, laterPps = { 0x44, 0x01, 0xC2 };
+        const std::vector<uint8_t> delimiter = { 0x46, 0x01, 0x50 }, sei = { 0x4E, 0x01, 0x05 }, idr = { 0x26, 0x01, 0xAF }, cleanRandomAccess = { 0x2A, 0x01, 0xAF }, trailing = { 0x02, 0x01, 0xD0 };
+        EncodedFrameFinisher finisher(VideoCodec::H265);
+        remember(finisher, annexB({ sps, pps }));
+        QVERIFY(!finish(finisher, annexB({ idr })).whole);
+
+        remember(finisher, annexB({ vps, sps, pps }));
+        Finished finished = finish(finisher, annexB({ delimiter, sei, idr }));
+        QVERIFY(finished.whole && finished.keyframe);
+        QVERIFY(finished.data == annexB({ vps, sps, pps, sei, idr }));
+
+        // Every picture a decoder can start at is a key frame, not only an IDR.
+        finished = finish(finisher, annexB({ cleanRandomAccess }));
+        QVERIFY(finished.whole && finished.keyframe);
+        QVERIFY(finished.data == annexB({ vps, sps, pps, cleanRandomAccess }));
+
+        finished = finish(finisher, annexB({ delimiter, trailing }));
+        QVERIFY(finished.whole && !finished.keyframe);
+        QVERIFY(finished.data == annexB({ delimiter, trailing }));
+
+        QVERIFY(finish(finisher, annexB({ vps, sps, pps, idr })).data == annexB({ vps, sps, pps, idr }));
+        // One that brings some of them gets the rest, in the order they belong in.
+        QVERIFY(finish(finisher, annexB({ laterSps, laterPps, idr })).data == annexB({ vps, laterSps, laterPps, idr }));
+    }
+    {
+        constexpr int TEMPORAL_DELIMITER = OBU_TEMPORAL_DELIMITER;
+        constexpr int TILE_GROUP = 4;
+        const std::vector<uint8_t> sequence = { 0x00, 0x00, 0x00, 0x42, 0xAB }, laterSequence = { 0x00, 0x00, 0x00, 0x6A, 0xAB };
+        // What a frame header opens with: a key frame that is shown, a frame predicted from
+        // others, and an earlier frame shown again.
+        const std::vector<uint8_t> key = { 0x10, 0x00, 0x55 }, predicted = { 0x30, 0x11 }, shownAgain = { 0x90 };
+        const std::vector<uint8_t> delimiter = obu(TEMPORAL_DELIMITER, {});
+        EncodedFrameFinisher finisher(VideoCodec::AV1);
+        QVERIFY(!finish(finisher, joined({ delimiter, obu(OBU_FRAME, key) })).whole);
+
+        remember(finisher, obu(OBU_SEQUENCE_HEADER, sequence));
+        Finished finished = finish(finisher, joined({ delimiter, obu(OBU_FRAME, key) }));
+        QVERIFY(finished.whole && finished.keyframe);
+        QVERIFY(finished.data == joined({ delimiter, obu(OBU_SEQUENCE_HEADER, sequence), obu(OBU_FRAME, key) }));
+
+        finished = finish(finisher, joined({ delimiter, obu(OBU_FRAME, predicted) }));
+        QVERIFY(finished.whole && !finished.keyframe);
+        QVERIFY(finished.data == joined({ delimiter, obu(OBU_FRAME, predicted) }));
+        finished = finish(finisher, joined({ delimiter, obu(OBU_FRAME_HEADER, shownAgain) }));
+        QVERIFY(finished.whole && !finished.keyframe);
+
+        // A frame may come as its header and its tiles apart.
+        finished = finish(finisher, joined({ obu(OBU_FRAME_HEADER, key), obu(TILE_GROUP, { 0x77, 0x78 }) }));
+        QVERIFY(finished.whole && finished.keyframe);
+        QVERIFY(finished.data == joined({ obu(OBU_SEQUENCE_HEADER, sequence), obu(OBU_FRAME_HEADER, key), obu(TILE_GROUP, { 0x77, 0x78 }) }));
+
+        finished = finish(finisher, joined({ delimiter, obu(OBU_SEQUENCE_HEADER, laterSequence), obu(OBU_FRAME, key) }));
+        QVERIFY(finished.whole && finished.keyframe);
+        QVERIFY(finished.data == joined({ delimiter, obu(OBU_SEQUENCE_HEADER, laterSequence), obu(OBU_FRAME, key) }));
+        QVERIFY(finish(finisher, obu(OBU_FRAME, key)).data == joined({ obu(OBU_SEQUENCE_HEADER, laterSequence), obu(OBU_FRAME, key) }));
+
+        // The last OBU may leave its size out, and is given it: long enough here that the size
+        // takes two bytes.
+        std::vector<uint8_t> longKey(300, 0x5A);
+        longKey[0] = key[0];
+        finished = finish(finisher, joined({ delimiter, obu(OBU_FRAME, longKey, false) }));
+        QVERIFY(finished.whole && finished.keyframe);
+        QVERIFY(finished.data == joined({ delimiter, obu(OBU_SEQUENCE_HEADER, laterSequence), obu(OBU_FRAME, longKey) }));
+        finished = finish(finisher, joined({ delimiter, obu(OBU_FRAME, predicted, false) }));
+        QVERIFY(finished.whole && !finished.keyframe);
+        QVERIFY(finished.data == joined({ delimiter, obu(OBU_FRAME, predicted) }));
+
+        // Not OBUs: the bit that is always clear is set, a size runs past the end, no picture.
+        QVERIFY(!finish(finisher, { 0xB2, 0x01, 0x10 }).whole);
+        QVERIFY(!finish(finisher, { 0x32, 0x09, 0x10 }).whole);
+        QVERIFY(!finish(finisher, delimiter).whole);
+
+        // Extradata may be the sequence header as an MP4 file keeps it, behind four bytes.
+        EncodedFrameFinisher fromConfiguration(VideoCodec::AV1);
+        remember(fromConfiguration, joined({ { 0x81, 0x00, 0x0C, 0x00 }, obu(OBU_SEQUENCE_HEADER, sequence) }));
+        QVERIFY(finish(fromConfiguration, obu(OBU_FRAME, key)).data == joined({ obu(OBU_SEQUENCE_HEADER, sequence), obu(OBU_FRAME, key) }));
+
+        // A stream of still pictures has key frames only, and its frame headers do not say so.
+        const std::vector<uint8_t> stills = { 0x18, 0x00 };
+        finished = finish(fromConfiguration, joined({ obu(OBU_SEQUENCE_HEADER, stills), obu(OBU_FRAME, predicted) }));
+        QVERIFY(finished.whole && finished.keyframe);
+    }
+    {
+        EncodedFrameFinisher finisher(VideoCodec::VP8);
+        QVERIFY(finish(finisher, { 0x10, 0x02, 0x00 }).keyframe);
+        Finished finished = finish(finisher, { 0x11, 0x02, 0x00 });
+        QVERIFY(finished.whole && !finished.keyframe);
+        EncodedFrameFinisher unknown;
+        QVERIFY(!finish(unknown, { 0x10, 0x02, 0x00 }).whole);
+    }
+}
+
+// A graphics card's encoder left to itself makes a key frame every few hundred pictures (a
+// Radeon's every 240 or 300), which the other tests are too short to see.
+void TestVideoEncode::noKeyFrameComesUnasked()
+{
+    QFETCH(EncoderCase, encoderCase);
+    SKIP_AN_ENCODER_THAT_DOES_NOT_WORK(encoderCase);
+    constexpr int PICTURES = 330;
+
+    EncodeRun run(encoderCase, WIDTH, HEIGHT, BITRATE);
+    for (int index = 0; index < PICTURES; index++)
+        QVERIFY(run.encodeNext());
+    QVERIFY(run.frames[0].keyframe);
+    QCOMPARE(static_cast<int>(std::count_if(run.frames.begin(), run.frames.end(), [](const EncodedVideoFrame &frame) { return frame.keyframe; })), 1);
+    QCOMPARE(run.encoder.stats().opened, quint64(1));
+}
+
+void TestVideoEncode::theStreamSaysWhatColoursItIsIn_data()
+{
+    QTest::addColumn<EncoderCase>("encoderCase");
+    for (VideoCodec codec : CODECS) {
+        for (const QString &name : Core::Media::videoEncoderNames(codec)) {
+            QTest::newRow(qPrintable(name + QStringLiteral(", BT.709"))) << EncoderCase{ codec, name, AVCOL_SPC_BT709 };
+            QTest::newRow(qPrintable(name + QStringLiteral(", BT.601"))) << EncoderCase{ codec, name, AVCOL_SPC_SMPTE170M };
+        }
+    }
+}
+
+// Pictures that are YUV already are not converted by an encoder, only described. A colour has
+// to come out as it went in, in video range, and the stream has to name the matrix it is in or
+// name none: a viewer takes a stream that names none for BT.709 from 720 lines up and BT.601
+// below, which is why the pipelines send what a viewer would assume.
+void TestVideoEncode::theStreamSaysWhatColoursItIsIn()
+{
+    QFETCH(EncoderCase, encoderCase);
+    SKIP_AN_ENCODER_THAT_DOES_NOT_WORK(encoderCase);
+    constexpr int PICTURES = 20;
+    const auto sent = static_cast<AVColorSpace>(encoderCase.detail);
+    const Yuv patch = patchInYuv(sent == AVCOL_SPC_BT709);
+
+    VideoEncoder encoder(settingsFor(encoderCase, BITRATE));
+    AVFrame *picture = allocatePicture(encoder.softwareFormat(), WIDTH, HEIGHT);
+    const auto freePicture = qScopeGuard([&picture] { av_frame_free(&picture); });
+    std::vector<EncodedVideoFrame> frames;
+    for (int index = 0; index < PICTURES; index++) {
+        av_frame_make_writable(picture);
+        paintYuv(picture, index);
+        stampPatch(picture, patch);
+        picture->colorspace = sent;
+        picture->color_range = AVCOL_RANGE_MPEG;
+        QVERIFY(encoder.encode(picture, index * TICKS_PER_FRAME, frames) == VideoEncoder::Outcome::Encoded);
+    }
+
+    const Decoded decoded = decodeAll(encoderCase.codec, frames);
+    QCOMPARE(decoded.errors, quint64(0));
+    QCOMPARE(decoded.pictures, static_cast<int>(frames.size()));
+    qInfo().noquote() << QStringLiteral("%1: a patch of %2 %3 %4 decodes to %5 %6 %7; the stream was told matrix %8 and names matrix %9 and range %10").arg(encoder.stats().encoderName).arg(patch.y, 0, 'f', 0).arg(patch.u, 0, 'f', 0).arg(patch.v, 0, 'f', 0).arg(decoded.middle.y).arg(decoded.middle.u).arg(decoded.middle.v).arg(sent).arg(decoded.colorspace).arg(decoded.range);
+    QVERIFY(distance(decoded.middle, patch) < 6);
+    QVERIFY(decoded.range != AVCOL_RANGE_JPEG);
+    // VP8 has no way to say, and is BT.601 by definition. This picture is smaller than the 720
+    // lines from which a stream that names nothing is taken for BT.709, so BT.709 has to be
+    // named; BT.601, which goes by two names, may be left to be assumed.
+    if (encoderCase.codec == VideoCodec::VP8)
+        return;
+    if (sent == AVCOL_SPC_BT709)
+        QCOMPARE(decoded.colorspace, static_cast<int>(AVCOL_SPC_BT709));
+    else
+        QVERIFY(decoded.colorspace == AVCOL_SPC_SMPTE170M || decoded.colorspace == AVCOL_SPC_BT470BG || decoded.colorspace == AVCOL_SPC_UNSPECIFIED);
+}
+
+// Not a check of much: a record of what a viewer is sent when a picture's size is not one the
+// encoder codes. A Radeon of the 7000 series codes AV1 in blocks of 64 by 16, with two rows
+// more where eight are missing, as at 1080 and 360 lines. What fills the last blocks is sent
+// as picture, and is black. An AV1 frame can say at what size it is to be shown, which a
+// viewer may take for the part to show, and these do not say it.
+void TestVideoEncode::whatAnEncoderMakesOfASizeItCannotCode()
+{
+    QFETCH(EncoderCase, encoderCase);
+    SKIP_AN_ENCODER_THAT_DOES_NOT_WORK(encoderCase);
+    constexpr int PICTURES = 5;
+
+    QStringList seen;
+    for (const QSize &size : { QSize(1280, 720), QSize(1920, 1080), QSize(640, 360), QSize(960, 540), QSize(1000, 700), QSize(2560, 1440), QSize(1452, 752) }) {
+        EncodeRun run(encoderCase, size.width(), size.height(), 3'000'000);
+        for (int index = 0; index < PICTURES; index++)
+            QVERIFY(run.encodeNext());
+        // How far what lies beyond the picture is from the picture's own last row and column.
+        // The mean luma of what was decoded beyond the picture, where a row of the picture
+        // itself is 128 or so: below it, and to its right.
+        double below = 0;
+        double beside = 0;
+        const Decoded decoded = decodeAll(encoderCase.codec, run.frames, [&](const AVFrame *picture, int) {
+            if (picture->format != AV_PIX_FMT_YUV420P || picture->width < size.width() || picture->height < size.height())
+                return;
+            double rows = 0;
+            double columns = 0;
+            for (int y = size.height(); y < picture->height; y++) {
+                for (int x = 0; x < picture->width; x++)
+                    rows += picture->data[0][y * picture->linesize[0] + x];
+            }
+            for (int y = 0; y < size.height(); y++) {
+                for (int x = size.width(); x < picture->width; x++)
+                    columns += picture->data[0][y * picture->linesize[0] + x];
+            }
+            below = picture->height > size.height() ? rows / ((picture->height - size.height()) * picture->width) : 0;
+            beside = picture->width > size.width() ? columns / ((picture->width - size.width()) * size.height()) : 0;
+        });
+        QCOMPARE(decoded.errors, quint64(0));
+        QCOMPARE(decoded.pictures, static_cast<int>(run.frames.size()));
+        QString outcome = QStringLiteral("%1x%2 as %3x%4").arg(size.width()).arg(size.height()).arg(decoded.width).arg(decoded.height);
+        if (QSize(decoded.width, decoded.height) != size)
+            outcome += QStringLiteral(" (samples of %1:%2; luma of %3 below the picture and of %4 beside it)").arg(decoded.shape.num).arg(decoded.shape.den).arg(below, 0, 'f', 0).arg(beside, 0, 'f', 0);
+        seen.append(outcome);
+        QVERIFY2(isThePictureSent(encoderCase.codec, decoded, size), qPrintable(outcome));
+        // What is offered to the server for a size rests on this being known beforehand.
+        QVERIFY2(QSize(decoded.width, decoded.height) == Core::Media::codedSize(encoderCase.encoderName, size), qPrintable(outcome));
+    }
+    qInfo().noquote() << encoderCase.encoderName << "decodes" << seen.join(QStringLiteral(", "));
+}
+
+void TestVideoEncode::whatTheEncodersMakeOfTheSameRate_data()
+{
+    QTest::addColumn<EncoderCase>("encoderCase");
+    QTest::addColumn<bool>("page");
+    for (VideoCodec codec : CODECS) {
+        for (const QString &name : Core::Media::videoEncoderNames(codec)) {
+            for (int onTheCard : { 0, 1 }) {
+                const QString from = onTheCard ? QStringLiteral(", on the card") : QStringLiteral(", from memory");
+                QTest::newRow(qPrintable(name + QStringLiteral(", a moving picture") + from)) << EncoderCase{ codec, name, onTheCard } << false;
+                QTest::newRow(qPrintable(name + QStringLiteral(", a page of text") + from)) << EncoderCase{ codec, name, onTheCard } << true;
+            }
+        }
+    }
+}
+
+// Every encoder on the same pictures at the same rate, for the table cleanupTestCase prints:
+// what each made of the rate, how close its pictures are to the ones it was given, and how
+// long it took over one. The moving picture is tuned as a camera's is and the page as a
+// screen's, which is how each would be sent.
+void TestVideoEncode::whatTheEncodersMakeOfTheSameRate()
+{
+    QFETCH(EncoderCase, encoderCase);
+    QFETCH(bool, page);
+    SKIP_AN_ENCODER_THAT_DOES_NOT_WORK(encoderCase);
+    constexpr int PICTURES = 120;
+    constexpr int SETTLING = 30;
+    constexpr int RATE = 1'500'000;
+    const QSize size(1280, 720);
+    const bool onTheCard = encoderCase.detail == 1;
+    const Painter painter = page ? paintPage : paintYuv;
+
+    VideoEncoder::Settings settings = settingsFor(encoderCase, RATE);
+    settings.content = page ? VideoEncoder::Content::Screen : VideoEncoder::Content::Camera;
+    VideoEncoder encoder(settings);
+    if (onTheCard && !encoder.takesCardFrames())
+        QSKIP("this encoder takes no pictures from the graphics card");
+
+    AVFrame *inMemory = allocatePicture(encoder.softwareFormat(), size.width(), size.height());
+    const auto freeInMemory = qScopeGuard([&inMemory] { av_frame_free(&inMemory); });
+#ifdef Q_OS_WIN
+    std::optional<CardPictures> card;
+    if (onTheCard) {
+        card.emplace(AV_PIX_FMT_NV12, size.width(), size.height(), AVCOL_SPC_BT709);
+        if (!card->usable())
+            QSKIP("no Direct3D 11 device takes these pictures");
+    }
+#else
+    if (onTheCard)
+        QSKIP("pictures stay on the graphics card only on Windows");
+#endif
+
+    std::vector<EncodedVideoFrame> frames;
+    qint64 encodingNs = 0;
+    for (int index = 0; index < PICTURES; index++) {
+        AVFrame *picture = inMemory;
+#ifdef Q_OS_WIN
+        if (card)
+            picture = card->next(index, painter);
+#endif
+        if (picture == inMemory) {
+            av_frame_make_writable(inMemory);
+            painter(inMemory, index);
+        }
+        QVERIFY(picture);
+        QElapsedTimer timer;
+        timer.start();
+        QVERIFY(encoder.encode(picture, index * TICKS_PER_FRAME, frames) == VideoEncoder::Outcome::Encoded);
+        encodingNs += index > 0 ? timer.nsecsElapsed() : 0;
+    }
+    QVERIFY(!frames.empty() && frames[0].keyframe);
+    QCOMPARE(encoder.stats().opened, quint64(1));
+    QCOMPARE(encoder.stats().encoderName.contains(QStringLiteral("d3d11va")), onTheCard);
+    for (const EncodedVideoFrame &frame : frames)
+        QVERIFY(isWellFormed(encoderCase.codec, frame));
+
+    size_t settledBytes = 0;
+    for (const EncodedVideoFrame &frame : frames)
+        settledBytes += frame.rtpTimestamp >= uint32_t(SETTLING * TICKS_PER_FRAME) ? frame.data.size() : 0;
+    const double rate = static_cast<double>(settledBytes) * 8.0 * FRAMERATE / (PICTURES - SETTLING);
+
+    Likeness likeness(painter, size, SETTLING);
+    const Decoded decoded = decodeAll(encoderCase.codec, frames, [&](const AVFrame *picture, int frame) { likeness.compare(picture, static_cast<int>(frames[static_cast<size_t>(frame)].rtpTimestamp / TICKS_PER_FRAME)); });
+    QCOMPARE(decoded.errors, quint64(0));
+    QCOMPARE(decoded.pictures, static_cast<int>(frames.size()));
+    QVERIFY(isThePictureSent(encoderCase.codec, decoded, size));
+
+    const double msAPicture = static_cast<double>(encodingNs) / 1e6 / (PICTURES - 1);
+    comparison.append(QStringLiteral("%1 | %2 | %3 | %4 | %5 | %6 | %7 | %8 | %9 | %10")
+                              .arg(videoCodecName(encoderCase.codec), -4)
+                              .arg(encoderCase.encoderName, -16)
+                              .arg(page ? QStringLiteral("page of text") : QStringLiteral("moving picture"), -14)
+                              .arg(onTheCard ? QStringLiteral("card") : QStringLiteral("memory"), -6)
+                              .arg(RATE / 1000, 5)
+                              .arg(qRound(rate / 1000), 4)
+                              .arg(likeness.psnr(), 5, 'f', 2)
+                              .arg(msAPicture, 5, 'f', 2)
+                              .arg(frames.size(), 6)
+                              .arg(frames[0].data.size(), 9));
+    qInfo().noquote() << comparison.last();
+
+    // A graphics card's encoder has a frame for every picture. libvpx is set, as libwebrtc sets
+    // it, to leave pictures out when its buffer runs low, and after the key frame of a page of
+    // text it leaves out most. A rate control that works is not above what it was asked for,
+    // and uses it up on pictures that are hard enough; and a picture that looks nothing like
+    // what went in is no encode.
+    if (encoder.stats().hardware)
+        QCOMPARE(frames.size(), size_t(PICTURES));
+    QVERIFY2(rate < RATE * 1.3, qPrintable(QString::number(rate)));
+    if (!page)
+        QVERIFY2(rate > RATE * 0.7, qPrintable(QString::number(rate)));
+    QVERIFY2(likeness.psnr() > 20, qPrintable(QString::number(likeness.psnr())));
+}
+
+void TestVideoEncode::cleanupTestCase()
+{
+    if (comparison.isEmpty())
+        return;
+    const QString heading = QStringLiteral("1280x720 at 30 pictures a second, measured over the last 90 of 120; PSNR is of the luma\ncodec | encoder | pictures | from | kbps asked | got | PSNR dB | ms a picture | frames | key frame bytes\n");
+    qInfo().noquote() << heading + comparison.join(QLatin1Char('\n'));
+}
+
 void TestVideoEncode::picturesOnTheGraphicsCardAreEncodedThere_data()
 {
     QTest::addColumn<EncoderCase>("encoderCase");
-    for (VideoCodec codec : { VideoCodec::H264, VideoCodec::VP8 }) {
+    for (VideoCodec codec : CODECS) {
         for (const QString &name : Core::Media::videoEncoderNames(codec)) {
             QTest::newRow(qPrintable(name + QStringLiteral(", NV12"))) << EncoderCase{ codec, name, AV_PIX_FMT_NV12 };
             QTest::newRow(qPrintable(name + QStringLiteral(", BGRA"))) << EncoderCase{ codec, name, AV_PIX_FMT_BGRA };
@@ -1215,8 +2145,7 @@ void TestVideoEncode::picturesOnTheGraphicsCardAreEncodedThere()
         const Decoded decoded = decodeAll(encoderCase.codec, frames);
         QCOMPARE(decoded.errors, quint64(0));
         QCOMPARE(decoded.pictures, PICTURES);
-        QCOMPARE(decoded.width, WIDTH);
-        QCOMPARE(decoded.height, HEIGHT);
+        QVERIFY(isThePictureSent(encoderCase.codec, decoded, QSize(WIDTH, HEIGHT)));
         if (rgb) {
             // And the stream says so, or a small picture would be shown as BT.601.
             qInfo() << "the patch decodes to" << decoded.middle.y << decoded.middle.u << decoded.middle.v << ", off BT.709 by" << distance(decoded.middle, patchInYuv(true)) << "and off BT.601 by" << distance(decoded.middle, patchInYuv(false));
@@ -1262,6 +2191,187 @@ void TestVideoEncode::whichTexturesTheCardMakes()
 #endif
 }
 
+void TestVideoEncode::theCardScalesAndConvertsPictures_data()
+{
+    QTest::addColumn<bool>("bt601");
+    QTest::newRow("to BT.709") << false;
+    QTest::newRow("to BT.601") << true;
+}
+
+// What the card makes of full-range RGB has to be the video-range YUV of the coefficients asked
+// for: Y = 16 + 219 (Kr R + Kg G + Kb B) / 255, U = 128 + 224 (B - Y') / (2 (1 - Kb)) / 255 and
+// V likewise from R, with Kr and Kb 0.2126 and 0.0722 for BT.709 and 0.299 and 0.114 for BT.601.
+void TestVideoEncode::theCardScalesAndConvertsPictures()
+{
+#ifdef Q_OS_WIN
+    QFETCH(bool, bt601);
+    using Core::Video::CardScaler;
+    // A count of rounding in each of the three, where the two sets of coefficients put the
+    // colours six counts and more apart.
+    constexpr double CLOSE = 2.5;
+    constexpr double FAR_OFF = 5;
+    const QSize size(480, 360);
+    const QRect all(QPoint(0, 0), size);
+    const CardScaler::Output output = { size, bt601, false };
+
+    AVBufferRef *device = nullptr;
+    if (av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) < 0)
+        QSKIP("this machine has no Direct3D 11 device");
+    AVFrame *large = quartersOnCard(device, QSize(1280, 960));
+    AVFrame *lesser = quartersOnCard(device, QSize(640, 480));
+    AVFrame *scaled = av_frame_alloc();
+    AVFrame *inMemory = av_frame_alloc();
+    const auto release = qScopeGuard([&] {
+        av_frame_free(&inMemory);
+        av_frame_free(&scaled);
+        av_frame_free(&lesser);
+        av_frame_free(&large);
+        av_buffer_unref(&device);
+    });
+    QVERIFY(large && lesser);
+
+    CardScaler scaler;
+    if (!scaler.scale(large, output, scaled)) {
+        QVERIFY(!CardScaler::usable());
+        QSKIP("this machine's graphics card does not scale pictures");
+    }
+    QVERIFY(CardScaler::usable());
+
+    // The colour found at a point given in thousandths of the picture, against the quarter
+    // colour expected there, or black for none.
+    const auto shows = [&](int perMilleX, int perMilleY, int quarter, const char *where) {
+        const int x = size.width() * perMilleX / 1000;
+        const int y = size.height() * perMilleY / 1000;
+        const Yuv seen = colourAt(inMemory, x, y);
+        const Yuv expected = quarter < 0 ? Yuv{ 16, 128, 128 } : inYuv(QUARTER_COLOURS[static_cast<size_t>(quarter)], !bt601);
+        const double off = distance(seen, expected);
+        const double offTheOther = quarter < 0 ? 0 : distance(seen, inYuv(QUARTER_COLOURS[static_cast<size_t>(quarter)], bt601));
+        qInfo().noquote() << QStringLiteral("%1: %2 %3 %4, expected %5 %6 %7, off by %8 (off the other coefficients by %9)").arg(QLatin1String(where)).arg(seen.y).arg(seen.u).arg(seen.v).arg(expected.y, 0, 'f', 1).arg(expected.u, 0, 'f', 1).arg(expected.v, 0, 'f', 1).arg(off, 0, 'f', 1).arg(offTheOther, 0, 'f', 1);
+        // Grey is the same under both.
+        return off < CLOSE && (quarter < 0 || quarter == 3 || offTheOther > FAR_OFF);
+    };
+    const auto takenOffTheCard = [&] {
+        av_frame_unref(inMemory);
+        return av_hwframe_transfer_data(inMemory, scaled, 0) >= 0 && inMemory->format == AV_PIX_FMT_NV12 && QSize(inMemory->width, inMemory->height) == size;
+    };
+
+    // An NV12 picture on the same card, of the size asked for, that says what colours it has.
+    QCOMPARE(scaled->format, static_cast<int>(AV_PIX_FMT_D3D11));
+    QCOMPARE(formatOnCard(scaled), AV_PIX_FMT_NV12);
+    QCOMPARE(QSize(scaled->width, scaled->height), size);
+    QVERIFY(reinterpret_cast<const AVHWFramesContext *>(scaled->hw_frames_ctx->data)->device_ref->data == device->data);
+    QCOMPARE(static_cast<int>(scaled->colorspace), static_cast<int>(bt601 ? AVCOL_SPC_SMPTE170M : AVCOL_SPC_BT709));
+    QCOMPARE(static_cast<int>(scaled->color_range), static_cast<int>(AVCOL_RANGE_MPEG));
+    const uint8_t *const kind = scaled->hw_frames_ctx->data;
+
+    // Each quarter where it was, in its colour, whether or not the source had any opacity.
+    QVERIFY(takenOffTheCard());
+    QVERIFY(shows(250, 250, 0, "the whole picture, top left"));
+    QVERIFY(shows(750, 250, 1, "the whole picture, top right"));
+    QVERIFY(shows(250, 750, 2, "the whole picture, bottom left"));
+    QVERIFY(shows(750, 750, 3, "the whole picture, bottom right"));
+
+    // A part of the source is all that is drawn: its right half, and its bottom left quarter.
+    QVERIFY(scaler.scale(large, QRect(640, 0, 640, 960), output, all, scaled));
+    QVERIFY(takenOffTheCard());
+    QVERIFY(shows(100, 250, 1, "the right half, top left"));
+    QVERIFY(shows(900, 250, 1, "the right half, top right"));
+    QVERIFY(shows(100, 750, 3, "the right half, bottom left"));
+    QVERIFY(shows(900, 750, 3, "the right half, bottom right"));
+    QVERIFY(scaler.scale(large, QRect(0, 480, 640, 480), output, all, scaled));
+    QVERIFY(takenOffTheCard());
+    QVERIFY(shows(100, 100, 2, "the bottom left quarter, top left"));
+    QVERIFY(shows(900, 900, 2, "the bottom left quarter, bottom right"));
+
+    // Drawn over a part of the new picture, the rest of which is black.
+    QVERIFY(scaler.scale(large, QRect(0, 0, 1280, 960), output, QRect(120, 90, 240, 180), scaled));
+    QVERIFY(takenOffTheCard());
+    QVERIFY(shows(375, 375, 0, "placed in the middle, its top left"));
+    QVERIFY(shows(625, 625, 3, "placed in the middle, its bottom right"));
+    QVERIFY(shows(100, 100, -1, "placed in the middle, outside it at the top left"));
+    QVERIFY(shows(900, 500, -1, "placed in the middle, outside it on the right"));
+    QVERIFY(scaled->hw_frames_ctx->data == kind);
+
+    // A source of another size makes pictures of the same kind, so an encoder goes on with them.
+    QVERIFY(scaler.scale(lesser, output, scaled));
+    QVERIFY(scaled->hw_frames_ctx->data == kind);
+    QVERIFY(takenOffTheCard());
+    QVERIFY(shows(250, 250, 0, "the smaller source, top left"));
+    QVERIFY(shows(750, 750, 3, "the smaller source, bottom right"));
+    QVERIFY(scaler.scale(large, output, scaled));
+    QVERIFY(scaled->hw_frames_ctx->data == kind);
+
+    constexpr int PICTURES = 120;
+    const double before = processCpuMs();
+    for (int index = 0; index < PICTURES; index++)
+        QVERIFY(scaler.scale(index % 2 ? lesser : large, output, scaled));
+    qInfo().noquote() << QStringLiteral("scaling on the card: %1 ms of processor time a picture").arg((processCpuMs() - before) / PICTURES, 0, 'f', 3);
+#else
+    QSKIP("Direct3D 11 is on Windows");
+#endif
+}
+
+void TestVideoEncode::picturesScaledOnTheCardAreEncodedThere_data()
+{
+    QTest::addColumn<EncoderCase>("encoderCase");
+    for (VideoCodec codec : CODECS) {
+        for (const QString &name : Core::Media::videoEncoderNames(codec))
+            QTest::newRow(qPrintable(name)) << EncoderCase{ codec, name };
+    }
+}
+
+void TestVideoEncode::picturesScaledOnTheCardAreEncodedThere()
+{
+#ifdef Q_OS_WIN
+    QFETCH(EncoderCase, encoderCase);
+    SKIP_AN_ENCODER_THAT_DOES_NOT_WORK(encoderCase);
+    using Core::Video::CardScaler;
+    constexpr int PICTURES = 40;
+    const Core::Video::CardScaler::Output output = { QSize(WIDTH, HEIGHT), false, false };
+
+    VideoEncoder encoder(settingsFor(encoderCase, BITRATE));
+    if (!encoder.takesCardFrames())
+        QSKIP("this encoder takes no pictures from the graphics card");
+    CardPictures pictures(AV_PIX_FMT_BGRA, 2 * WIDTH, 2 * HEIGHT, AVCOL_SPC_RGB);
+    if (!pictures.usable())
+        QSKIP("no Direct3D 11 device takes these pictures");
+
+    CardScaler scaler;
+    AVFrame *scaled = av_frame_alloc();
+    const auto freeScaled = qScopeGuard([&scaled] { av_frame_free(&scaled); });
+    std::vector<EncodedVideoFrame> frames;
+    for (int index = 0; index < PICTURES; index++) {
+        AVFrame *picture = pictures.next(index);
+        QVERIFY(picture);
+        if (!scaler.scale(picture, output, scaled)) {
+            QVERIFY(!CardScaler::usable());
+            QSKIP("this machine's graphics card does not scale pictures");
+        }
+        QCOMPARE(formatOnCard(scaled), AV_PIX_FMT_NV12);
+        QVERIFY2(encoder.encode(scaled, index * TICKS_PER_FRAME, frames) == VideoEncoder::Outcome::Encoded, qPrintable(QStringLiteral("picture %1 was not taken from the card").arg(index)));
+        QCOMPARE(frames.size(), size_t(index + 1));
+    }
+    qInfo() << "encoder:" << encoder.stats().encoderName << encoder.stats().averageEncodeMs << "ms a picture";
+    QVERIFY(encoder.stats().encoderName.contains(QStringLiteral("d3d11va")));
+    QCOMPARE(encoder.stats().opened, quint64(1));
+    for (int index = 0; index < PICTURES; index++) {
+        QCOMPARE(frames[static_cast<size_t>(index)].keyframe, index == 0);
+        QVERIFY(isWellFormed(encoderCase.codec, frames[static_cast<size_t>(index)]));
+    }
+
+    const Decoded decoded = decodeAll(encoderCase.codec, frames);
+    QCOMPARE(decoded.errors, quint64(0));
+    QCOMPARE(decoded.pictures, PICTURES);
+    QVERIFY(isThePictureSent(encoderCase.codec, decoded, output.size));
+    qInfo() << "the patch decodes to" << decoded.middle.y << decoded.middle.u << decoded.middle.v << ", off BT.709 by" << distance(decoded.middle, patchInYuv(true)) << "and off BT.601 by" << distance(decoded.middle, patchInYuv(false)) << "; the stream says its colours are" << decoded.colorspace;
+    QVERIFY(distance(decoded.middle, patchInYuv(true)) < 6);
+    QVERIFY(distance(decoded.middle, patchInYuv(false)) > 12);
+    QCOMPARE(decoded.colorspace, static_cast<int>(AVCOL_SPC_BT709));
+#else
+    QSKIP("pictures stay on the graphics card only on Windows");
+#endif
+}
+
 void TestVideoEncode::screensAreListedWithThumbnails()
 {
     if (!Core::Video::screenCaptureAvailable()) {
@@ -1304,6 +2414,8 @@ void TestVideoEncode::thePipelineSharesTheScreen_data()
     if (!encodable.isEmpty()) {
         QTest::newRow(qPrintable(videoCodecName(encodable.first()) + QStringLiteral(" at 720p, by graphics capture"))) << EncoderCase{ encodable.first(), {}, 720 } << CaptureMethod::GraphicsCapture;
         QTest::newRow(qPrintable(videoCodecName(encodable.first()) + QStringLiteral(" at the screen's own size, by graphics capture"))) << EncoderCase{ encodable.first(), {}, 0 } << CaptureMethod::GraphicsCapture;
+        // The second screen again, for what is in the middle of it.
+        QTest::newRow(qPrintable(videoCodecName(encodable.first()) + QStringLiteral(" at 720p, a second screen by duplication"))) << EncoderCase{ encodable.first(), {}, 720 } << CaptureMethod::DesktopDuplication;
     }
 }
 
@@ -1323,16 +2435,27 @@ void TestVideoEncode::thePipelineSharesTheScreen()
     CaptureSource source = sources.first();
 #ifdef Q_OS_WIN
     // Graphics capture has a picture only when the screen changes, which a window of the test's
-    // own sees to. That goes on a second screen, and that screen is then the one shared.
+    // own sees to. That goes on a second screen, and that screen is then the one shared. It is
+    // over the middle of its screen, so the middle of the picture is its colour.
     std::unique_ptr<TestWindow> stirring;
-    if (method == CaptureMethod::GraphicsCapture) {
+    if (method != CaptureMethod::Auto) {
         SKIP_WITHOUT_A_QUIET_SCREEN(quiet);
         const auto shared = std::find_if(sources.begin(), sources.end(), [&quiet](const CaptureSource &each) { return each.geometry == quiet->whole; });
         QVERIFY(shared != sources.end());
         source = *shared;
-        stirring = std::make_unique<TestWindow>(TestWindow::Look{ QSize(96, 96), quiet->cornerFor(QSize(160, 180)) });
+        stirring = std::make_unique<TestWindow>(TestWindow::Look{ QSize(440, 330), quiet->whole.center() - QPoint(220, 190) });
+        QVERIFY(stirring->isOpen());
+        QVERIFY(stirring->insideOnScreen().adjusted(40, 40, -40, -40).contains(quiet->whole.center()));
     }
 #endif
+
+    // A screen of a size the codec is not offered for is not shared in it. A row that is about
+    // how the screen is captured goes on in the codec such a screen is shared in.
+    const QSize expectedSize = encodeSizeFor(source.geometry.size(), encoderCase.detail);
+    const QList<VideoCodec> shared = codecsSharedAt(expectedSize);
+    if (!shared.contains(encoderCase.codec) && method == CaptureMethod::Auto)
+        QSKIP("a screen of this size is not shared in this codec, whose encoder would add black to it");
+    const VideoCodec codec = shared.contains(encoderCase.codec) ? encoderCase.codec : shared.first();
 
     BroadcastPipeline pipeline;
     QObject here;
@@ -1356,7 +2479,7 @@ void TestVideoEncode::thePipelineSharesTheScreen()
     settings.sourceId = source.id;
     settings.maxHeight = encoderCase.detail;
     settings.framerate = FRAMERATE;
-    settings.codec = encoderCase.codec;
+    settings.codec = codec;
     settings.bitrate = 2'500'000;
     settings.maxBitrate = 4'000'000;
 
@@ -1367,7 +2490,6 @@ void TestVideoEncode::thePipelineSharesTheScreen()
     QVERIFY2(failures.isEmpty(), qPrintable(failures.join(QLatin1Char(';'))));
     qInfo() << "20 frames after" << sinceStart.elapsed() << "ms";
 
-    const QSize expectedSize = encodeSizeFor(source.geometry.size(), encoderCase.detail);
     QCOMPARE(starts.size(), 1);
     QCOMPARE(starts.first(), expectedSize);
     QVERIFY(frames[0]->keyframe);
@@ -1426,6 +2548,8 @@ void TestVideoEncode::thePipelineSharesTheScreen()
     QVERIFY(lastStats.encoderName.endsWith(method == CaptureMethod::GraphicsCapture ? QStringLiteral(", from gfxcapture") : QStringLiteral(", from ddagrab")));
     QCOMPARE(lastStats.encodedSize, expectedSize);
     QVERIFY(lastStats.capturedFps > FRAMERATE * 0.8 && lastStats.capturedFps < FRAMERATE * 1.2);
+    // Scaled or not, the pictures never leave the card on their way to an encoder that is on it.
+    QCOMPARE(lastStats.encoderName.contains(QStringLiteral("(d3d11va)")), reachesTheEncoderOnTheCard(codec, expectedSize != source.geometry.size(), method == CaptureMethod::GraphicsCapture));
 
     pipeline.stop();
     QTest::qWait(300);
@@ -1437,12 +2561,18 @@ void TestVideoEncode::thePipelineSharesTheScreen()
 
     // Everything sent decodes as one stream, the gap and the new rate included.
     for (const EncodedFramePointer &frame : frames)
-        QVERIFY(isWellFormed(encoderCase.codec, *frame));
-    const Decoded decoded = decodeAll(encoderCase.codec, frames);
+        QVERIFY(isWellFormed(codec, *frame));
+    const Decoded decoded = decodeAll(codec, frames);
     QCOMPARE(decoded.errors, quint64(0));
     QCOMPARE(decoded.dropped, quint64(0));
     QCOMPARE(decoded.pictures, static_cast<int>(frames.size()));
-    QCOMPARE(QSize(decoded.width, decoded.height), expectedSize);
+    QVERIFY2(isThePictureSent(codec, decoded, expectedSize), qPrintable(QStringLiteral("%1x%2").arg(decoded.width).arg(decoded.height)));
+#ifdef Q_OS_WIN
+    if (stirring) {
+        qInfo() << "the middle of the screen decodes off the window's colour by" << offItsOwnCoefficients(decoded, decoded.middle, SHARED_COLOUR) << "; the stream says its colours are" << decoded.colorspace;
+        QVERIFY2(offItsOwnCoefficients(decoded, decoded.middle, SHARED_COLOUR) < COLOUR_SURVIVES, "the window in the middle of the screen is not its colour in the picture");
+    }
+#endif
 
     // The same pipeline shares again, and time does not run backwards across the restart.
     const uint32_t lastTimestamp = frames.back()->rtpTimestamp;
@@ -1453,6 +2583,104 @@ void TestVideoEncode::thePipelineSharesTheScreen()
     QCOMPARE(starts.size(), 2);
     QVERIFY(frames[0]->keyframe);
     QVERIFY(static_cast<int32_t>(frames[0]->rtpTimestamp - lastTimestamp) > 0);
+}
+
+void TestVideoEncode::whatScalingAScreenCosts_data()
+{
+    using Core::Video::CaptureMethod;
+    QTest::addColumn<CaptureMethod>("method");
+    QTest::newRow("by duplication") << CaptureMethod::DesktopDuplication;
+    QTest::newRow("by graphics capture") << CaptureMethod::GraphicsCapture;
+}
+
+// Not a check of much: a record of what capturing a screen and scaling it to 720p costs this
+// process before any encoder has it, each way a capture may be asked to hand its pictures over.
+// In software is how every scaled share went before the card was made to scale.
+void TestVideoEncode::whatScalingAScreenCosts()
+{
+#ifdef Q_OS_WIN
+    QFETCH(Core::Video::CaptureMethod, method);
+    using namespace Core::Video;
+    constexpr int SETTLING = 15;
+    constexpr int PICTURES = 60;
+    constexpr int MAX_HEIGHT = 720;
+    if (!screenCaptureAvailable() || !captureMethodUsable(method))
+        QSKIP("this build or this Windows cannot capture a screen this way");
+    const QList<CaptureSource> sources = captureSources();
+    if (sources.isEmpty())
+        QSKIP("no screen is attached");
+
+    // Graphics capture has a picture only when its screen changes, which a window sees to.
+    CaptureSource source = sources.first();
+    std::unique_ptr<TestWindow> stirring;
+    if (method == CaptureMethod::GraphicsCapture) {
+        SKIP_WITHOUT_A_QUIET_SCREEN(quiet);
+        const auto shared = std::find_if(sources.begin(), sources.end(), [&quiet](const CaptureSource &each) { return each.geometry == quiet->whole; });
+        QVERIFY(shared != sources.end());
+        source = *shared;
+        stirring = std::make_unique<TestWindow>(TestWindow::Look{ QSize(96, 96), quiet->cornerFor(QSize(160, 180)) });
+    }
+    const QSize size = encodeSizeFor(source.geometry.size(), MAX_HEIGHT);
+    if (size == source.geometry.size())
+        QSKIP("the screen is no larger than 720p, so nothing is scaled");
+
+    struct Way
+    {
+        const char *name;
+        bool keepOnCard;
+        bool rgbOnCard;
+    };
+    const std::array ways = {
+        Way{ "read back and scaled in software", false, false },
+        Way{ "kept on the card for an encoder that takes NV12 and the screen's own BGRA", true, true },
+        Way{ "kept on the card for an encoder that takes only NV12", true, false },
+    };
+    for (const Way &way : ways) {
+        ScreenCapture::Request request;
+        request.sourceId = source.id;
+        request.method = method;
+        request.maxHeight = MAX_HEIGHT;
+        request.framerate = FRAMERATE;
+        request.softwareFormat = AV_PIX_FMT_NV12;
+        request.keepOnCard = way.keepOnCard;
+        request.rgbOnCard = way.rgbOnCard;
+        ScreenCapture capture;
+        capture.configure(request);
+
+        AVFrame *picture = av_frame_alloc();
+        const auto freePicture = qScopeGuard([&picture] { av_frame_free(&picture); });
+        int read = 0;
+        int onCard = 0;
+        int nv12 = 0;
+        double cpuAfterSettling = 0;
+        QElapsedTimer timer;
+        timer.start();
+        while (read < SETTLING + PICTURES && timer.elapsed() < 10000) {
+            const ScreenCapture::Status status = capture.read(picture);
+            QVERIFY2(status != ScreenCapture::Status::Failed && status != ScreenCapture::Status::Closed, qPrintable(capture.failure()));
+            if (status != ScreenCapture::Status::Frame)
+                continue;
+            QCOMPARE(QSize(picture->width, picture->height), size);
+            QCOMPARE(static_cast<int>(picture->color_range), static_cast<int>(AVCOL_RANGE_MPEG));
+            QCOMPARE(static_cast<int>(picture->colorspace), static_cast<int>(AVCOL_SPC_BT709));
+            onCard += picture->hw_frames_ctx ? 1 : 0;
+            nv12 += (picture->hw_frames_ctx ? formatOnCard(picture) : static_cast<AVPixelFormat>(picture->format)) == AV_PIX_FMT_NV12 ? 1 : 0;
+            av_frame_unref(picture);
+            if (++read == SETTLING)
+                cpuAfterSettling = processCpuMs();
+        }
+        QCOMPARE(read, SETTLING + PICTURES);
+        qInfo().noquote() << QStringLiteral("a %1x%2 screen captured as %3x%4, %5: %6 ms of processor time a picture; %7 of %8 pictures on the card, %9 of them NV12").arg(source.geometry.width()).arg(source.geometry.height()).arg(size.width()).arg(size.height()).arg(QLatin1String(way.name)).arg((processCpuMs() - cpuAfterSettling) / PICTURES, 0, 'f', 2).arg(onCard).arg(read).arg(nv12);
+
+        // Graphics capture scales by itself for an encoder that takes its BGRA pictures. Every
+        // other picture that stays on the card is the video processor's, and NV12.
+        const bool scaledByTheSource = method == CaptureMethod::GraphicsCapture && way.rgbOnCard;
+        QCOMPARE(onCard, way.keepOnCard && (scaledByTheSource || CardScaler::usable()) ? read : 0);
+        QCOMPARE(nv12, scaledByTheSource ? 0 : read);
+    }
+#else
+    QSKIP("screens are captured on Windows");
+#endif
 }
 
 void TestVideoEncode::aScreenThatIsNotThereFails()
@@ -1693,10 +2921,13 @@ void TestVideoEncode::thePipelineSharesAWindow_data()
     using Core::Video::CaptureMethod;
     QTest::addColumn<CaptureMethod>("method");
     QTest::addColumn<bool>("scaledByWindows");
-    QTest::newRow("by graphics capture") << CaptureMethod::GraphicsCapture << false;
-    QTest::newRow("by graphics capture, a window Windows scales") << CaptureMethod::GraphicsCapture << true;
-    QTest::newRow("by duplication") << CaptureMethod::DesktopDuplication << false;
-    QTest::newRow("by duplication, a window Windows scales") << CaptureMethod::DesktopDuplication << true;
+    QTest::addColumn<int>("maxHeight");
+    QTest::newRow("by graphics capture") << CaptureMethod::GraphicsCapture << false << 0;
+    QTest::newRow("by graphics capture, a window Windows scales") << CaptureMethod::GraphicsCapture << true << 0;
+    QTest::newRow("by graphics capture, scaled down") << CaptureMethod::GraphicsCapture << false << 360;
+    QTest::newRow("by duplication") << CaptureMethod::DesktopDuplication << false << 0;
+    QTest::newRow("by duplication, a window Windows scales") << CaptureMethod::DesktopDuplication << true << 0;
+    QTest::newRow("by duplication, scaled down") << CaptureMethod::DesktopDuplication << false << 360;
 }
 
 void TestVideoEncode::thePipelineSharesAWindow()
@@ -1704,15 +2935,17 @@ void TestVideoEncode::thePipelineSharesAWindow()
 #ifdef Q_OS_WIN
     QFETCH(Core::Video::CaptureMethod, method);
     QFETCH(bool, scaledByWindows);
+    QFETCH(int, maxHeight);
     using namespace Core::Video;
     const QList<VideoCodec> encodable = Core::Media::encodableVideoCodecs();
     if (encodable.isEmpty())
         QSKIP("this machine has no encoder");
     if (!windowCaptureAvailable() || !captureMethodUsable(method))
         QSKIP("this build or this Windows cannot capture a window this way");
-    const VideoCodec codec = encodable.first();
+    // What follows looks at where things are in the decoded picture, so it takes a codec whose
+    // pictures come out at the size they went in, which AV1's do not from every graphics card.
+    const VideoCodec codec = encodable.contains(VideoCodec::H264) ? VideoCodec::H264 : encodable.first();
     const bool duplicated = method == CaptureMethod::DesktopDuplication;
-    const auto even = [](const QSize &size) { return QSize(size.width() & ~1, size.height() & ~1); };
     // Two lots of the statistics, a second apart, for what was captured how in between.
     const auto countsOverASecond = [](PipelineRecord &record, PathCounts *earlier, PathCounts *later) {
         for (PathCounts *counts : { earlier, later }) {
@@ -1729,14 +2962,15 @@ void TestVideoEncode::thePipelineSharesAWindow()
     TestWindow window(TestWindow::Look{ QSize(640, 480), home, SHARED_COLOUR, true, scaledByWindows });
     QVERIFY(window.isOpen());
     QTest::qWait(200);
-    const QSize firstSize = even(window.insideOnScreen().size());
+    const QSize firstSize = encodeSizeFor(window.insideOnScreen().size(), maxHeight);
+    QCOMPARE(firstSize != window.insideOnScreen().size(), maxHeight != 0);
 
     setCaptureMethod(method);
     BroadcastPipeline pipeline;
     PipelineRecord record(pipeline);
     BroadcastSettings settings;
     settings.sourceId = window.sourceId();
-    settings.maxHeight = 0;
+    settings.maxHeight = maxHeight;
     settings.framerate = FRAMERATE;
     settings.codec = codec;
     settings.bitrate = 2'500'000;
@@ -1763,6 +2997,8 @@ void TestVideoEncode::thePipelineSharesAWindow()
         QVERIFY(pathCounts(record.stats.last()).cutOut > 0);
     else
         QVERIFY(record.stats.last().encoderName.endsWith(QStringLiteral(", from gfxcapture")));
+    const bool onCard = reachesTheEncoderOnTheCard(codec, maxHeight != 0, !duplicated);
+    QCOMPARE(record.stats.last().encoderName.contains(QStringLiteral("(d3d11va)")), onCard);
 
     // A window that has gone still is sent on, a couple of pictures a second at the least.
     window.setAnimated(false);
@@ -1808,8 +3044,9 @@ void TestVideoEncode::thePipelineSharesAWindow()
 
     // The picture follows the window's size, and starts over with a key frame when it does.
     const size_t atResize = record.frames.size();
-    window.resizeInside(QSize(800, 600));
-    const QSize secondSize = even(window.insideOnScreen().size());
+    // Of another shape where the picture is scaled down, which would bring both sizes to the same.
+    window.resizeInside(maxHeight ? QSize(800, 400) : QSize(800, 600));
+    const QSize secondSize = encodeSizeFor(window.insideOnScreen().size(), maxHeight);
     QVERIFY(secondSize != firstSize);
     QTRY_VERIFY2_WITH_TIMEOUT(record.starts.size() == 2, "the encoded size did not follow the window", 4000);
     QCOMPARE(record.starts.last(), secondSize);
@@ -1845,6 +3082,8 @@ void TestVideoEncode::thePipelineSharesAWindow()
     QVERIFY2(looksLike(covered.middle, SHARED_COLOUR), "the middle of the picture is not the shared window's colour");
     QVERIFY2(!looksLike(covered.middle, COVERING_COLOUR), "what covered the window is in the picture");
     QVERIFY2(looksLike(covered.top, SHARED_COLOUR), "the top of the picture is not the inside of the window");
+    qInfo() << "covered, the middle decodes off the window's colour by" << offItsOwnCoefficients(covered, covered.middle, SHARED_COLOUR) << "; the stream says its colours are" << covered.colorspace;
+    QVERIFY2(offItsOwnCoefficients(covered, covered.middle, SHARED_COLOUR) < COLOUR_SURVIVES, "the window's colour did not survive while it was covered");
 
     if (duplicated) {
         QTest::qWait(300);
@@ -1916,12 +3155,94 @@ void TestVideoEncode::thePipelineSharesAWindow()
 
     for (const EncodedFramePointer &frame : record.frames)
         QVERIFY(isWellFormed(codec, *frame));
-    const Decoded decoded = decodeAll(codec, record.frames);
+    // Graphics capture has a picture with nothing in it for a window as it is hidden, as it is
+    // shown again and as it is closed. Sent on, a viewer sees black where the window was.
+    std::atomic<int> blackPictures{ 0 };
+    const Decoded decoded = decodeAll(codec, record.frames, [&blackPictures](const AVFrame *picture, int) {
+        if (picture->data[0][(picture->height / 2) * picture->linesize[0] + picture->width / 2] < BLACK_AT_MOST)
+            blackPictures++;
+    });
+    // A duplicated window is not held to this. Its screen shows it black from the moment it
+    // asks to be kept out of captures, and for a picture as Windows starts drawing it again.
+    if (!duplicated)
+        QCOMPARE(blackPictures.load(), 0);
     QCOMPARE(decoded.errors, quint64(0));
     QCOMPARE(decoded.pictures, static_cast<int>(record.frames.size()));
     QCOMPARE(QSize(decoded.width, decoded.height), secondSize);
     QVERIFY2(looksLike(decoded.middle, SHARED_COLOUR), "the middle of the last picture is not the shared window's colour");
     QVERIFY2(looksLike(decoded.top, SHARED_COLOUR), "the top of the last picture is not the inside of the window");
+    qInfo() << "uncovered, the middle decodes off the window's colour by" << offItsOwnCoefficients(decoded, decoded.middle, SHARED_COLOUR) << "; the stream says its colours are" << decoded.colorspace;
+    QVERIFY2(offItsOwnCoefficients(decoded, decoded.middle, SHARED_COLOUR) < COLOUR_SURVIVES, "the window's colour did not survive");
+    // Whatever the window went through, its pictures stayed where they were to begin with.
+    QCOMPARE(record.stats.last().encoderName.contains(QStringLiteral("(d3d11va)")), onCard);
+#else
+    QSKIP("windows are captured on Windows");
+#endif
+}
+
+// A window whose size AV1's encoder would add black columns to: its size is reported, so that
+// another codec can be asked for, and none of it is encoded until it has a size that is coded
+// as it is.
+void TestVideoEncode::thePipelineHoldsBackWhatItsEncoderWouldPad()
+{
+#ifdef Q_OS_WIN
+    using namespace Core::Video;
+    using Core::Media::codedSize;
+    const QString encoderName = Core::Media::videoEncoderFor(VideoCodec::AV1);
+    const QSize padded(700, 500);
+    const QSize exact(640, 480);
+    if (encoderName.isEmpty() || codedSize(encoderName, padded) == padded)
+        QSKIP("this machine's AV1 encoder, if it has one, codes every size as it is");
+    if (!windowCaptureAvailable())
+        QSKIP("this build or this Windows cannot capture a window");
+    QVERIFY(!Core::Media::paddingIsAcceptable(padded, codedSize(encoderName, padded)));
+    QCOMPARE(codedSize(encoderName, exact), exact);
+
+    SKIP_WITHOUT_A_QUIET_SCREEN(quiet);
+    TestWindow window(TestWindow::Look{ padded, quiet->cornerFor(QSize(860, 700)) });
+    QVERIFY(window.isOpen());
+    QTest::qWait(200);
+    QCOMPARE(window.insideOnScreen().size(), padded);
+
+    CaptureSource source;
+    source.id = window.sourceId();
+    source.kind = CaptureSource::Kind::Window;
+    QCOMPARE(encodeSizeOf(source, 0), padded);
+    QCOMPARE(encodeSizeOf(source, 360), encodeSizeFor(padded, 360));
+
+    BroadcastPipeline pipeline;
+    PipelineRecord record(pipeline);
+    BroadcastSettings settings;
+    settings.sourceId = source.id;
+    settings.maxHeight = 0;
+    settings.framerate = FRAMERATE;
+    settings.codec = VideoCodec::AV1;
+    settings.bitrate = 2'500'000;
+    settings.maxBitrate = 4'000'000;
+    pipeline.start(settings);
+
+    QTRY_VERIFY2_WITH_TIMEOUT(!record.starts.isEmpty() || !record.failures.isEmpty(), "the size was not reported", 4000);
+    QVERIFY2(record.failures.isEmpty(), qPrintable(record.failures.join(QLatin1Char(';'))));
+    QCOMPARE(record.starts.first(), padded);
+    QTRY_VERIFY_WITH_TIMEOUT(!record.stats.isEmpty(), 2500);
+    QTest::qWait(500);
+    QVERIFY(record.frames.empty());
+    QVERIFY2(record.stats.last().encoderName.startsWith(QStringLiteral("none while AV1")), qPrintable(record.stats.last().encoderName));
+    QVERIFY(record.stats.last().capturedFps > 0);
+    QCOMPARE(record.stats.last().framesEncoded, quint64(0));
+
+    window.resizeInside(exact);
+    QTRY_VERIFY2_WITH_TIMEOUT(record.starts.size() == 2, "the encoded size did not follow the window", 4000);
+    QCOMPARE(record.starts.last(), exact);
+    QTRY_VERIFY_WITH_TIMEOUT(record.frames.size() >= 10, 3000);
+    QVERIFY(record.frames[0]->keyframe);
+    pipeline.stop();
+    QTest::qWait(200);
+
+    const Decoded decoded = decodeAll(VideoCodec::AV1, record.frames);
+    QCOMPARE(decoded.errors, quint64(0));
+    QCOMPARE(QSize(decoded.width, decoded.height), exact);
+    QVERIFY2(record.failures.isEmpty(), qPrintable(record.failures.join(QLatin1Char(';'))));
 #else
     QSKIP("windows are captured on Windows");
 #endif
@@ -1978,7 +3299,7 @@ void TestVideoEncode::whatCapturingAWindowCosts()
     settings.sourceId = window.sourceId();
     settings.maxHeight = maxHeight;
     settings.framerate = FRAMERATE;
-    settings.codec = encodable.first();
+    settings.codec = codecsSharedAt(encodeSizeFor(inside.size(), maxHeight)).first();
     settings.bitrate = 4'000'000;
     settings.maxBitrate = 6'000'000;
     pipeline.start(settings);
@@ -2002,6 +3323,7 @@ void TestVideoEncode::whatCapturingAWindowCosts()
         const PathCounts counts = pathCounts(last);
         QVERIFY(covered ? counts.drawn > 0 && counts.cutOut == 0 : counts.cutOut > 10 * counts.drawn);
     }
+    QCOMPARE(last.encoderName.contains(QStringLiteral("(d3d11va)")), reachesTheEncoderOnTheCard(settings.codec, last.encodedSize != inside.size(), method == CaptureMethod::GraphicsCapture));
     QVERIFY(framesPerSecond > FRAMERATE * 0.5 && framesPerSecond < FRAMERATE * 1.25);
 #else
     QSKIP("windows are captured on Windows");

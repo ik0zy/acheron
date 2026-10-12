@@ -15,6 +15,8 @@ set(FFMPEG_COMPONENTS avcodec avformat avutil swscale swresample)
 # Screen capture and on-card scaling for sending video live in avfilter. It is taken when the
 # prebuilt package has it and done without otherwise, in which case nothing can be shared.
 set(FFMPEG_HAVE_AVFILTER OFF CACHE INTERNAL "whether the ffmpeg target includes libavfilter" FORCE)
+# Cameras are opened through avdevice, on the same terms.
+set(FFMPEG_HAVE_AVDEVICE OFF CACHE INTERNAL "whether the ffmpeg target includes libavdevice" FORCE)
 
 # ffmpeg 5.1, where AVChannelLayout replaced the channel-layout fields MediaDecoder
 # needs. Both routes below check it, or a distro on an older ffmpeg (Ubuntu 22.04 is
@@ -131,6 +133,17 @@ if(FFMPEG_INCLUDE_DIR AND NOT _ffmpeg_missing
         target_compile_definitions(ffmpeg INTERFACE ACHERON_HAVE_AVFILTER)
         list(APPEND _ffmpeg_staged_components avfilter)
         set(FFMPEG_HAVE_AVFILTER ON CACHE INTERNAL "whether the ffmpeg target includes libavfilter" FORCE)
+    endif()
+
+    if(NOT FFMPEG_avdevice_LIBRARY)
+        unset(FFMPEG_avdevice_LIBRARY CACHE)
+    endif()
+    find_library(FFMPEG_avdevice_LIBRARY NAMES avdevice libavdevice PATH_SUFFIXES lib)
+    if(FFMPEG_avdevice_LIBRARY)
+        target_link_libraries(ffmpeg INTERFACE "${FFMPEG_avdevice_LIBRARY}")
+        target_compile_definitions(ffmpeg INTERFACE ACHERON_HAVE_AVDEVICE)
+        list(APPEND _ffmpeg_staged_components avdevice)
+        set(FFMPEG_HAVE_AVDEVICE ON CACHE INTERNAL "whether the ffmpeg target includes libavdevice" FORCE)
     endif()
 
     # shared prebuilds keep their DLLs in <prefix>/bin, staged next to the exe later

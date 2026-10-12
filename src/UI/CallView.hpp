@@ -22,6 +22,7 @@ class QToolButton;
 namespace Acheron {
 namespace Core {
 class CallVideo;
+class CameraSender;
 class StreamBroadcaster;
 class StreamWatcher;
 namespace Audio {
@@ -49,6 +50,10 @@ class VideoSurface;
 // The account's own screen share is started and stopped from the bar, and has a tile like any
 // other stream, drawn from the capture's previews. A share that ended by itself leaves its
 // tile up to say why, until it is clicked away.
+//
+// The account's own camera is turned on and off from the bar as well, where the arrow beside
+// its button chooses which camera. Its tile shows the camera mirrored, as its owner expects to
+// see themself; what is sent is not.
 class CallView : public QWidget
 {
     Q_OBJECT
@@ -57,7 +62,7 @@ public:
     using AvatarResolver = std::function<QUrl(Core::Snowflake)>;
 
     // `dock` is the widget whose layout the view lives in while it is not in its own window.
-    CallView(Core::Audio::VoiceManager *voice, Core::StreamWatcher *watcher, Core::StreamBroadcaster *broadcaster, Core::ImageManager *images, Core::Snowflake accountId, NameResolver names, AvatarResolver avatars, const QString &title, QWidget *dock);
+    CallView(Core::Audio::VoiceManager *voice, Core::StreamWatcher *watcher, Core::StreamBroadcaster *broadcaster, Core::CameraSender *camera, Core::ImageManager *images, Core::Snowflake accountId, NameResolver names, AvatarResolver avatars, const QString &title, QWidget *dock);
     ~CallView() override;
 
     // Enlarges one tile, or with an empty id goes back to the grid. Ids are "stream:<user>"
@@ -117,6 +122,14 @@ private:
     [[nodiscard]] QStringList ownShareStats() const;
     [[nodiscard]] bool isOwnShare(const Tile &tile) const { return tile.stream && tile.userId == accountId; }
     [[nodiscard]] bool ownShareShown() const;
+    void applyOwnCameraState(Tile &tile);
+    void showOwnCameraPreview(const QImage &preview);
+    void onCameraClicked();
+    void fillCameraMenu();
+    void chooseCamera(const QString &deviceId);
+    [[nodiscard]] QStringList ownCameraStats() const;
+    [[nodiscard]] bool isOwnCamera(const Tile &tile) const { return !tile.stream && tile.userId == accountId; }
+    [[nodiscard]] bool ownCameraShown() const;
     void layoutTiles();
     void refreshStats();
     void showTileMenu(const QString &tileId, const QPoint &globalPos);
@@ -139,6 +152,7 @@ private:
     QPointer<Core::Audio::VoiceManager> voice;
     QPointer<Core::StreamWatcher> watcher;
     QPointer<Core::StreamBroadcaster> broadcaster;
+    QPointer<Core::CameraSender> camera;
     QPointer<Core::CallVideo> video;
     Core::ImageManager *images;
     Core::Snowflake accountId;
@@ -168,6 +182,9 @@ private:
     QMenu *shareQualityMenu;
     bool captureAvailable = false;
     bool sharingWindow = false;
+    QToolButton *cameraButton;
+    QMenu *cameraMenu;
+    bool cameraAvailable = false;
     QCheckBox *nonVideoCheck;
     QPushButton *statsButton;
     QPushButton *popOutButton;

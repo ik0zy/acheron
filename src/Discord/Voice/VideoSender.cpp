@@ -46,7 +46,7 @@ bool VideoSendStream::queueFrame(std::span<const uint8_t> frame, uint32_t rtpTim
     if (!packetizer)
         return false;
 
-    std::vector<std::vector<uint8_t>> payloads = packetizer->packetize(frame, maxPayloadSize());
+    std::vector<std::vector<uint8_t>> payloads = packetizer->packetize(frame, keyframe, maxPayloadSize());
     if (payloads.empty())
         return false;
 

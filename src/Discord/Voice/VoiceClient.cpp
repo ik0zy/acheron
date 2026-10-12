@@ -59,6 +59,15 @@ static uint64_t ntpTimeNow()
     return ((ms / 1000 + SECONDS_FROM_1900_TO_1970) << 32) | (((ms % 1000) << 32) / 1000);
 }
 
+QList<StreamDescription> cameraStreams()
+{
+    StreamDescription layer;
+    layer.type = QStringLiteral("video");
+    layer.rid = QStringLiteral("100");
+    layer.quality = 100;
+    return { layer };
+}
+
 VoiceClient::VoiceClient(const ConnectionParams &params, QObject *parent)
     : QObject(parent), params(params)
 {
@@ -337,6 +346,9 @@ void VoiceClient::onSessionDescription(const SessionDescription &desc)
 
     setState(State::Connected);
     emit connected();
+
+    if (std::exchange(codecsChangedSinceOffered, false))
+        sendOfferedCodecs();
 
     if (!videoPayloadTypes.isEmpty())
         startVideoTimer();
@@ -794,8 +806,50 @@ quint32 VoiceClient::localVideoSsrc() const
     return localVideoLayer < localVideoStreams.size() ? localVideoStreams[localVideoLayer].ssrc.valueOr(0) : 0;
 }
 
+void VoiceClient::offerVideoEncoding(const QList<VideoCodec> &encodable)
+{
+    bool changed = false;
+    for (Codec &offered : params.videoCodecs) {
+        const bool encoded = encodable.contains(videoCodecFromName(offered.name));
+        if (offered.encode.valueOr(false) == encoded)
+            continue;
+        offered.encode = encoded;
+        changed = true;
+    }
+    if (!changed)
+        return;
+
+    if (currentState == State::WaitingForSession)
+        codecsChangedSinceOffered = true;
+    if (currentState != State::Connected)
+        return;
+
+    sendOfferedCodecs();
+    // The server may have named this codec already, when it could not be taken up.
+    setVideoSendCodec(serverVideoCodec);
+}
+
+// A video codec that is neither encoded nor decoded any more is left out, as the official
+// client leaves it out.
+QList<Codec> VoiceClient::offeredCodecs() const
+{
+    QList<Codec> codecs = { Codec::opus() };
+    for (const Codec &video : params.videoCodecs) {
+        if (video.encode.valueOr(false) || video.decode.valueOr(false))
+            codecs.append(video);
+    }
+    return codecs;
+}
+
+void VoiceClient::sendOfferedCodecs()
+{
+    gateway->sendSessionUpdate(offeredCodecs());
+}
+
 void VoiceClient::setVideoSendCodec(const QString &name)
 {
+    serverVideoCodec = name;
+
     // The server picks among the codecs this client said it encodes.
     VideoCodec codec = VideoCodec::Unknown;
     for (const Codec &offered : params.videoCodecs) {
@@ -857,10 +911,16 @@ void VoiceClient::registerLocalVideoWithDave()
     case VideoCodec::H264:
         daveSession->setLocalVideoCodec(videoSender->ssrc(), discord::dave::Codec::H264);
         break;
+    case VideoCodec::H265:
+        daveSession->setLocalVideoCodec(videoSender->ssrc(), discord::dave::Codec::H265);
+        break;
     case VideoCodec::VP8:
         daveSession->setLocalVideoCodec(videoSender->ssrc(), discord::dave::Codec::VP8);
         break;
-    default:
+    case VideoCodec::AV1:
+        daveSession->setLocalVideoCodec(videoSender->ssrc(), discord::dave::Codec::AV1);
+        break;
+    case VideoCodec::Unknown:
         break;
     }
 }
@@ -985,12 +1045,17 @@ void VoiceClient::sendVideoFrame(const EncodedVideoFrame &frame)
     startVideoPacing();
 }
 
-// The whole frame is encrypted before it is cut into packets. It grows on the way: the
-// encryptor appends its trailer and widens short H264 start codes.
+// The whole frame is encrypted before it is cut into packets, and comes out in another shape:
+// the encryptor appends its trailer, widens the short start codes of H264 and H265, and of AV1
+// drops the OBUs that are not sent and the size field of the last one.
 bool VoiceClient::daveEncryptVideo(std::span<const uint8_t> frame, std::vector<uint8_t> &encrypted)
 {
     auto *encryptor = daveSession->encryptor();
-    encrypted.resize(encryptor->GetMaxCiphertextByteSize(discord::dave::MediaType::Video, frame.size()));
+    // The encryptor writes its trailer without looking at how much room it was given, and the
+    // size it asks for allows 64 bytes beyond the frame. A frame of many units outgrows that:
+    // each NAL or OBU can add a widened start code and a pair of range numbers, nine bytes at
+    // most, to a unit that may be only two bytes long.
+    encrypted.resize(encryptor->GetMaxCiphertextByteSize(discord::dave::MediaType::Video, frame.size()) + frame.size() * 5);
 
     size_t bytesWritten = 0;
     const auto result = encryptor->Encrypt(discord::dave::MediaType::Video, videoSender->ssrc(), discord::dave::ArrayView<const uint8_t>(frame.data(), frame.size()), discord::dave::ArrayView<uint8_t>(encrypted.data(), encrypted.size()), &bytesWritten);
@@ -1206,9 +1271,7 @@ void VoiceClient::withdrawVideoCodec(VideoCodec codec)
         return;
 
     qCWarning(LogVoice) << "Withdrawing" << videoCodecName(codec) << "from the codecs this client decodes";
-    QList<Codec> codecs = { Codec::opus() };
-    codecs.append(params.videoCodecs);
-    gateway->sendSessionUpdate(codecs);
+    sendOfferedCodecs();
 }
 
 void VoiceClient::startVideoTimer()
@@ -1538,9 +1601,8 @@ void VoiceClient::onIpDiscovered(const QString &ip, int port)
     protocol.address = ip;
     protocol.port = port;
     protocol.mode = selectedMode;
-    QList<Codec> codecs = { Codec::opus() };
-    codecs.append(params.videoCodecs);
-    protocol.codecs = codecs;
+    protocol.codecs = offeredCodecs();
+    codecsChangedSinceOffered = false;
     if (params.video)
         protocol.rtcConnectionId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     gateway->sendSelectProtocol(protocol);

@@ -383,6 +383,10 @@ if(ENABLE_VOICE AND TARGET ffmpeg)
         src/Core/Audio/LoopbackCapture.cpp
         src/Core/Video/BroadcastPipeline.cpp
         src/Core/Video/ScreenCapture.cpp
+        src/Core/Video/CardScaler.cpp
+        src/Core/Video/CameraCapture.cpp
+        src/Core/Video/CameraPipeline.cpp
+        src/Core/Video/CameraSender.cpp
         src/Core/Video/SendQuality.cpp
         src/Core/Video/SendRateController.cpp
         src/Core/Video/CallVideo.cpp
@@ -562,7 +566,7 @@ if(BUILD_TESTS)
 
             qt_add_executable(TestVideoEncode tests/tst_VideoEncode.cpp src/Core/Media/VideoEncoder.cpp
                 src/Core/Media/VideoDecoder.cpp src/Core/Media/RgbScaler.cpp
-                src/Core/Video/BroadcastPipeline.cpp src/Core/Video/ScreenCapture.cpp
+                src/Core/Video/BroadcastPipeline.cpp src/Core/Video/ScreenCapture.cpp src/Core/Video/CardScaler.cpp
                 src/Core/Logging.cpp src/Core/OrderedJson.cpp src/Core/Snowflake.cpp
                 src/Discord/Voice/RtpPacket.cpp src/Discord/Voice/VideoDepacketizer.cpp
                 src/Discord/Voice/VideoReceiver.cpp src/Discord/Voice/Rtcp.cpp)
@@ -570,6 +574,17 @@ if(BUILD_TESTS)
             target_compile_definitions(TestVideoEncode PRIVATE ACHERON_HAVE_FFMPEG NOMINMAX)
             target_include_directories(TestVideoEncode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
             add_test(NAME VideoEncodeTests COMMAND TestVideoEncode)
+
+            qt_add_executable(TestCameraCapture tests/tst_CameraCapture.cpp src/Core/Video/CameraCapture.cpp
+                src/Core/Video/CameraPipeline.cpp src/Core/Media/VideoEncoder.cpp
+                src/Core/Media/VideoDecoder.cpp src/Core/Media/RgbScaler.cpp
+                src/Core/Logging.cpp src/Core/OrderedJson.cpp src/Core/Snowflake.cpp
+                src/Discord/Voice/RtpPacket.cpp src/Discord/Voice/VideoDepacketizer.cpp
+                src/Discord/Voice/VideoReceiver.cpp src/Discord/Voice/Rtcp.cpp)
+            target_link_libraries(TestCameraCapture PRIVATE Qt::Core Qt::Gui Qt::Network Qt::Test ffmpeg)
+            target_compile_definitions(TestCameraCapture PRIVATE ACHERON_HAVE_FFMPEG NOMINMAX)
+            target_include_directories(TestCameraCapture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            add_test(NAME CameraCaptureTests COMMAND TestCameraCapture)
 
             qt_add_executable(TestVideoSurface tests/tst_VideoSurface.cpp src/UI/Video/VideoSurface.cpp src/Core/Media/RgbScaler.cpp)
             target_compile_definitions(TestVideoSurface PRIVATE ACHERON_HAVE_FFMPEG)
@@ -651,7 +666,7 @@ if (MSVC)
             list(APPEND _msvc_test_targets TestRtp TestOpusEncoder TestLoopbackCapture TestUdpTransport TestSinkWants TestVoiceClient)
         endif()
         if(TARGET TestRtpVideo)
-            list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface TestVideoSend TestVideoEncode)
+            list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface TestVideoSend TestVideoEncode TestCameraCapture)
         endif()
         foreach(test_target ${_msvc_test_targets})
             target_link_options(${test_target} PRIVATE $<$<CONFIG:Debug>:/INCREMENTAL>)

@@ -22,6 +22,9 @@ namespace Video {
 // The size a source is sent at: fitted inside (maxHeight * 16 / 9) x maxHeight with its shape
 // kept, never enlarged, and both sides even. A `maxHeight` of zero is the source's own size.
 [[nodiscard]] QSize encodeSizeFor(const QSize &source, int maxHeight);
+// The size `source` would be sent at as it is now: a screen whole, a window by its inside.
+// Empty for a window that has nothing to measure: one that is hidden, minimised or gone.
+[[nodiscard]] QSize encodeSizeOf(const CaptureSource &source, int maxHeight);
 
 // How pictures are taken off the machine. Remembered as `video/capture_method`.
 enum class CaptureMethod {
@@ -95,8 +98,9 @@ public:
         // Pictures are left on the graphics card as Direct3D 11 NV12 frames whenever they can
         // be scaled there, and arrive in `softwareFormat` otherwise.
         bool keepOnCard = false;
-        // With `keepOnCard`: a source sent at its own size is handed over as the BGRA frames
-        // it is captured in, marked with the colours the encoder is to convert them to.
+        // With `keepOnCard`: a source sent at its own size, or one that graphics capture scales
+        // by itself, is handed over as the BGRA frames it is captured in, marked with the
+        // colours the encoder is to convert them to.
         bool rgbOnCard = false;
         // For a codec that cannot say which colours it carries and is taken as BT.601.
         bool bt601Only = false;
@@ -123,8 +127,7 @@ public:
     ScreenCapture &operator=(const ScreenCapture &) = delete;
 
     void configure(const Request &request);
-    // Blocks until the next picture is due. A picture must be let go of before the next is
-    // read, unless deliversOnlyChanges(): the pictures scaled on the card all share one texture.
+    // Blocks until the next picture is due.
     Status read(AVFrame *into);
     [[nodiscard]] QString failure() const { return failureText; }
 
@@ -144,14 +147,6 @@ public:
     static constexpr int DRAWING_LIMIT_MS = 5000;
 
 private:
-    enum class CardScaling {
-        Untried,
-        Works,
-        // A capture that scaled on the card failed before its first picture, and one without
-        // is being tried to see whether the scaling was at fault.
-        Suspected,
-    };
-
     enum class Path {
         Duplication,
         GraphicsCapture,
@@ -160,19 +155,22 @@ private:
     };
 
     struct Backends;
+    struct CutOut;
 
     Status watchWindow();
     Status readDuplication(AVFrame *into);
     Status readGraphicsCapture(AVFrame *into);
     Status readWindowByDuplication(AVFrame *into);
-    bool cutOutOfScreen(const QRect &client, AVFrame *card);
+    bool cutOutOfScreen(const QRect &client, CutOut *cut);
     bool duplicateScreenOf(const QRect &client);
     bool drawnByItself(const QRect &client);
+    [[nodiscard]] bool scalesOnCard() const;
+    bool scaleOnCard(const AVFrame *from, const QRect &area, const QSize &size, const QRect &placed, AVFrame *into);
     int buildDuplication();
     int buildGraphicsCapture();
     void dropDuplication();
     void tearDown();
-    void delivered(AVFrame *picture, bool bt601);
+    void delivered();
     Status afterFailure(int error);
 
     Request request;
@@ -180,11 +178,12 @@ private:
     Path path = Path::Duplication;
     AVFilterGraph *graph = nullptr;
     AVFilterContext *sink = nullptr;
+    // The screen's pictures are left on the card by the graph and scaled there after it.
     bool graphScalesOnCard = false;
     bool graphIsBt601 = false;
-    quint64 picturesFromGraph = 0;
     bool everDelivered = false;
-    CardScaling cardScaling = CardScaling::Untried;
+    // The card stopped scaling in the middle of this capture, which goes on in software.
+    bool cardScalingFailed = false;
     std::optional<std::chrono::steady_clock::time_point> failingSince;
     std::chrono::steady_clock::time_point retryAt;
     bool closed = false;

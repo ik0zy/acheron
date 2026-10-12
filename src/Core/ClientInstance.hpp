@@ -39,6 +39,7 @@ class StreamManager;
 class StreamPreviews;
 class StreamWatcher;
 class StreamBroadcaster;
+class CameraSender;
 struct ShareTerms;
 
 class ClientInstance : public QObject
@@ -73,7 +74,11 @@ public:
 #ifdef ACHERON_HAVE_STREAM_VIEW
     [[nodiscard]] StreamWatcher *streamWatcher() const;
     [[nodiscard]] StreamBroadcaster *streamBroadcaster() const;
+    [[nodiscard]] CameraSender *cameraSender() const;
 #endif
+    // What a voice state update that puts the account in `channelId` says of its camera: on
+    // only when it is on in that channel. Leaving, or going anywhere else, turns it off.
+    [[nodiscard]] bool selfVideoIn(Snowflake channelId) const;
 
     [[nodiscard]] QList<Discord::Role> getRolesForGuild(Snowflake guildId);
     [[nodiscard]] QList<Discord::Role> getMemberRolesSorted(Snowflake guildId, Snowflake userId);
@@ -219,8 +224,9 @@ private:
 #ifdef ACHERON_HAVE_STREAM_VIEW
     StreamWatcher *streamWatch = nullptr;
     StreamBroadcaster *streamBroadcast = nullptr;
+    CameraSender *cameraSend = nullptr;
     // Whether the account may share its screen in the voice channel or call it is in, by the
-    // official client's rule, and what it may share there.
+    // official client's rule, and what it may share there. The camera goes by the same rule.
     [[nodiscard]] ShareTerms screenShareTerms();
 #endif
 

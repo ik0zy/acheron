@@ -66,6 +66,20 @@ public:
     [[nodiscard]] Discord::Voice::VoiceClient::State clientState() const;
     [[nodiscard]] Snowflake currentChannelId() const { return channelId; }
     [[nodiscard]] Snowflake currentGuildId() const { return guildId; }
+    // The account's own voice state as the server last gave it for this client's connection.
+    [[nodiscard]] bool isSelfMuted() const { return selfMute; }
+    [[nodiscard]] bool isSelfDeafened() const { return selfDeaf; }
+    [[nodiscard]] bool isSelfVideo() const { return selfVideo; }
+
+    // The voice connection's client, for what else is sent on that connection (the account's
+    // camera). It lives on the connection's thread and goes when the connection does:
+    // rtcClientCreated announces each one before it starts, and rtcClientClosing its end.
+    [[nodiscard]] Discord::Voice::VoiceClient *rtcClient() const { return voiceClient; }
+
+    // The codecs voice connections offer to send video with, which is the camera: those this
+    // machine has turned out to encode, as far as the camera can be sent with them. A
+    // connection that is already up is told now.
+    void setEncodableVideoCodecs(const QList<Discord::Voice::VideoCodec> &codecs);
 
     void setInputGain(float gain);
     void setOutputVolume(float volume);
@@ -125,6 +139,9 @@ public:
 signals:
     void voiceConnected();
     void voiceDisconnected();
+    void rtcClientCreated(Discord::Voice::VoiceClient *client);
+    // The client can still be called, and is stopped and destroyed straight after.
+    void rtcClientClosing();
     // Another session of this account joined voice while this client was connected, which ends
     // this client's connection without it having asked to leave.
     void takenOverByAnotherSession(Snowflake channelId, Snowflake guildId);
@@ -167,6 +184,8 @@ private:
     bool selfDeaf = false;
     // Set by the server while this account has a stream up; the client never asks for it.
     bool selfStream = false;
+    bool selfVideo = false;
+    QList<Discord::Voice::VideoCodec> encodableVideoCodecs;
 
     // pending data: VOICE_SERVER_UPDATE may arrive before VOICE_STATE_UPDATE
     // both are needed to connect

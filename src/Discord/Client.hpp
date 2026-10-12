@@ -154,7 +154,8 @@ public:
     void ackMessage(Snowflake channelId, Snowflake messageId, int flags, int lastViewed);
     void ackBulk(const QList<AckEntry> &entries, std::function<void(bool success)> onFinished);
 
-    void sendVoiceStateUpdate(Snowflake guildId, Snowflake channelId, bool selfMute, bool selfDeaf);
+    // `selfVideo` is whether the account's camera is on in that channel. Every update says so.
+    void sendVoiceStateUpdate(Snowflake guildId, Snowflake channelId, bool selfMute, bool selfDeaf, bool selfVideo);
 
     // Asks the gateway for the call in a DM or group DM; it answers with CALL_CREATE if one exists.
     void sendCallConnect(Snowflake channelId);

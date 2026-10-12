@@ -80,9 +80,14 @@ using EncodedFramePointer = std::shared_ptr<const Discord::Voice::EncodedVideoFr
 // Captures a source, scales it and encodes it, on a thread of its own. Its signals are
 // emitted from that thread, so connect to them queued or from an object on another thread.
 //
-// Encoded frames are whole access units as the RTP sender wants them: Annex B for H264 with
-// SPS and PPS in front of every key frame, a bare frame for VP8, and a 90 kHz timestamp taken
-// from when the picture was captured.
+// Encoded frames are whole access units as the RTP sender wants them, with a 90 kHz timestamp
+// taken from when the picture was captured: Annex B for H264 and H265, every key frame led by
+// its parameter sets; OBUs with their sizes for AV1, every key frame holding a sequence
+// header; a bare frame for VP8.
+//
+// A source whose size the codec's encoder cannot code acceptably (Media::paddingIsAcceptable)
+// is captured and reported and not encoded: started() says the size, and nothing follows
+// until the pipeline is started again with another codec or the source changes its size.
 class BroadcastPipeline : public QObject
 {
     Q_OBJECT
@@ -90,7 +95,8 @@ public:
     explicit BroadcastPipeline(QObject *parent = nullptr);
     ~BroadcastPipeline() override;
 
-    // The codecs this machine has a working encoder for, of those the RTP sender can packetize.
+    // The codecs this machine has a working encoder for, best first. H265 and AV1 are among
+    // them only when there is hardware for them.
     // The first call opens each candidate once and can take a moment; call it off the UI thread.
     [[nodiscard]] static QList<Discord::Voice::VideoCodec> encodableCodecs();
 
