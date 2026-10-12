@@ -321,6 +321,7 @@ void VideoDecoder::run()
 {
     decoded = av_frame_alloc();
     downloaded = av_frame_alloc();
+    packet = av_packet_alloc();
 
     for (;;) {
         Queued queued;
@@ -342,6 +343,7 @@ void VideoDecoder::run()
     close();
     av_frame_free(&decoded);
     av_frame_free(&downloaded);
+    av_packet_free(&packet);
 }
 
 bool VideoDecoder::open(Discord::Voice::VideoCodec codec)
@@ -381,6 +383,9 @@ bool VideoDecoder::openHardware(Discord::Voice::VideoCodec codec)
         candidate->opaque = &hardwarePixelFormat;
         candidate->get_format = chooseFormat;
         candidate->hw_device_ctx = av_buffer_ref(device);
+        // Drivers under-report the levels they decode, and ffmpeg's own advice is to go by
+        // whether the stream decodes. One that does not falls to software like any other.
+        candidate->hwaccel_flags |= AV_HWACCEL_FLAG_IGNORE_LEVEL;
         candidate->flags |= AV_CODEC_FLAG_LOW_DELAY;
         candidate->thread_count = 1;
         candidate->extra_hw_frames = EXTRA_HARDWARE_FRAMES;
@@ -501,7 +506,6 @@ bool VideoDecoder::decodeWithOpenDecoder(const Discord::Voice::EncodedVideoFrame
     QElapsedTimer timer;
     timer.start();
 
-    AVPacket *packet = av_packet_alloc();
     packet->data = const_cast<uint8_t *>(paddedFrame.data.data());
     packet->size = size;
     packet->pts = paddedFrame.rtpTimestamp;
@@ -509,7 +513,7 @@ bool VideoDecoder::decodeWithOpenDecoder(const Discord::Voice::EncodedVideoFrame
         packet->flags |= AV_PKT_FLAG_KEY;
 
     const int sent = avcodec_send_packet(context, packet);
-    av_packet_free(&packet);
+    av_packet_unref(packet);
     if (sent < 0)
         return false;
     awaitingKeyframe = false;

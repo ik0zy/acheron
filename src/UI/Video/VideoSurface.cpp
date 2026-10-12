@@ -2,6 +2,8 @@
 
 #include "D3D11GlBridge.hpp"
 
+#include "Core/Media/RgbScaler.hpp"
+
 #include <QFontDatabase>
 #include <QGuiApplication>
 #include <QImage>
@@ -44,35 +46,15 @@ const char *const DIRECT_FRAMES_KEY = "video/direct_frames";
 constexpr int RESCALE_DELAY_MS = 120;
 // Drawn over video, so it does not follow the theme: the green Discord rings a speaker with.
 const QColor SPEAKING_RING(0x23, 0xA5, 0x5A);
-constexpr int HD_HEIGHT = 720;
 
-// QImage::Format_RGB32 is a 32-bit word per pixel, so its byte order follows the machine's.
-#if Q_BYTE_ORDER == Q_BIG_ENDIAN
-constexpr AVPixelFormat RGB32_FORMAT = AV_PIX_FMT_ARGB;
-#else
-constexpr AVPixelFormat RGB32_FORMAT = AV_PIX_FMT_BGRA;
-#endif
+using Core::Media::isFullRange;
+using Core::Media::usesBt709;
 
 QSize fitted(QSize content, QSize bounds)
 {
     if (content.isEmpty() || bounds.isEmpty())
         return {};
     return content.scaled(bounds, Qt::KeepAspectRatio).expandedTo(QSize(1, 1));
-}
-
-// Untagged video is taken as BT.709 at HD sizes and BT.601 below, as players do.
-bool usesBt709(const AVFrame *frame)
-{
-    if (frame->colorspace == AVCOL_SPC_BT709)
-        return true;
-    if (frame->colorspace == AVCOL_SPC_BT470BG || frame->colorspace == AVCOL_SPC_SMPTE170M)
-        return false;
-    return frame->height >= HD_HEIGHT;
-}
-
-bool isFullRange(const AVFrame *frame)
-{
-    return frame->color_range == AVCOL_RANGE_JPEG || frame->format == AV_PIX_FMT_YUVJ420P;
 }
 
 // The layouts the shader reads directly: 8-bit 4:2:0, planar or with interleaved chroma.
@@ -161,8 +143,7 @@ public:
     {
         QMetaObject::invokeMethod(&context, [this, job = std::move(job)] {
             enter();
-            job();
-        }, Qt::QueuedConnection);
+            job(); }, Qt::QueuedConnection);
     }
 
     // The same, waiting for it. Not to be called from the worker's thread.
@@ -171,8 +152,7 @@ public:
     {
         QMetaObject::invokeMethod(&context, [this, &job] {
             enter();
-            job();
-        }, Qt::BlockingQueuedConnection);
+            job(); }, Qt::BlockingQueuedConnection);
     }
 
     [[nodiscard]] QOpenGLFunctions *gl() { return context.functions(); }
@@ -225,7 +205,7 @@ class CardPicture
 {
 public:
     explicit CardPicture(std::shared_ptr<CardWorker> worker)
-        : worker(std::move(worker)) { }
+        : worker(std::move(worker)) {}
 
     template <typename Job>
     void post(Job job)
@@ -348,11 +328,10 @@ class VideoSurface::Sink : public Core::Media::VideoFrameSink, public std::enabl
 {
 public:
     Sink(VideoSurface *owner, bool gpu)
-        : owner(owner), gpu(gpu), last(av_frame_alloc()), handing(av_frame_alloc()) { }
+        : owner(owner), gpu(gpu), last(av_frame_alloc()), handing(av_frame_alloc()) {}
 
     ~Sink() override
     {
-        sws_freeContext(scaler);
         sws_freeContext(normalizer);
         av_frame_free(&last);
         av_frame_free(&handing);
@@ -395,7 +374,6 @@ public:
     {
         return format == AV_PIX_FMT_D3D11 && hardwareFramesUsable.load(std::memory_order_relaxed);
     }
-
 
     // Whether the surface is on screen. The card's pictures are not made ready for one that
     // is not.
@@ -549,27 +527,11 @@ private:
         if (size.isEmpty())
             return;
 
-        const bool newScaler = last->width != sourceSize.width() || last->height != sourceSize.height() || last->format != sourceFormat || size != scaledSize;
-        scaler = sws_getCachedContext(scaler, last->width, last->height, static_cast<AVPixelFormat>(last->format), size.width(), size.height(), RGB32_FORMAT, SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!scaler)
-            return;
-
-        if (newScaler) {
-            sourceSize = QSize(last->width, last->height);
-            sourceFormat = last->format;
-            scaledSize = size;
-
-            const int *coefficients = sws_getCoefficients(usesBt709(last) ? SWS_CS_ITU709 : SWS_CS_ITU601);
-            sws_setColorspaceDetails(scaler, coefficients, isFullRange(last) ? 1 : 0, sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16, 1 << 16);
-        }
-
         if (back.size() != size)
-            back = QImage(size, QImage::Format_RGB32);
+            back = Core::Media::RgbScaler::allocate(size, QImage::Format_RGB32);
+        if (!scaler.scale(last, back))
+            return;
         back.setDevicePixelRatio(pixelRatio);
-
-        uint8_t *planes[4] = { back.bits(), nullptr, nullptr, nullptr };
-        const int strides[4] = { static_cast<int>(back.bytesPerLine()), 0, 0, 0 };
-        sws_scale(scaler, last->data, last->linesize, 0, last->height, planes, strides);
         back.swap(front);
     }
 
@@ -577,7 +539,7 @@ private:
     VideoSurface *owner;
     bool gpu;
     bool shown = false;
-    std::atomic<bool> hardwareFramesUsable { false };
+    std::atomic<bool> hardwareFramesUsable{ false };
 #ifdef Q_OS_WIN
     std::shared_ptr<CardPicture> card;
     bool handOverPending = false;
@@ -586,13 +548,10 @@ private:
     // The worker's own reference to the frame it is turning into a texture.
     AVFrame *handing;
     quint64 serial = 0;
-    SwsContext *scaler = nullptr;
+    Core::Media::RgbScaler scaler;
     SwsContext *normalizer = nullptr;
     QSize target;
     qreal pixelRatio = 1.0;
-    QSize sourceSize;
-    QSize scaledSize;
-    int sourceFormat = -1;
     QImage front;
     QImage back;
     bool updatePending = false;
@@ -1206,7 +1165,6 @@ void VideoSurface::setSpeaking(bool value)
     refreshOverlays();
 }
 
-
 void VideoSurface::announceGeometry()
 {
     reportGeometry(true);
@@ -1344,7 +1302,6 @@ void VideoSurface::paintOverlays(QPainter &painter, bool hasPicture)
         painter.setPen(Qt::white);
         painter.drawText(bounds, Qt::AlignLeft | Qt::AlignBottom, captionText);
     }
-
 
     if (speaking) {
         painter.setRenderHint(QPainter::Antialiasing, false);

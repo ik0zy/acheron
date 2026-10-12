@@ -209,6 +209,8 @@ set(PROJECT_SOURCES
     src/Core/Theme/Fonts.cpp
     src/Core/Media/Player.cpp
     src/Core/Media/MediaDecoder.cpp
+    src/Core/Media/RgbScaler.cpp
+    src/Core/Media/InputConfinement.cpp
     src/Core/Media/AudioOutput.cpp
     src/Core/Media/PlayerPool.cpp
     src/Core/Media/ClipDecoder.cpp
@@ -520,7 +522,8 @@ if(BUILD_TESTS)
             target_include_directories(TestVideoDecode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
             add_test(NAME VideoDecodeTests COMMAND TestVideoDecode)
 
-            qt_add_executable(TestVideoSurface tests/tst_VideoSurface.cpp src/UI/Video/VideoSurface.cpp)
+            qt_add_executable(TestVideoSurface tests/tst_VideoSurface.cpp src/UI/Video/VideoSurface.cpp src/Core/Media/RgbScaler.cpp)
+            target_compile_definitions(TestVideoSurface PRIVATE ACHERON_HAVE_FFMPEG)
             if(WIN32)
                 target_sources(TestVideoSurface PRIVATE src/UI/Video/D3D11GlBridge.cpp)
             endif()
@@ -558,11 +561,17 @@ if(BUILD_TESTS)
     add_test(NAME FavoriteGifTests COMMAND TestFavoriteGifs)
 
     if(TARGET ffmpeg)
-        qt_add_executable(TestClips tests/tst_Clips.cpp src/Core/Media/ClipDecoder.cpp src/Core/Media/ClipPlayer.cpp)
+        qt_add_executable(TestClips tests/tst_Clips.cpp src/Core/Media/ClipDecoder.cpp src/Core/Media/ClipPlayer.cpp src/Core/Media/RgbScaler.cpp)
         target_link_libraries(TestClips PRIVATE Qt::Core Qt::Gui Qt::Test ffmpeg)
         target_compile_definitions(TestClips PRIVATE ACHERON_HAVE_FFMPEG)
         target_include_directories(TestClips PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME ClipTests COMMAND TestClips)
+
+        qt_add_executable(TestMediaInput tests/tst_MediaInput.cpp src/Core/Media/RgbScaler.cpp src/Core/Media/InputConfinement.cpp src/Core/Logging.cpp)
+        target_link_libraries(TestMediaInput PRIVATE Qt::Core Qt::Gui Qt::Network Qt::Test ffmpeg)
+        target_compile_definitions(TestMediaInput PRIVATE ACHERON_HAVE_FFMPEG)
+        target_include_directories(TestMediaInput PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME MediaInputTests COMMAND TestMediaInput)
 
         qt_add_executable(TestApng tests/tst_Apng.cpp src/Core/ApngDecoder.cpp)
         target_link_libraries(TestApng PRIVATE Qt::Core Qt::Gui Qt::Test ffmpeg)
@@ -587,7 +596,7 @@ if (MSVC)
     if(BUILD_TESTS)
         set(_msvc_test_targets TestMarkdown TestUnicodeEmoji TestOrderedJson TestFrecency TestProto TestProxy TestEmojiGrid TestCdnUrls TestEmbeds TestFavoriteGifs TestVoicePayloads TestStreams TestCalls TestDecodeDemand)
         if(TARGET TestApng)
-            list(APPEND _msvc_test_targets TestApng TestClips)
+            list(APPEND _msvc_test_targets TestApng TestClips TestMediaInput)
         endif()
         if(TARGET TestRtp)
             list(APPEND _msvc_test_targets TestRtp TestUdpTransport TestSinkWants TestVoiceClient)

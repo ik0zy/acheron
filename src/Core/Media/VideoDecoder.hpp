@@ -18,6 +18,7 @@ struct AVBufferRef;
 struct AVCodec;
 struct AVCodecContext;
 struct AVFrame;
+struct AVPacket;
 
 namespace Acheron {
 namespace Core {
@@ -141,6 +142,7 @@ private:
     AVBufferRef *hardwareDevice = nullptr;
     AVFrame *decoded = nullptr;
     AVFrame *downloaded = nullptr;
+    AVPacket *packet = nullptr;
     Discord::Voice::VideoCodec openCodec = Discord::Voice::VideoCodec::Unknown;
     int hardwarePixelFormat = -1;
     const char *hardwareName = nullptr;
