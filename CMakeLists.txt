@@ -493,6 +493,11 @@ if(BUILD_TESTS)
         target_include_directories(TestRtp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME RtpTests COMMAND TestRtp)
 
+        qt_add_executable(TestOpusEncoder tests/tst_OpusEncoder.cpp src/Core/Logging.cpp src/Core/Audio/OpusEncoder.cpp)
+        target_link_libraries(TestOpusEncoder PRIVATE Qt::Core Qt::Test ${OPUS_TARGET})
+        target_include_directories(TestOpusEncoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME OpusEncoderTests COMMAND TestOpusEncoder)
+
         qt_add_executable(TestUdpTransport tests/tst_UdpTransport.cpp src/Core/Logging.cpp
             src/Core/ProxyConfig.cpp src/Discord/Voice/UdpTransport.cpp
             src/Discord/Voice/Socks5UdpAssociation.cpp)
@@ -633,7 +638,7 @@ if (MSVC)
             list(APPEND _msvc_test_targets TestApng TestClips TestMediaInput)
         endif()
         if(TARGET TestRtp)
-            list(APPEND _msvc_test_targets TestRtp TestUdpTransport TestSinkWants TestVoiceClient)
+            list(APPEND _msvc_test_targets TestRtp TestOpusEncoder TestUdpTransport TestSinkWants TestVoiceClient)
         endif()
         if(TARGET TestRtpVideo)
             list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface TestVideoSend TestVideoEncode)

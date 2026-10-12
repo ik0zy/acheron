@@ -19,6 +19,12 @@ public:
 
     bool init(int sampleRate, int channels, int application = OPUS_APPLICATION_VOIP);
 
+    // The most one encoded frame may take, whatever bitrate is asked for. With the RTP header
+    // and the end-to-end encryption's trailer added, the packet then stays within the 1200
+    // bytes the official client keeps its media packets to. Larger ones are split up by
+    // networks with a reduced MTU, a VPN's for one, and split voice packets get lost.
+    static constexpr int MAX_PACKET_BYTES = 1160;
+
     QByteArray encode(const QByteArray &pcmFrame);
 
     void setBitrate(int bitrate);
