@@ -1,6 +1,6 @@
 // The camera pipeline with a camera of the test's own in the real one's place: pictures the test
 // paints go through the scaling, the thinning and the encoders this machine has, and back through
-// the decoder. One case opens the real camera, for two seconds at most. What that saw is only
+// the decoder. Two cases open the real camera, each for two seconds at most. What that saw is only
 // ever counted and measured here: never printed, never written anywhere, never shown.
 
 #include "Core/Media/RgbScaler.hpp"
@@ -9,7 +9,11 @@
 #include "Core/Video/CameraCapture.hpp"
 #include "Core/Video/CameraPipeline.hpp"
 
+#include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
+#include <QFileInfo>
+#include <QRegularExpression>
 #include <QSet>
 #include <QTest>
 #include <QThread>
@@ -18,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -32,6 +37,12 @@ extern "C" {
 
 #ifdef Q_OS_WIN
 #include <windows.h>
+#endif
+#ifdef Q_OS_LINUX
+#include <fcntl.h>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 #endif
 
 using namespace Acheron;
@@ -555,7 +566,7 @@ double processCpuMs()
 #else
 double processCpuMs()
 {
-    return 0;
+    return 1000.0 * static_cast<double>(std::clock()) / CLOCKS_PER_SEC;
 }
 #endif
 
@@ -619,6 +630,7 @@ private slots:
     void whatACameraPictureCosts();
 
     void theFirstCameraDeliversPictures();
+    void aPictureOutlivesItsCamera();
 
 private:
     static void everyCodec();
@@ -673,6 +685,27 @@ void TestCameraCapture::camerasAreListedTheSameEveryTime()
     QCOMPARE(ids.size(), first.size());
     if (!cameraCaptureAvailable())
         QVERIFY(first.isEmpty());
+
+#ifdef Q_OS_LINUX
+    // The nodes that can themselves be captured from, which the one a camera's metadata comes
+    // from and a loopback that nothing writes to cannot.
+    QSet<QString> capturing;
+    const QStringList nodes = QDir(QStringLiteral("/dev")).entryList({ QStringLiteral("video*") }, QDir::System);
+    for (const QString &node : nodes) {
+        const QString path = QStringLiteral("/dev/") + node;
+        v4l2_capability device{};
+        const int fd = open(QFile::encodeName(path).constData(), O_RDONLY);
+        if (fd >= 0 && ioctl(fd, VIDIOC_QUERYCAP, &device) == 0 && (device.device_caps & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE)) && (device.device_caps & V4L2_CAP_STREAMING))
+            capturing.insert(path);
+        if (fd >= 0)
+            close(fd);
+    }
+    QSet<QString> listedNodes;
+    for (const CameraDevice &each : first)
+        listedNodes.insert(QFileInfo(each.id).canonicalFilePath());
+    if (cameraCaptureAvailable())
+        QCOMPARE(listedNodes, capturing);
+#endif
 
     timer.start();
     for (int again = 0; again < 3; again++) {
@@ -1516,6 +1549,7 @@ void TestCameraCapture::whatACameraPictureCosts()
     qInfo().noquote() << QStringLiteral("%1 ms of processor time a camera picture, %2 pictures and %3 frames in 1.5 s").arg(cpuPerPicture, 0, 'f', 2).arg(pictures).arg(frames);
     QVERIFY(pictures >= 30);
     QCOMPARE(frames > 0, !suspended);
+    QVERIFY(cpuPerPicture > 0);
 }
 
 void TestCameraCapture::theFirstCameraDeliversPictures()
@@ -1534,6 +1568,17 @@ void TestCameraCapture::theFirstCameraDeliversPictures()
     CameraSettings settings = settingsFor(codec, encodeSize, 30);
     settings.deviceId.clear();
 
+    static std::mutex saidMutex;
+    static QStringList said;
+    static QtMessageHandler handler;
+    handler = qInstallMessageHandler([](QtMsgType type, const QMessageLogContext &context, const QString &message) {
+        {
+            std::lock_guard lock(saidMutex);
+            said.append(message);
+        }
+        handler(type, context, message);
+    });
+
     QElapsedTimer open;
     open.start();
     pipeline->start(settings);
@@ -1551,6 +1596,7 @@ void TestCameraCapture::theFirstCameraDeliversPictures()
     // Closes the camera before it returns.
     pipeline->stop();
     pipeline.reset();
+    qInstallMessageHandler(handler);
     qInfo() << "from starting to open the camera to having closed it:" << open.elapsed() << "ms";
     QCoreApplication::processEvents();
 
@@ -1560,6 +1606,11 @@ void TestCameraCapture::theFirstCameraDeliversPictures()
     if (record.frames.empty() && record.previews.isEmpty())
         QSKIP("the first camera opened and sent no picture in the two seconds it may be open for");
     QVERIFY(!record.frames.empty());
+
+    // In a mode it was asked for, or in its own when asked for nothing: never in one near to what was asked.
+    const QStringList opened = said.filter(QStringLiteral("opened as"));
+    QCOMPARE(opened.size(), 1);
+    QVERIFY2(opened.first().contains(QRegularExpression(QStringLiteral("opened as \\S+ \\S+ (\\d+x\\d+) at .* when asked for (\\1|nothing)$"))), qPrintable(opened.first()));
 
     const std::vector<int> ticks = record.ticksBetween();
     for (int each : ticks)
@@ -1588,6 +1639,34 @@ void TestCameraCapture::theFirstCameraDeliversPictures()
     QCOMPARE(decoded.errors, quint64(0));
     QCOMPARE(decoded.pictures, static_cast<int>(record.frames.size()));
     QCOMPARE(decoded.sizes, QList<QSize>{ sent });
+}
+
+// A picture is its reader's to keep. One of v4l2's is in the driver's own memory when it comes,
+// which is gone once the camera is closed.
+void TestCameraCapture::aPictureOutlivesItsCamera()
+{
+    setCameraFrameSourceFactory({});
+    std::unique_ptr<CameraFrameSource> source = makeCameraFrameSource();
+    if (!source)
+        QSKIP("this build cannot open cameras");
+    if (cameraDevices().isEmpty())
+        QSKIP("no camera is connected");
+    if (!source->open(QString()))
+        QSKIP(qPrintable(QStringLiteral("the camera could not be used: %1").arg(source->failure())));
+
+    const FramePointer picture = makeFrame();
+    Clock::time_point capturedAt;
+    CameraFrameSource::Status status = CameraFrameSource::Status::NoFrame;
+    QElapsedTimer open;
+    open.start();
+    while (status == CameraFrameSource::Status::NoFrame && open.elapsed() < REAL_CAMERA_MS)
+        status = source->read(picture.get(), capturedAt);
+    source.reset();
+    if (status != CameraFrameSource::Status::Frame)
+        QSKIP("the first camera sent no picture in the two seconds it may be open for");
+
+    QVERIFY(picture->colorspace != AVCOL_SPC_UNSPECIFIED);
+    QVERIFY(!inRgb(picture.get()).isNull());
 }
 
 QTEST_GUILESS_MAIN(TestCameraCapture)

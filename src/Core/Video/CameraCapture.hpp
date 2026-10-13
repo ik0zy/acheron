@@ -74,11 +74,11 @@ private:
     std::optional<std::chrono::steady_clock::time_point> last;
 };
 
-#if defined(ACHERON_HAVE_AVDEVICE) && defined(Q_OS_WIN)
+#if defined(ACHERON_HAVE_AVDEVICE) && (defined(Q_OS_WIN) || defined(Q_OS_LINUX))
 
-// A camera, opened through ffmpeg's DirectShow input. It is asked for 1280x720 at 30 as MJPEG,
-// which is the only way many USB cameras deliver that, then for the same in any format, then
-// for 640x480 at 30, and at last for whatever it gives when asked for nothing.
+// A camera, opened through ffmpeg's DirectShow input, or on Linux its V4L2 one. It is asked for
+// 1280x720 at 30 as MJPEG, which is the only way many USB cameras deliver that, then for the same
+// in any format, then for 640x480 at 30, and at last for whatever it gives when asked for nothing.
 //
 // A thread of its own opens the camera, reads it and decodes what it sends, so that nothing
 // waits in the device's buffer for a reader that is busy encoding.

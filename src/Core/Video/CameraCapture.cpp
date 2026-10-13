@@ -11,7 +11,7 @@
 #include <optional>
 #include <utility>
 
-#if defined(ACHERON_HAVE_AVDEVICE) && defined(Q_OS_WIN)
+#if defined(ACHERON_HAVE_AVDEVICE) && (defined(Q_OS_WIN) || defined(Q_OS_LINUX))
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/codec_desc.h>
@@ -24,6 +24,18 @@ extern "C" {
 }
 #endif
 
+#if defined(ACHERON_HAVE_AVDEVICE) && defined(Q_OS_LINUX)
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QHash>
+
+#include <fcntl.h>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+
 namespace Acheron {
 namespace Core {
 namespace Video {
@@ -33,9 +45,17 @@ namespace {
 std::mutex factoryMutex;
 CameraFrameSourceFactory replacementFactory;
 
-#if defined(ACHERON_HAVE_AVDEVICE) && defined(Q_OS_WIN)
+#if defined(ACHERON_HAVE_AVDEVICE) && (defined(Q_OS_WIN) || defined(Q_OS_LINUX))
 
 using Clock = std::chrono::steady_clock;
+
+#ifdef Q_OS_WIN
+constexpr const char *DEVICE = "dshow";
+constexpr const char *URL_BEFORE_ID = "video=";
+#else
+constexpr const char *DEVICE = "v4l2";
+constexpr const char *URL_BEFORE_ID = "";
+#endif
 
 struct Mode
 {
@@ -84,13 +104,14 @@ struct OpenCamera
 {
     std::unique_ptr<AVFormatContext, InputCloser> input;
     std::unique_ptr<AVCodecContext, DecoderDeleter> decoder;
+    const char *sizeAskedFor = nullptr;
 };
 
 const AVInputFormat *inputDevice()
 {
     static const AVInputFormat *const device = [] {
         avdevice_register_all();
-        return av_find_input_format("dshow");
+        return av_find_input_format(DEVICE);
     }();
     return device;
 }
@@ -139,6 +160,13 @@ OpenCamera openCamera(const QByteArray &url)
         camera.input.reset(openInput(url, mode));
         if (!camera.input || camera.input->nb_streams == 0 || camera.input->streams[0]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
             continue;
+#ifdef Q_OS_LINUX
+        // v4l2 opens at the nearest size the camera has to the one asked for, where dshow refuses.
+        const AVCodecParameters *opened = camera.input->streams[0]->codecpar;
+        if (mode.size && QStringLiteral("%1x%2").arg(opened->width).arg(opened->height) != QLatin1String(mode.size))
+            continue;
+#endif
+        camera.sizeAskedFor = mode.size;
         camera.decoder.reset(openDecoder(camera.input->streams[0]));
         if (camera.decoder)
             return camera;
@@ -150,8 +178,25 @@ QString describe(const AVStream *stream)
 {
     const AVCodecParameters *sent = stream->codecpar;
     const char *format = sent->codec_id == AV_CODEC_ID_RAWVIDEO ? av_get_pix_fmt_name(static_cast<AVPixelFormat>(sent->format)) : avcodec_get_name(sent->codec_id);
-    return QStringLiteral("dshow %1 %2x%3 at %4 fps").arg(QString::fromLatin1(format ? format : "unknown")).arg(sent->width).arg(sent->height).arg(av_q2d(stream->avg_frame_rate), 0, 'g', 4);
+    return QStringLiteral("%1 %2 %3x%4 at %5 fps").arg(QString::fromLatin1(DEVICE), QString::fromLatin1(format ? format : "unknown")).arg(sent->width).arg(sent->height).arg(av_q2d(stream->avg_frame_rate), 0, 'g', 4);
 }
+
+#ifdef Q_OS_LINUX
+// A v4l2 packet is the driver's own mapped memory, which the raw decoder hands on as the picture
+// and which is unmapped when the camera is closed.
+bool copyOutOfTheDriver(AVPacket *packet)
+{
+    AVBufferRef *copy = av_buffer_alloc(packet->size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!copy)
+        return false;
+    std::copy_n(packet->data, packet->size, copy->data);
+    std::fill_n(copy->data + packet->size, AV_INPUT_BUFFER_PADDING_SIZE, 0);
+    av_buffer_unref(&packet->buf);
+    packet->buf = copy;
+    packet->data = copy->data;
+    return true;
+}
+#endif
 
 #endif
 
@@ -185,19 +230,21 @@ std::unique_ptr<CameraFrameSource> makeCameraFrameSource()
         if (replacementFactory)
             return replacementFactory();
     }
-#if defined(ACHERON_HAVE_AVDEVICE) && defined(Q_OS_WIN)
+#if defined(ACHERON_HAVE_AVDEVICE) && (defined(Q_OS_WIN) || defined(Q_OS_LINUX))
     return std::make_unique<CameraCapture>();
 #else
     return nullptr;
 #endif
 }
 
-#if defined(ACHERON_HAVE_AVDEVICE) && defined(Q_OS_WIN)
+#if defined(ACHERON_HAVE_AVDEVICE) && (defined(Q_OS_WIN) || defined(Q_OS_LINUX))
 
 bool cameraCaptureAvailable()
 {
     return inputDevice() != nullptr;
 }
+
+#ifdef Q_OS_WIN
 
 QList<CameraDevice> cameraDevices()
 {
@@ -216,6 +263,41 @@ QList<CameraDevice> cameraDevices()
     avdevice_free_list_devices(&found);
     return cameras;
 }
+
+#else
+
+QList<CameraDevice> cameraDevices()
+{
+    if (!inputDevice())
+        return {};
+
+    // udev names a USB camera by its maker, model and serial number, which it keeps when its
+    // /dev/videoN changes.
+    QHash<QString, QString> lasting;
+    const QFileInfoList links = QDir(QStringLiteral("/dev/v4l/by-id")).entryInfoList(QDir::System);
+    for (const QFileInfo &link : links)
+        lasting.insert(link.canonicalFilePath(), link.filePath());
+
+    QList<CameraDevice> cameras;
+    const QStringList nodes = QDir(QStringLiteral("/dev")).entryList({ QStringLiteral("video*") }, QDir::System, QDir::Name);
+    for (const QString &node : nodes) {
+        const QString path = QStringLiteral("/dev/") + node;
+        v4l2_capability device{};
+        const int fd = open(QFile::encodeName(path).constData(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        const bool answered = ioctl(fd, VIDIOC_QUERYCAP, &device) == 0;
+        close(fd);
+        // `capabilities` is of all of a camera's nodes together, and so names capture for the node
+        // its metadata comes from as well.
+        const __u32 own = device.capabilities & V4L2_CAP_DEVICE_CAPS ? device.device_caps : device.capabilities;
+        if (answered && (own & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE)) && (own & V4L2_CAP_STREAMING))
+            cameras.append({ lasting.value(path, path), QString::fromUtf8(reinterpret_cast<const char *>(device.card)) });
+    }
+    return cameras;
+}
+
+#endif
 
 CameraCapture::CameraCapture() : newest(av_frame_alloc()) {}
 
@@ -306,14 +388,14 @@ void CameraCapture::run(const QString &deviceId)
     const QString id = deviceId.isEmpty() ? cameras.first().id : deviceId;
     const auto listed = std::find_if(cameras.begin(), cameras.end(), [&id](const CameraDevice &each) { return each.id == id; });
 
-    const OpenCamera camera = openCamera("video=" + id.toUtf8());
+    const OpenCamera camera = openCamera(URL_BEFORE_ID + id.toUtf8());
     if (!camera.input) {
         end(listed == cameras.end() ? QCoreApplication::translate("Acheron::Core::Video::CameraPipeline", "The camera is not connected.") : QCoreApplication::translate("Acheron::Core::Video::CameraPipeline", "The camera could not be opened. Another program may be using it."));
         return;
     }
     const AVStream *stream = camera.input->streams[0];
     const QString openedMode = describe(stream);
-    qCInfo(LogVideo).noquote() << "Camera" << (listed == cameras.end() ? id : listed->name) << "opened as" << openedMode;
+    qCInfo(LogVideo).noquote() << "Camera" << (listed == cameras.end() ? id : listed->name) << "opened as" << openedMode << "when asked for" << (camera.sizeAskedFor ? camera.sizeAskedFor : "nothing");
     opened(openedMode);
 
     const std::unique_ptr<AVPacket, PacketDeleter> packet(av_packet_alloc());
@@ -349,6 +431,12 @@ void CameraCapture::run(const QString &deviceId)
             av_packet_move_ref(packet.get(), newer.get());
         }
 
+#ifdef Q_OS_LINUX
+        if (!copyOutOfTheDriver(packet.get())) {
+            av_packet_unref(packet.get());
+            continue;
+        }
+#endif
         const int sent = avcodec_send_packet(camera.decoder.get(), packet.get());
         av_packet_unref(packet.get());
         while (sent >= 0 && avcodec_receive_frame(camera.decoder.get(), decoded.get()) >= 0) {
