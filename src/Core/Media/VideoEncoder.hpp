@@ -187,8 +187,11 @@ public:
 
     // The next picture becomes a key frame.
     void requestKeyframe();
-    // Followed while running by the encoders that can; the others start over with the next
-    // picture, which is then a key frame.
+    // Followed while running by the encoders that can. The others start over with the next
+    // picture, which is then a key frame, and so not for every small move: they run a little
+    // under a rate that has come down, where the next step down finds room, and are left
+    // there until the rate has risen by enough to be worth the key frame. They never run
+    // over the rate.
     void setBitrate(int bitrate);
 
     // Encodes one picture, whose size and format may differ from the last one's. `timestamp` is
@@ -230,6 +233,8 @@ private:
     bool cardFramesRefused = false;
     bool keyframeWanted = false;
     bool reopenWanted = false;
+    // The rate last asked for when `settings.bitrate` was last chosen.
+    int bitrateChosenFor = 0;
     int awaited = 0;
     quint64 framesSinceOpen = 0;
     int64_t lastKeyframeAt = 0;

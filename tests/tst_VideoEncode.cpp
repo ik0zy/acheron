@@ -1517,6 +1517,8 @@ private slots:
     void everyPictureComesOutAtOnceAndDecodes();
     void aChangedBitrateIsFollowed_data() { encoderCases(true); }
     void aChangedBitrateIsFollowed();
+    void smallMovesOfTheRateDoNotStartAnEncoderOver_data() { encoderCases(true); }
+    void smallMovesOfTheRateDoNotStartAnEncoderOver();
     void aStillPictureIsNotFilledUpToTheRate_data() { encoderCases(false); }
     void aStillPictureIsNotFilledUpToTheRate();
     void keyFramesComeAtTheIntervalAskedFor_data() { encoderCases(true); }
@@ -1979,6 +1981,45 @@ void TestVideoEncode::aChangedBitrateIsFollowed()
     QCOMPARE(decoded.errors, quint64(0));
     QCOMPARE(decoded.dropped, quint64(0));
     QCOMPARE(decoded.pictures, static_cast<int>(run.frames.size()));
+}
+
+void TestVideoEncode::smallMovesOfTheRateDoNotStartAnEncoderOver()
+{
+    QFETCH(EncoderCase, encoderCase);
+    SKIP_AN_ENCODER_THAT_DOES_NOT_WORK(encoderCase);
+    constexpr int PICTURES_PER_RATE = 6;
+
+    EncodeRun run(encoderCase, WIDTH, HEIGHT, BITRATE);
+    const auto openedAt = [&run](int bitrate) {
+        run.encoder.setBitrate(bitrate);
+        for (int index = 0; index < PICTURES_PER_RATE; index++) {
+            if (!run.encodeNext())
+                return quint64(0);
+        }
+        return static_cast<quint64>(run.encoder.stats().opened);
+    };
+
+    const quint64 atFirst = openedAt(BITRATE);
+    QCOMPARE(atFirst, quint64(1));
+
+    // An encoder never runs over the rate, so one that cannot follow starts over for the
+    // first step down, and there leaves room for the next.
+    const quint64 lowered = openedAt(BITRATE * 95 / 100);
+    QVERIFY(lowered == atFirst || lowered == atFirst + 1);
+    const bool startsOver = lowered > atFirst;
+    QCOMPARE(openedAt(BITRATE * 90 / 100), lowered);
+    QCOMPARE(openedAt(BITRATE * 88 / 100), lowered);
+    // Nor is a little more worth a key frame.
+    QCOMPARE(openedAt(BITRATE), lowered);
+
+    // Out of the room, and a rise that is worth one.
+    QCOMPARE(openedAt(BITRATE * 80 / 100), lowered + (startsOver ? 1 : 0));
+    QCOMPARE(openedAt(BITRATE * 120 / 100), lowered + (startsOver ? 2 : 0));
+
+    for (const EncodedVideoFrame &frame : run.frames)
+        QVERIFY(isWellFormed(encoderCase.codec, frame));
+    const Decoded decoded = decodeAll(encoderCase.codec, run.frames);
+    QCOMPARE(decoded.errors, quint64(0));
 }
 
 // Mesa's encoders fill every frame of a constant bit rate up to it, so that a screen on which
@@ -2992,7 +3033,7 @@ void TestVideoEncode::thePipelineSharesTheScreen()
     // own sees to. That goes on a second screen, and that screen is then the one shared. It is
     // over the middle of its screen, so the middle of the picture is its colour.
     std::unique_ptr<TestWindow> stirring;
-    if (method != CaptureMethod::Auto) {
+    {
         SKIP_WITHOUT_A_QUIET_SCREEN(quiet);
         const auto shared = std::find_if(sources.begin(), sources.end(), [&quiet](const CaptureSource &each) { return each.geometry == quiet->whole; });
         QVERIFY(shared != sources.end());
@@ -3122,11 +3163,20 @@ void TestVideoEncode::thePipelineSharesTheScreen()
         QCOMPARE(preview.size(), expectedSize.scaled(QSize(512, 288), Qt::KeepAspectRatio));
     }
 
-    QTRY_VERIFY_WITH_TIMEOUT(stats.size() >= 2, 2500);
+    // Two more, so that the last is of a second in which somebody was watching all along.
+    const int statsBefore = static_cast<int>(stats.size());
+    QTRY_VERIFY_WITH_TIMEOUT(stats.size() >= statsBefore + 2, 3500);
     const BroadcastStats lastStats = stats.last();
     qInfo().noquote() << QStringLiteral("pipeline: %1, hardware %2, %3x%4, captured %5 fps, %6 ms in the encoder a picture, %7 ms of processor time a picture in all, %8 frames, %9 dropped").arg(lastStats.encoderName).arg(lastStats.hardware).arg(lastStats.encodedSize.width()).arg(lastStats.encodedSize.height()).arg(lastStats.capturedFps, 0, 'f', 1).arg(lastStats.averageEncodeMs, 0, 'f', 2).arg(cpuPerFrame, 0, 'f', 2).arg(lastStats.framesEncoded).arg(lastStats.framesDropped);
     QCOMPARE(lastStats.encodedSize, expectedSize);
-    QVERIFY(lastStats.capturedFps > FRAMERATE * 0.8 && lastStats.capturedFps < FRAMERATE * 1.2);
+#ifdef Q_OS_WIN
+    // Only pictures that show something new are counted, and the window that sees to those
+    // keeps a time of its own.
+    constexpr double FEWEST = 0.6;
+#else
+    constexpr double FEWEST = 0.8;
+#endif
+    QVERIFY2(lastStats.capturedFps > FRAMERATE * FEWEST && lastStats.capturedFps < FRAMERATE * 1.2, qPrintable(QString::number(lastStats.capturedFps)));
 #ifdef Q_OS_WIN
     QVERIFY(lastStats.encoderName.endsWith(method == CaptureMethod::GraphicsCapture ? QStringLiteral(", from gfxcapture") : QStringLiteral(", from ddagrab")));
     // Scaled or not, the pictures never leave the card on their way to an encoder that is on it.
@@ -4444,6 +4494,8 @@ void TestVideoEncode::thePipelineSharesAWindow()
 
     // The picture follows the window's size, and starts over with a key frame when it does.
     partBegins(QStringLiteral("resized"));
+    // What follows counts pictures, and of a window that shows nothing new few are sent.
+    window.setAnimated(true);
     const size_t atResize = record.frames.size();
     // Of another shape where the picture is scaled down, which would bring both sizes to the same.
     window.resizeInside(maxHeight ? QSize(800, 400) : QSize(800, 600));

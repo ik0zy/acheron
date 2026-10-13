@@ -612,8 +612,16 @@ QList<Discord::Voice::VideoCodec> cameraCodecs(const QList<Discord::Voice::Video
     return codecs;
 }
 
+namespace {
+
+// For an encoder that has to start over to change its rate.
+constexpr double RISE_WORTH_A_KEY_FRAME = 1.15;
+constexpr double ROOM_UNDER_A_LOWERED_RATE = 0.9;
+
+} // namespace
+
 VideoEncoder::VideoEncoder(const Settings &settings)
-    : settings(settings), uploaded(av_frame_alloc()), packet(av_packet_alloc()), asEncoded(av_packet_alloc())
+    : settings(settings), uploaded(av_frame_alloc()), packet(av_packet_alloc()), asEncoded(av_packet_alloc()), bitrateChosenFor(settings.bitrate)
 {
     for (const VideoEncoderCandidate &each : CANDIDATES) {
         if (each.codec != settings.codec)
@@ -660,19 +668,26 @@ void VideoEncoder::requestKeyframe()
 
 void VideoEncoder::setBitrate(int bitrate)
 {
-    if (bitrate == settings.bitrate)
-        return;
-    settings.bitrate = bitrate;
-    if (!context)
-        return;
-
-    if (!candidate->followsBitrate) {
-        reopenWanted = true;
+    if (!context || candidate->followsBitrate) {
+        if (bitrate == settings.bitrate)
+            return;
+        settings.bitrate = bitrate;
+        bitrateChosenFor = bitrate;
+        if (context) {
+            context->bit_rate = bitrate;
+            context->rc_max_rate = bitrate;
+            context->rc_buffer_size = bufferBits();
+        }
         return;
     }
-    context->bit_rate = bitrate;
-    context->rc_max_rate = bitrate;
-    context->rc_buffer_size = bufferBits();
+
+    const bool runsOver = settings.bitrate > bitrate;
+    const bool risenEnough = bitrate >= bitrateChosenFor * RISE_WORTH_A_KEY_FRAME;
+    if (!runsOver && !risenEnough)
+        return;
+    settings.bitrate = runsOver ? static_cast<int>(bitrate * ROOM_UNDER_A_LOWERED_RATE) : bitrate;
+    bitrateChosenFor = bitrate;
+    reopenWanted = true;
 }
 
 VideoEncoder::Outcome VideoEncoder::encode(AVFrame *frame, int64_t timestamp, std::vector<EncodedVideoFrame> &out)
