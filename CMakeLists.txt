@@ -383,13 +383,8 @@ if(ENABLE_VOICE)
         src/Discord/Voice/RtpPacket.cpp
         src/Discord/Voice/VoiceEncryption.cpp
         src/Discord/Voice/DaveSession.cpp
-        src/Discord/Voice/VideoDepacketizer.cpp
-        src/Discord/Voice/VideoReceiver.cpp
-        src/Discord/Voice/VideoPacketizer.cpp
-        src/Discord/Voice/VideoSender.cpp
         src/Discord/Voice/Rtcp.cpp
         src/Discord/Voice/SinkWants.cpp
-        src/Discord/Voice/TransportFeedback.cpp
         src/Core/Audio/VoiceManager.cpp
         src/Core/Audio/VoiceConnection.cpp
         src/Core/Audio/AudioPipeline.cpp
@@ -403,8 +398,18 @@ if(ENABLE_VOICE)
     )
 endif()
 
+if(ENABLE_VOICE AND NOT ACHERON_VIDEO)
+    list(APPEND PROJECT_SOURCES src/Discord/Voice/VoiceClientWithoutVideo.cpp)
+endif()
+
 if(ACHERON_VIDEO)
     list(APPEND PROJECT_SOURCES
+        src/Discord/Voice/VoiceClientVideo.cpp
+        src/Discord/Voice/VideoDepacketizer.cpp
+        src/Discord/Voice/VideoReceiver.cpp
+        src/Discord/Voice/VideoPacketizer.cpp
+        src/Discord/Voice/VideoSender.cpp
+        src/Discord/Voice/TransportFeedback.cpp
         src/Core/Media/DecodeDemand.cpp
         src/Core/Media/VideoDecoder.cpp
         src/Core/Media/VideoEncoder.cpp
@@ -564,6 +569,7 @@ if(BUILD_TESTS)
             src/Discord/Voice/Socks5UdpAssociation.cpp src/Discord/Voice/TransportFeedback.cpp
             src/Discord/Voice/UdpTransport.cpp src/Discord/Voice/VideoDepacketizer.cpp
             src/Discord/Voice/VideoReceiver.cpp src/Discord/Voice/VoiceClient.cpp
+            src/Discord/Voice/VoiceClientVideo.cpp
             src/Discord/Voice/VideoPacketizer.cpp src/Discord/Voice/VideoSender.cpp
             src/Discord/Voice/VoiceEncryption.cpp src/Discord/Voice/VoiceGateway.cpp)
         target_link_libraries(TestVoiceClient PRIVATE Qt::Core Qt::Network Qt::Test CURL::libcurl ${SODIUM_TARGET} libdave MLSPP::mlspp)

@@ -244,6 +244,8 @@ private:
     void setState(State state);
     void sendSilence();
     void cleanupTransport();
+    void cleanupVideo();
+    void readVideoPayloadTypes();
     void ensureDaveSession(uint16_t protocolVersion);
 
     void onPacket(PacketPool::Handle packet);
