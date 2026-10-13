@@ -366,9 +366,13 @@ bool CardScaler::scale(const AVFrame *from, const QRect &area, const Output &out
     }
 
     const QString reason = QStringLiteral("%1 (%2)").arg(QLatin1String(card->refused), QString::number(static_cast<quint32>(card->refusedWith), 16));
-    if (verdict.compare_exchange_strong(untried, Verdict::RuledOut))
+    // A card that Windows has just taken away, as it does on a change of driver or of screen
+    // mode, has said nothing of what it can do.
+    auto *lent = static_cast<AVD3D11VADeviceContext *>(reinterpret_cast<AVHWFramesContext *>(from->hw_frames_ctx->data)->device_ctx->hwctx);
+    const bool cardTakenAway = FAILED(lent->device->GetDeviceRemovedReason());
+    if (!cardTakenAway && verdict.compare_exchange_strong(untried, Verdict::RuledOut))
         qCInfo(LogVideo).noquote() << "The graphics card does not scale pictures:" << reason << "; they are read back and scaled in software";
-    else if (verdict == Verdict::Works)
+    else if (cardTakenAway || verdict == Verdict::Works)
         qCWarning(LogVideo).noquote() << "The graphics card did not scale a picture:" << reason;
     card->release();
     return false;
