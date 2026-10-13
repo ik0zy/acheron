@@ -614,6 +614,22 @@ if(BUILD_TESTS)
             target_include_directories(TestVideoEncode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
             add_test(NAME VideoEncodeTests COMMAND TestVideoEncode)
 
+            if(UNIX AND NOT APPLE)
+                qt_add_executable(TestX11Capture tests/tst_X11Capture.cpp src/Core/Video/X11Capture.cpp
+                    src/Core/Media/RgbScaler.cpp src/Core/Logging.cpp)
+                target_link_libraries(TestX11Capture PRIVATE Qt::Core Qt::Gui Qt::Test ffmpeg linuxcapture)
+                target_compile_definitions(TestX11Capture PRIVATE ACHERON_HAVE_FFMPEG)
+                target_include_directories(TestX11Capture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+                add_test(NAME X11CaptureTests COMMAND TestX11Capture)
+
+                qt_add_executable(TestPortalCapture tests/tst_PortalCapture.cpp src/Core/Video/PortalCapture.cpp
+                    src/Core/Media/RgbScaler.cpp src/Core/Logging.cpp)
+                target_link_libraries(TestPortalCapture PRIVATE Qt::Core Qt::Gui Qt::Test ffmpeg linuxcapture)
+                target_compile_definitions(TestPortalCapture PRIVATE ACHERON_HAVE_FFMPEG)
+                target_include_directories(TestPortalCapture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+                add_test(NAME PortalCaptureTests COMMAND TestPortalCapture)
+            endif()
+
             qt_add_executable(TestCameraCapture tests/tst_CameraCapture.cpp src/Core/Video/CameraCapture.cpp
                 src/Core/Video/CameraPipeline.cpp src/Core/Media/VideoEncoder.cpp
                 src/Core/Media/H264Sps.cpp src/Core/Media/VideoDecoder.cpp src/Core/Media/RgbScaler.cpp
