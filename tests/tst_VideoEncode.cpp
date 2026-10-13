@@ -844,6 +844,37 @@ bool reachesTheEncoderOnTheCard(VideoCodec codec, bool scaled, bool byGraphicsCa
     return chosen.takesCardFrames() && (withoutTheProcessor || Core::Video::CardScaler::usable());
 }
 
+// Whether a screen of this machine is on a graphics adapter that gives a Direct3D 11 device,
+// which capturing it takes either way. A machine that draws its screen in software, as a
+// hosted build machine does, has no such adapter.
+bool aScreenIsOnAGraphicsCard()
+{
+#ifdef Q_OS_WIN
+    using CreateFactory = HRESULT(WINAPI *)(REFIID, void **);
+    const auto createFactory = reinterpret_cast<CreateFactory>(reinterpret_cast<void *>(GetProcAddress(LoadLibraryW(L"dxgi.dll"), "CreateDXGIFactory1")));
+    IDXGIFactory1 *factory = nullptr;
+    if (!createFactory || FAILED(createFactory(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory))))
+        return false;
+
+    bool found = false;
+    IDXGIAdapter *adapter = nullptr;
+    for (UINT index = 0; !found && SUCCEEDED(factory->EnumAdapters(index, &adapter)); index++) {
+        IDXGIOutput *output = nullptr;
+        if (SUCCEEDED(adapter->EnumOutputs(0, &output))) {
+            output->Release();
+            AVBufferRef *device = nullptr;
+            found = av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_D3D11VA, QByteArray::number(index).constData(), nullptr, 0) >= 0;
+            av_buffer_unref(&device);
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return found;
+#else
+    return true;
+#endif
+}
+
 #ifdef Q_OS_WIN
 // The two solid colours of the windows the tests put on the screen: one to share and one to
 // lay over it.
@@ -2437,6 +2468,8 @@ void TestVideoEncode::thePipelineSharesTheScreen()
     const QList<CaptureSource> sources = captureSources();
     if (sources.isEmpty())
         QSKIP("no screen is attached");
+    if (!aScreenIsOnAGraphicsCard())
+        QSKIP("no screen of this machine is on a graphics card");
     setCaptureMethod(method);
     CaptureSource source = sources.first();
 #ifdef Q_OS_WIN
@@ -2616,6 +2649,8 @@ void TestVideoEncode::whatScalingAScreenCosts()
     const QList<CaptureSource> sources = captureSources();
     if (sources.isEmpty())
         QSKIP("no screen is attached");
+    if (!aScreenIsOnAGraphicsCard())
+        QSKIP("no screen of this machine is on a graphics card");
 
     // Graphics capture has a picture only when its screen changes, which a window sees to.
     CaptureSource source = sources.first();
