@@ -44,6 +44,11 @@ int CallVideo::maxDecoders()
     return std::max(1, QSettings().value(MAX_DECODERS_KEY, DEFAULT_MAX_DECODERS).toInt());
 }
 
+void CallVideo::setMaxDecoders(int decoders)
+{
+    QSettings().setValue(MAX_DECODERS_KEY, std::max(1, decoders));
+}
+
 void CallVideo::attach(VoiceClient *voiceClient)
 {
     detach();

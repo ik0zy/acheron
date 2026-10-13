@@ -1506,6 +1506,7 @@ private slots:
     void theProbeGivesTheSameAnswerEveryTime();
     void encodableCodecsAreOfferedForSending();
     void av1FromAmfIsCodedInWholeBlocks();
+    void aCodecTurnedOffIsNotSentWith();
     void av1FromVaapiIsAskedWhatSizesItCodes();
     void blackColumnsAreNotAcceptableAndAFewRowsAre();
     void av1IsOfferedOnlyWhereItAddsNoBlack();
@@ -1712,6 +1713,30 @@ void TestVideoEncode::encodableCodecsAreOfferedForSending()
 
 // What a Radeon RX 7000 was measured to make of each size (whatAnEncoderMakesOfASizeItCannotCode
 // measures it again wherever the encoder works).
+void TestVideoEncode::aCodecTurnedOffIsNotSentWith()
+{
+    using namespace Core::Media;
+    const QVariant before = QSettings().value(QStringLiteral("video/send_codecs_off"));
+    const auto restore = qScopeGuard([&before] { QSettings().setValue(QStringLiteral("video/send_codecs_off"), before); });
+    QSettings().remove(QStringLiteral("video/send_codecs_off"));
+
+    const QList<VideoCodec> encodable = { VideoCodec::AV1, VideoCodec::H264, VideoCodec::VP8 };
+    QCOMPARE(allowedSendCodecs(encodable), encodable);
+
+    setSendCodecAllowed(VideoCodec::AV1, false);
+    setSendCodecAllowed(VideoCodec::H265, false);
+    QVERIFY(!sendCodecAllowed(VideoCodec::AV1));
+    QVERIFY(sendCodecAllowed(VideoCodec::H264));
+    QCOMPARE(allowedSendCodecs(encodable), QList<VideoCodec>({ VideoCodec::H264, VideoCodec::VP8 }));
+
+    // Turned off twice it is off once, and on again it is as it was.
+    setSendCodecAllowed(VideoCodec::AV1, false);
+    setSendCodecAllowed(VideoCodec::AV1, true);
+    QVERIFY(sendCodecAllowed(VideoCodec::AV1));
+    QCOMPARE(allowedSendCodecs(encodable), encodable);
+    QVERIFY(!sendCodecAllowed(VideoCodec::H265));
+}
+
 void TestVideoEncode::av1FromAmfIsCodedInWholeBlocks()
 {
     using Core::Media::codedSize;

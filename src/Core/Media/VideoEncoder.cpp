@@ -5,6 +5,7 @@
 #include "Core/Media/HardwareDevices.hpp"
 
 #include <QElapsedTimer>
+#include <QSettings>
 
 #include <algorithm>
 #include <array>
@@ -570,6 +571,37 @@ QList<Discord::Voice::VideoCodec> shareCodecs(const QList<Discord::Voice::VideoC
     if (!paddingIsAcceptable(size, codedSize(av1Encoder, size)))
         codecs.removeAll(VideoCodec::AV1);
     return codecs;
+}
+
+namespace {
+
+const char *const SEND_CODECS_OFF_KEY = "video/send_codecs_off";
+
+} // namespace
+
+bool sendCodecAllowed(Discord::Voice::VideoCodec codec)
+{
+    return !QSettings().value(SEND_CODECS_OFF_KEY).toStringList().contains(Discord::Voice::videoCodecName(codec));
+}
+
+void setSendCodecAllowed(Discord::Voice::VideoCodec codec, bool allowed)
+{
+    const QString name = Discord::Voice::videoCodecName(codec);
+    QStringList off = QSettings().value(SEND_CODECS_OFF_KEY).toStringList();
+    off.removeAll(name);
+    if (!allowed)
+        off.append(name);
+    QSettings().setValue(SEND_CODECS_OFF_KEY, off);
+}
+
+QList<Discord::Voice::VideoCodec> allowedSendCodecs(const QList<Discord::Voice::VideoCodec> &encodable)
+{
+    QList<VideoCodec> allowed;
+    for (VideoCodec codec : encodable) {
+        if (sendCodecAllowed(codec))
+            allowed.append(codec);
+    }
+    return allowed;
 }
 
 QList<Discord::Voice::VideoCodec> cameraCodecs(const QList<Discord::Voice::VideoCodec> &encodable, const QString &av1Encoder)

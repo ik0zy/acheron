@@ -102,6 +102,11 @@ bool cameraSecondLayerEnabled()
     return QSettings().value(QStringLiteral("video/camera_second_layer"), false).toBool();
 }
 
+void setCameraSecondLayerEnabled(bool enabled)
+{
+    QSettings().setValue(QStringLiteral("video/camera_second_layer"), enabled);
+}
+
 QSize announcedSize(const SendQuality &quality)
 {
     if (quality.isSource())

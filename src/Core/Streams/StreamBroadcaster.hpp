@@ -92,6 +92,7 @@ public:
     // The codecs this machine can encode a share with. Finding out opens every encoder once,
     // which is too slow for the UI thread, so the answer comes later (at once when it is
     // already known), on the main thread, unless `context` has gone by then.
+    // Without those the settings turned off.
     static void whenEncodersKnown(QObject *context, std::function<void(const QList<Discord::Voice::VideoCodec> &)> then);
 
     void setGatewaySessionId(const QString &sessionId);

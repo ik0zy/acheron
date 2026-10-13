@@ -26,6 +26,10 @@ struct CameraDevice
 [[nodiscard]] bool cameraCaptureAvailable();
 // The cameras attached now. Asking is cheap and opens none of them.
 [[nodiscard]] QList<CameraDevice> cameraDevices();
+// The camera the user chose last (`video/camera_device`), when it is among `attached`. Empty
+// otherwise, which takes the first there is.
+[[nodiscard]] QString preferredCamera(const QList<CameraDevice> &attached);
+void setPreferredCamera(const QString &deviceId);
 
 struct CameraSettings
 {

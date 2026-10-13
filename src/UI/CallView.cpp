@@ -55,8 +55,6 @@ constexpr QSize TILE_WINDOW_SIZE(640, 360);
 const char *const COLLAPSED_WITHOUT_VIDEO_KEY = "video/call_view_collapsed_without_video";
 const char *const GEOMETRY_KEY = "video/call_view_geometry";
 
-const char *const CAMERA_DEVICE_KEY = "video/camera_device";
-
 const char *const SHARE_ICON = "screen-share";
 const char *const STOP_SHARING_ICON = "screen-share-off";
 const char *const CAMERA_ICON = "video";
@@ -64,13 +62,6 @@ const char *const STOP_CAMERA_ICON = "video-off";
 
 // The camera last chosen, while it is attached. Empty leaves the choice to the pipeline, which
 // takes the first there is.
-QString rememberedCamera(const QList<Core::Video::CameraDevice> &attached)
-{
-    const QString remembered = QSettings().value(CAMERA_DEVICE_KEY).toString();
-    const bool stillAttached = std::any_of(attached.cbegin(), attached.cend(), [&remembered](const Core::Video::CameraDevice &device) { return device.id == remembered; });
-    return stillAttached ? remembered : QString();
-}
-
 // The official client mirrors the camera for its owner alone.
 QImage mirrored(const QImage &picture)
 {
@@ -664,7 +655,7 @@ void CallView::onCameraClicked()
     if (camera->isOn())
         camera->turnOff();
     else
-        camera->turnOn(rememberedCamera(Core::Video::cameraDevices()));
+        camera->turnOn(Core::Video::preferredCamera(Core::Video::cameraDevices()));
 }
 
 void CallView::fillCameraMenu()
@@ -677,7 +668,7 @@ void CallView::fillCameraMenu()
         return;
     }
 
-    const QString remembered = rememberedCamera(devices);
+    const QString remembered = Core::Video::preferredCamera(devices);
     auto *choices = new QActionGroup(cameraMenu);
     for (const Core::Video::CameraDevice &device : devices) {
         QAction *action = cameraMenu->addAction(device.name);
@@ -690,7 +681,7 @@ void CallView::fillCameraMenu()
 
 void CallView::chooseCamera(const QString &deviceId)
 {
-    QSettings().setValue(CAMERA_DEVICE_KEY, deviceId);
+    Core::Video::setPreferredCamera(deviceId);
     if (camera && camera->isOn())
         camera->turnOn(deviceId);
 }

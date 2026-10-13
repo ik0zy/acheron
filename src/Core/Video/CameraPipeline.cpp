@@ -5,6 +5,7 @@
 #include "Core/Video/CameraCapture.hpp"
 
 #include <QElapsedTimer>
+#include <QSettings>
 
 #include <algorithm>
 #include <array>
@@ -224,6 +225,18 @@ Media::VideoEncoder::Settings encoderSettings(const CameraSettings &settings, in
 }
 
 } // namespace
+
+QString preferredCamera(const QList<CameraDevice> &attached)
+{
+    const QString chosen = QSettings().value(QStringLiteral("video/camera_device")).toString();
+    const bool stillAttached = std::any_of(attached.cbegin(), attached.cend(), [&chosen](const CameraDevice &device) { return device.id == chosen; });
+    return stillAttached ? chosen : QString();
+}
+
+void setPreferredCamera(const QString &deviceId)
+{
+    QSettings().setValue(QStringLiteral("video/camera_device"), deviceId);
+}
 
 class CameraPipeline::Worker
 {

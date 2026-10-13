@@ -56,7 +56,7 @@ void StreamBroadcaster::whenEncodersKnown(QObject *context, EncodersKnown then)
 {
     EncoderProbe &probe = encoderProbe();
     if (probe.known) {
-        then(probe.codecs);
+        then(Media::allowedSendCodecs(probe.codecs));
         return;
     }
 
@@ -76,7 +76,7 @@ void StreamBroadcaster::whenEncodersKnown(QObject *context, EncodersKnown then)
                     const auto waiting = std::exchange(probe.waiting, {});
                     for (const auto &[context, then] : waiting) {
                         if (context)
-                            then(codecs);
+                            then(Media::allowedSendCodecs(codecs));
                     }
                 },
                 Qt::QueuedConnection);

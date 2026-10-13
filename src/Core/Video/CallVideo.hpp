@@ -53,6 +53,7 @@ public:
 
     // At most this many cameras are decoded at once; the rest keep their avatars.
     [[nodiscard]] static int maxDecoders();
+    static void setMaxDecoders(int decoders);
 
     static constexpr int REPLAN_DELAY_MS = 100;
     static constexpr int DEFAULT_MAX_DECODERS = 9;

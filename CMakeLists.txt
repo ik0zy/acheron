@@ -432,6 +432,7 @@ if(ACHERON_VIDEO)
         src/Core/Video/TileVisibility.cpp
         src/UI/Video/VideoSurface.cpp
         src/UI/CallView.cpp
+        src/UI/Settings/VideoPage.cpp
         src/UI/ScreenSharePicker.cpp
     )
     if(WIN32)

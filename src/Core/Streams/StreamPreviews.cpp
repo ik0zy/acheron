@@ -82,6 +82,11 @@ bool StreamPreviewUploader::enabled()
     return QSettings().value(QStringLiteral("video/stream_previews"), true).toBool();
 }
 
+void StreamPreviewUploader::setEnabled(bool enabled)
+{
+    QSettings().setValue(QStringLiteral("video/stream_previews"), enabled);
+}
+
 QString StreamPreviewUploader::thumbnailOf(const QImage &picture)
 {
     if (picture.isNull())

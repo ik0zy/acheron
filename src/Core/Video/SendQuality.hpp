@@ -99,6 +99,7 @@ inline constexpr int CAMERA_MAX_BITRATE = 2'500'000;
 // it is the only camera in the call. This client does so when the setting
 // `video/camera_second_layer` is true. It is false until it has been tried against Discord.
 [[nodiscard]] bool cameraSecondLayerEnabled();
+void setCameraSecondLayerEnabled(bool enabled);
 inline constexpr int CAMERA_FULL_QUALITY = 100;
 inline constexpr int CAMERA_SECOND_QUALITY = 50;
 

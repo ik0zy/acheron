@@ -6,6 +6,9 @@
 #ifdef ACHERON_HAVE_MINIAUDIO
 #include "AudioPage.hpp"
 #endif
+#ifdef ACHERON_HAVE_STREAM_VIEW
+#include "VideoPage.hpp"
+#endif
 
 namespace Acheron {
 namespace UI {
@@ -49,6 +52,9 @@ void SettingsWindow::setupUi()
 
 #ifdef ACHERON_HAVE_MINIAUDIO
     addPage(tr("Audio"), new AudioPage(this));
+#endif
+#ifdef ACHERON_HAVE_STREAM_VIEW
+    addPage(tr("Video"), new VideoPage(this));
 #endif
 
     categoryList->setCurrentRow(0);

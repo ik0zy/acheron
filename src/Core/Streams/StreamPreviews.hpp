@@ -71,6 +71,7 @@ public:
 
     // The setting `video/stream_previews`; on unless the user turns it off.
     [[nodiscard]] static bool enabled();
+    static void setEnabled(bool enabled);
     // The picture fitted inside 512x288 as a JPEG data URL. Empty when it cannot be made.
     [[nodiscard]] static QString thumbnailOf(const QImage &picture);
 
