@@ -45,6 +45,15 @@ if(NOT TARGET CURL::libcurl AND TARGET CURL::libcurl-impersonate)
         INTERFACE_LINK_LIBRARIES CURL::libcurl-impersonate
         INTERFACE_INCLUDE_DIRECTORIES "${CURL_INCLUDE_DIRS}")
 endif()
+# FindCURL adds what pkg-config says of the system's own libcurl to whichever library was named.
+# Beside curl-impersonate that is a second libcurl in the program, and requests go to either.
+if(CURL_LIBRARY MATCHES "impersonate")
+    get_target_property(_curl_links CURL::libcurl INTERFACE_LINK_LIBRARIES)
+    if(_curl_links)
+        list(FILTER _curl_links EXCLUDE REGEX "(^|/)(lib)?curl(\\.[a-z0-9.]+)?$")
+        set_property(TARGET CURL::libcurl PROPERTY INTERFACE_LINK_LIBRARIES "${_curl_links}")
+    endif()
+endif()
 find_package(OpenSSL REQUIRED)
 if(ENABLE_VOICE)
     if(USE_VCPKG)
@@ -745,6 +754,11 @@ target_link_libraries(${PROJECT_NAME}
         qt${QT_VERSION_MAJOR}keychain
         OpenSSL::Crypto
 )
+# A static OpenSSL must not be what the system's libssl finds when Qt or another library loads
+# it: the linker would otherwise export it from the program, ahead of the libcrypto libssl needs.
+if(UNIX AND NOT APPLE AND OPENSSL_CRYPTO_LIBRARY MATCHES "\\.a$")
+    target_link_options(${PROJECT_NAME} PRIVATE "LINKER:--exclude-libs,libcrypto.a:libssl.a")
+endif()
 if(ENABLE_VOICE)
     target_link_libraries(${PROJECT_NAME} PRIVATE
         ${SODIUM_TARGET}
