@@ -51,13 +51,19 @@ static QString formatDisplayableCode(const std::vector<uint8_t> &data, int bytes
     return result;
 }
 
-QList<StreamDescription> cameraStreams()
+QList<StreamDescription> cameraStreams(bool withSecondLayer)
 {
-    StreamDescription layer;
-    layer.type = QStringLiteral("video");
-    layer.rid = QStringLiteral("100");
-    layer.quality = 100;
-    return { layer };
+    StreamDescription full;
+    full.type = QStringLiteral("video");
+    full.rid = QStringLiteral("100");
+    full.quality = 100;
+    if (!withSecondLayer)
+        return { full };
+
+    StreamDescription second = full;
+    second.rid = QStringLiteral("50");
+    second.quality = 50;
+    return { full, second };
 }
 
 VoiceClient::VoiceClient(const ConnectionParams &params, QObject *parent)
@@ -173,6 +179,7 @@ void VoiceClient::stop()
 
     localSsrc = 0;
     localVideoStreams.clear();
+    localLayers.clear();
     sendCodec = VideoCodec::Unknown;
     selectedMode.clear();
     sessionKey.clear();
@@ -775,8 +782,7 @@ void VoiceClient::ensureDaveSession(uint16_t protocolVersion)
             this, [this](bool enabled) {
                 if (std::exchange(videoDroppedAwaitingDaveKeys, false))
                     requestVideoKeyframeFromEveryone();
-                if (videoSendAwaitsKeyframe)
-                    askForLocalKeyframe();
+                askForAwaitedLocalKeyframes();
                 if (enabled) {
                     auto auth = daveSession->lastEpochAuthenticator();
                     if (!auth.empty())

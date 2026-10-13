@@ -97,6 +97,11 @@ qint64 estimatedCeiling(quint64 receiverEstimate, quint64 delayEstimate)
     return static_cast<qint64>(std::min(receiverEstimate, delayEstimate));
 }
 
+bool cameraSecondLayerEnabled()
+{
+    return QSettings().value(QStringLiteral("video/camera_second_layer"), false).toBool();
+}
+
 QSize announcedSize(const SendQuality &quality)
 {
     if (quality.isSource())

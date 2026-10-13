@@ -473,14 +473,20 @@ struct PipelineRecord
     explicit PipelineRecord(CameraPipeline &pipeline)
     {
         clock.start();
-        QObject::connect(&pipeline, &CameraPipeline::started, &here, [this](const QSize &size, int framerate) { starts.append({ size, framerate }); });
-        QObject::connect(&pipeline, &CameraPipeline::frameEncoded, &here, [this](const EncodedFramePointer &frame) {
+        QObject::connect(&pipeline, &CameraPipeline::started, &here, [this](const QSize &size, int framerate, int layer) { (layer == 0 ? starts : secondStarts).append({ size, framerate }); });
+        QObject::connect(&pipeline, &CameraPipeline::frameEncoded, &here, [this](const EncodedFramePointer &frame, int layer) {
+            if (layer != 0) {
+                secondFrames.push_back(frame);
+                return;
+            }
             frames.push_back(frame);
             if (firstFrameAt < 0)
                 firstFrameAt = clock.elapsed();
         });
         QObject::connect(&pipeline, &CameraPipeline::previewReady, &here, [this](const QImage &preview) { previews.append(preview); });
-        QObject::connect(&pipeline, &CameraPipeline::statsUpdated, &here, [this](const BroadcastStats &update) {
+        QObject::connect(&pipeline, &CameraPipeline::statsUpdated, &here, [this](const BroadcastStats &update, int layer) {
+            if (layer != 0)
+                return;
             stats.append(update);
             statsAt.append(clock.elapsed());
         });
@@ -514,6 +520,9 @@ struct PipelineRecord
     QElapsedTimer clock;
     qint64 firstFrameAt = -1;
     std::vector<EncodedFramePointer> frames;
+    // What the second layer said, apart from the first's.
+    std::vector<EncodedFramePointer> secondFrames;
+    QList<Start> secondStarts;
     QList<QImage> previews;
     QList<Start> starts;
     QList<BroadcastStats> stats;
@@ -614,6 +623,7 @@ private slots:
     void aKeyFrameComesWhenAskedFor();
     void nothingIsEncodedWhileSuspended();
     void aCameraOpenedWhileSuspendedIsAnnounced();
+    void aSecondLayerIsEncodedBesideTheFirstOnceItIsAskedFor();
     void aFullRangeCameraKeepsItsBrightness_data() { everyCodec(); }
     void aFullRangeCameraKeepsItsBrightness();
     void aCamerasColoursAreWhatAViewerTakesThemFor_data();
@@ -1166,6 +1176,60 @@ void TestCameraCapture::nothingIsEncodedWhileSuspended()
     const Decoded decoded = decodeAll(codec, record.frames);
     QCOMPARE(decoded.errors, quint64(0));
     QCOMPARE(decoded.pictures, static_cast<int>(record.frames.size()));
+}
+
+void TestCameraCapture::aSecondLayerIsEncodedBesideTheFirstOnceItIsAskedFor()
+{
+    SKIP_WITHOUT_AN_ENCODER(codec);
+
+    CameraPipeline pipeline;
+    PipelineRecord record(pipeline);
+    pipeline.setEncoding(QSize(320, 180), 15, 1);
+    pipeline.setBitrate(150000, 1);
+    pipeline.start(settingsFor(codec, QSize(640, 360), 30));
+    QTRY_VERIFY2_WITH_TIMEOUT(record.frames.size() >= 15 || !record.failures.isEmpty(), "fewer than 15 frames in 5 s", 5000);
+    QVERIFY2(record.failures.isEmpty(), qPrintable(record.failures.join(QLatin1Char(';'))));
+    QVERIFY(record.secondFrames.empty());
+    QVERIFY(record.secondStarts.isEmpty());
+
+    // Asked for, it starts with a key frame of its own, at its own size and rate, and the
+    // first layer goes on as it was.
+    const size_t firstLayerBefore = record.frames.size();
+    pipeline.setEncodingSuspended(false, 1);
+    QTRY_VERIFY2_WITH_TIMEOUT(record.secondFrames.size() >= 10 || !record.failures.isEmpty(), "fewer than 10 frames of the second layer in 5 s", 5000);
+    QVERIFY2(record.failures.isEmpty(), qPrintable(record.failures.join(QLatin1Char(';'))));
+    QVERIFY(record.secondFrames[0]->keyframe);
+    QCOMPARE(record.secondStarts, QList<PipelineRecord::Start>({ { QSize(320, 180), 15 } }));
+    QVERIFY(record.frames.size() > firstLayerBefore + 10);
+    QCOMPARE(record.keyFramesFrom(firstLayerBefore), 0);
+    QCOMPARE(record.starts.size(), 1);
+
+    // A key frame asked of the second layer is the second layer's alone.
+    const size_t secondLayerBefore = record.secondFrames.size();
+    const size_t firstLayerThen = record.frames.size();
+    pipeline.requestKeyframe(1);
+    const auto keyFrameSince = [&record, secondLayerBefore] { return std::any_of(record.secondFrames.begin() + static_cast<std::ptrdiff_t>(secondLayerBefore), record.secondFrames.end(), [](const EncodedFramePointer &frame) { return frame->keyframe; }); };
+    QTRY_VERIFY_WITH_TIMEOUT(keyFrameSince(), 2000);
+    QCOMPARE(record.keyFramesFrom(firstLayerThen), 0);
+
+    // No longer asked for, it stops and the first goes on.
+    pipeline.setEncodingSuspended(true, 1);
+    QTest::qWait(300);
+    const size_t secondLayerStopped = record.secondFrames.size();
+    const size_t firstLayerMeanwhile = record.frames.size();
+    QTest::qWait(500);
+    QCOMPARE(record.secondFrames.size(), secondLayerStopped);
+    QVERIFY(record.frames.size() > firstLayerMeanwhile + 5);
+    pipeline.stop();
+    QVERIFY(record.failures.isEmpty());
+
+    const Decoded first = decodeAll(codec, record.frames);
+    QCOMPARE(first.errors, quint64(0));
+    QCOMPARE(first.sizes, QList<QSize>{ QSize(640, 360) });
+    const Decoded second = decodeAll(codec, record.secondFrames);
+    QCOMPARE(second.errors, quint64(0));
+    QCOMPARE(second.pictures, static_cast<int>(record.secondFrames.size()));
+    QCOMPARE(second.sizes, QList<QSize>{ QSize(320, 180) });
 }
 
 void TestCameraCapture::aCameraOpenedWhileSuspendedIsAnnounced()

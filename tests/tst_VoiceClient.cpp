@@ -544,6 +544,7 @@ struct Call
 {
     enum class Kind {
         Voice,
+        VoiceWithSecondLayer,
         Stream,
         StreamWithSound,
     };
@@ -559,10 +560,10 @@ struct Call
         params.userId = Core::Snowflake(3);
         params.sessionId = QStringLiteral("session");
         params.video = true;
-        if (kind == Kind::Voice)
-            params.streams = cameraStreams();
+        if (kind == Kind::Voice || kind == Kind::VoiceWithSecondLayer)
+            params.streams = cameraStreams(kind == Kind::VoiceWithSecondLayer);
         params.sendsAudio = kind == Kind::StreamWithSound;
-        params.streamContext = kind != Kind::Voice;
+        params.streamContext = kind == Kind::Stream || kind == Kind::StreamWithSound;
 
         Codec vp8;
         vp8.name = QStringLiteral("VP8");
@@ -660,6 +661,7 @@ private slots:
 
     void connectsAndSaysWhatItCanReceive();
     void aVoiceConnectionDeclaresOneCameraLayer();
+    void aVoiceConnectionMayDeclareASecondCameraLayer();
     void usersTheServerNamesAreAnnounced();
     void framesReachTheHandlerUnderTheirSender();
     void aLostPacketIsAskedForAndTakenFromTheRetransmission();
@@ -670,7 +672,8 @@ private slots:
 
     void theServerNamesTheCodecVideoIsSentWith();
     void nothingIsSaidOfVideoBeforeItHasStarted();
-    void startingVideoAnnouncesTheLayerItIsSentOn();
+    void startingVideoAnnouncesEveryLayerItHas();
+    void eachLayerIsAStreamOfItsOwnUnderOneNumbering();
     void withoutStreamsFromTheServerTheSsrcsFollowTheAudioOne();
     void aFrameArrivesAsPacketsThatReassemble();
     void aFrameLeavesAtThePaceOfTheBitrateItWasEncodedAt();
@@ -723,6 +726,15 @@ void TestVoiceClient::aVoiceConnectionDeclaresOneCameraLayer()
     QCOMPARE(call.server.receivedText(0).size(), 1);
     QVERIFY2(call.server.receivedText(0)[0].endsWith(R"("video":true,"streams":[{"type":"video","rid":"100","quality":100}]}})"), call.server.receivedText(0)[0].constData());
     QCOMPARE(call.server.received(0)[0]["streams"].toArray().size(), 1);
+}
+
+void TestVoiceClient::aVoiceConnectionMayDeclareASecondCameraLayer()
+{
+    Call call(false, Call::Kind::VoiceWithSecondLayer);
+    QTRY_VERIFY(call.isUp());
+
+    QCOMPARE(call.server.receivedText(0).size(), 1);
+    QVERIFY2(call.server.receivedText(0)[0].endsWith(R"("video":true,"streams":[{"type":"video","rid":"100","quality":100},{"type":"video","rid":"50","quality":50}]}})"), call.server.receivedText(0)[0].constData());
 }
 
 void TestVoiceClient::usersTheServerNamesAreAnnounced()
@@ -929,7 +941,7 @@ void TestVoiceClient::nothingIsSaidOfVideoBeforeItHasStarted()
     QCOMPARE(call.server.undecryptable, 0);
 }
 
-void TestVoiceClient::startingVideoAnnouncesTheLayerItIsSentOn()
+void TestVoiceClient::startingVideoAnnouncesEveryLayerItHas()
 {
     Call call(true);
     // Two layers, the full one second, and its retransmissions not on the SSRC after its own.
@@ -937,28 +949,39 @@ void TestVoiceClient::startingVideoAnnouncesTheLayerItIsSentOn()
         QJsonObject{ { "type", "video" }, { "rid", "50" }, { "ssrc", 5002 }, { "rtx_ssrc", 5003 }, { "quality", 50 }, { "active", false } },
         QJsonObject{ { "type", "video" }, { "rid", "100" }, { "ssrc", 5000 }, { "rtx_ssrc", 5005 }, { "quality", 100 }, { "active", false } },
     };
+    QSignalSpy layersKnown(call.client.get(), &VoiceClient::videoSendLayersKnown);
     QTRY_VERIFY(call.isUp());
+    QCOMPARE(layersKnown.count(), 1);
+    QCOMPARE(layersKnown[0][0].value<QList<int>>(), QList<int>({ 50, 100 }));
 
+    // The top names the full layer, with the SSRC after it for its retransmissions whatever
+    // READY gave it. Every layer is said to be active, and to be of the same size and rate.
     const QByteArray opening = R"({"op":12,"d":{"audio_ssrc":777,"video_ssrc":5000,"rtx_ssrc":5001,"streams":[)";
-    const QByteArray lowLayer = R"({"type":"video","rid":"50","ssrc":5002,"active":false,"quality":50,"rtx_ssrc":5003})";
+    const auto layers = [](const QByteArray &active, const QByteArray &secondLimits, const QByteArray &fullLimits) {
+        return QByteArray(R"({"type":"video","rid":"50","ssrc":5002,"active":)") + active + R"(,"quality":50,"rtx_ssrc":5003,)" + secondLimits + R"(},{"type":"video","rid":"100","ssrc":5000,"active":)" + active + R"(,"quality":100,"rtx_ssrc":5005,)" + fullLimits + "}]}}";
+    };
+    const QByteArray fixedSize = R"("max_framerate":30,"max_resolution":{"type":"fixed","width":1280,"height":720})";
 
     call.startVideo();
     QTRY_COMPARE(call.server.receivedText(12).size(), 1);
-    QCOMPARE(call.server.receivedText(12)[0], opening + lowLayer + R"(,{"type":"video","rid":"100","ssrc":5000,"active":true,"quality":100,"rtx_ssrc":5005,"max_bitrate":3500000,"max_framerate":30,"max_resolution":{"type":"fixed","width":1280,"height":720}}]}})");
+    QCOMPARE(call.server.receivedText(12)[0], opening + layers("true", R"("max_bitrate":3500000,)" + fixedSize, R"("max_bitrate":3500000,)" + fixedSize));
+    // Said again, for whoever began to listen after the connection was made.
+    QCOMPARE(layersKnown.count(), 2);
 
-    // New limits, this time for whatever size the source has.
+    // New limits, this time for whatever size the source has, and less for the second layer.
     LocalVideoDescription source;
     source.maxFramerate = 60;
     source.maxBitrate = 9000000;
+    source.secondLayerMaxBitrate = 625000;
     call.client->describeVideo(source);
     QTRY_COMPARE(call.server.receivedText(12).size(), 2);
-    const QByteArray limitsAtSource = R"("quality":100,"rtx_ssrc":5005,"max_bitrate":9000000,"max_framerate":60,"max_resolution":{"type":"source","width":0,"height":0}}]}})";
-    QCOMPARE(call.server.receivedText(12)[1], opening + lowLayer + R"(,{"type":"video","rid":"100","ssrc":5000,"active":true,)" + limitsAtSource);
+    const QByteArray sourceSize = R"("max_framerate":60,"max_resolution":{"type":"source","width":0,"height":0})";
+    QCOMPARE(call.server.receivedText(12)[1], opening + layers("true", R"("max_bitrate":625000,)" + sourceSize, R"("max_bitrate":9000000,)" + sourceSize));
 
     // Off: no SSRC at the top, and the layers as they were but inactive.
     call.client->stopVideo();
     QTRY_COMPARE(call.server.receivedText(12).size(), 3);
-    QCOMPARE(call.server.receivedText(12)[2], R"({"op":12,"d":{"audio_ssrc":777,"video_ssrc":0,"rtx_ssrc":0,"streams":[)" + lowLayer + R"(,{"type":"video","rid":"100","ssrc":5000,"active":false,)" + limitsAtSource);
+    QCOMPARE(call.server.receivedText(12)[2], R"({"op":12,"d":{"audio_ssrc":777,"video_ssrc":0,"rtx_ssrc":0,"streams":[)" + layers("false", R"("max_bitrate":625000,)" + sourceSize, R"("max_bitrate":9000000,)" + sourceSize));
 
     // Already off: there is nothing new to say.
     call.client->stopVideo();
@@ -968,6 +991,89 @@ void TestVoiceClient::startingVideoAnnouncesTheLayerItIsSentOn()
 
     // No speaking message goes with video.
     QVERIFY(call.server.received(5).isEmpty());
+}
+
+void TestVoiceClient::eachLayerIsAStreamOfItsOwnUnderOneNumbering()
+{
+    constexpr quint32 SECOND_SSRC = 5002;
+    constexpr quint32 SECOND_RTX_SSRC = 5003;
+    constexpr int MEDIA_SINK_WANTS = 15;
+    Call call(true);
+    call.server.readyStreams = QJsonArray{
+        QJsonObject{ { "type", "video" }, { "rid", "100" }, { "ssrc", 5000 }, { "rtx_ssrc", 5001 }, { "quality", 100 }, { "active", false } },
+        QJsonObject{ { "type", "video" }, { "rid", "50" }, { "ssrc", int(SECOND_SSRC) }, { "rtx_ssrc", int(SECOND_RTX_SSRC) }, { "quality", 50 }, { "active", false } },
+    };
+    QTRY_VERIFY(call.isUp());
+    call.startVideo();
+    QSignalSpy keyframes(call.client.get(), &VoiceClient::videoKeyframeRequested);
+    QSignalSpy receivers(call.client.get(), &VoiceClient::videoReceiversChanged);
+    QSignalSpy wants(call.client.get(), &VoiceClient::videoWantsReceived);
+    QSignalSpy statistics(call.client.get(), &VoiceClient::videoSendStatsUpdated);
+
+    // Three packets of the full picture, one of the second layer, and nothing of a layer
+    // the connection does not have.
+    call.client->sendVideoFrame(videoFrame(3000, true, 90000));
+    call.client->sendVideoFrame(videoFrame(1000, true, 90000), 50);
+    call.client->sendVideoFrame(videoFrame(1000, true, 90000), 20);
+    QTRY_COMPARE(call.server.rtp.size(), 4);
+    QTest::qWait(50);
+    QCOMPARE(call.server.rtp.size(), 4);
+
+    int ofTheFull = 0;
+    quint16 secondSequence = 0;
+    QSet<int> numbers;
+    for (const RtpSeen &packet : std::as_const(call.server.rtp)) {
+        if (packet.header.ssrc == 5000)
+            ofTheFull++;
+        else
+            secondSequence = packet.header.sequence;
+        const std::span<const uint8_t> number = findRtpExtension(packet.extensions, VideoSendStream::TRANSPORT_SEQUENCE_EXTENSION);
+        QCOMPARE(number.size(), size_t(2));
+        numbers.insert(qFromBigEndian<quint16>(number.data()));
+    }
+    QCOMPARE(ofTheFull, 3);
+    QCOMPARE(call.server.rtp.last().header.ssrc, SECOND_SSRC);
+    // One numbering runs through both.
+    QCOMPARE(numbers, QSet<int>({ 1, 2, 3, 4 }));
+
+    // What the server says of the second layer is passed on as said of it: who receives it,
+    // which brings a key frame for whoever has only now begun to, and a packet to send again,
+    // which comes on that layer's own retransmission stream.
+    Bytes again(16);
+    const quint16 lost[] = { secondSequence };
+    again.resize(static_cast<size_t>(writeNack(again, SERVER_SSRC, SECOND_SSRC, lost)));
+    call.server.sendFeedback({ receiverCount(SECOND_SSRC, 2), again });
+    QTRY_COMPARE(receivers.count(), 1);
+    QCOMPARE(receivers[0][0].toInt(), 2);
+    QCOMPARE(receivers[0][1].toInt(), 50);
+    QTRY_COMPARE(keyframes.count(), 1);
+    QCOMPARE(keyframes[0][0].toInt(), 50);
+    QTRY_COMPARE(call.server.rtp.size(), 5);
+    QCOMPARE(call.server.rtp.last().header.ssrc, SECOND_RTX_SSRC);
+
+    // Each layer hears what is wanted of it: of its own SSRC first, then of any, and a
+    // want of nothing counts as a want of all of it.
+    call.server.send(MEDIA_SINK_WANTS, QJsonObject{ { "any", 30 }, { QString::number(SECOND_SSRC), 60 }, { "pixelCounts", QJsonObject{ { QString::number(SECOND_SSRC), 147456 } } } });
+    QTRY_COMPARE(wants.count(), 2);
+    const auto said = [&wants](int index) { return QList<int>({ wants[index][0].toInt(), wants[index][1].toInt(), wants[index][2].toInt() }); };
+    QCOMPARE(said(0), QList<int>({ 30, 0, 100 }));
+    QCOMPARE(said(1), QList<int>({ 60, 147456, 50 }));
+    call.server.send(MEDIA_SINK_WANTS, QJsonObject{ { "any", 0 }, { "5000", 0 }, { QString::number(SECOND_SSRC), 60 } });
+    QTRY_COMPARE(wants.count(), 4);
+    QCOMPARE(said(2), QList<int>({ 100, 0, 100 }));
+    QCOMPARE(said(3), QList<int>({ 60, 0, 50 }));
+
+    // The statistics count both layers together, and each sends a report of its own.
+    QTRY_VERIFY_WITH_TIMEOUT(statistics.count() >= 1, 1500);
+    const VideoSendStats sent = statistics.last()[0].value<VideoSendStats>();
+    QCOMPARE(sent.packets, quint64(4));
+    QCOMPARE(sent.frames, quint64(2));
+    QCOMPARE(sent.retransmitted, quint64(1));
+    QCOMPARE(sent.receivers, -1);
+    QSet<quint32> reportedOn;
+    for (const ReceivedRtcp::SenderReport &report : std::as_const(call.server.senderReports))
+        reportedOn.insert(report.ssrc);
+    QCOMPARE(reportedOn, QSet<quint32>({ 5000, SECOND_SSRC }));
 }
 
 void TestVoiceClient::withoutStreamsFromTheServerTheSsrcsFollowTheAudioOne()

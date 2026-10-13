@@ -94,6 +94,14 @@ inline constexpr int CAMERA_FRAMERATE = 30;
 inline constexpr int CAMERA_MIN_BITRATE = 150'000;
 inline constexpr int CAMERA_MAX_BITRATE = 2'500'000;
 
+// The official client sends its camera in two encodings, each on SSRCs of its own, and a
+// viewer takes one or the other: the second where the picture is shown small, and wherever
+// it is the only camera in the call. This client does so when the setting
+// `video/camera_second_layer` is true. It is false until it has been tried against Discord.
+[[nodiscard]] bool cameraSecondLayerEnabled();
+inline constexpr int CAMERA_FULL_QUALITY = 100;
+inline constexpr int CAMERA_SECOND_QUALITY = 50;
+
 // One row of the camera's ladder.
 struct CameraLayer
 {

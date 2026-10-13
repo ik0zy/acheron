@@ -22,6 +22,8 @@ CameraSender::CameraSender(Discord::Client *client, Audio::VoiceManager *voice, 
     : QObject(parent), client(client), voice(voice), screenShare(screenShare), allowedHere(std::move(allowedHere))
 {
     clock.start();
+    layers[SECOND].quality = Video::CAMERA_SECOND_QUALITY;
+    layers[SECOND].suspended = true;
 
     planTimer.setSingleShot(true);
     connect(&planTimer, &QTimer::timeout, this, &CameraSender::applyPlan);
@@ -82,14 +84,23 @@ void CameraSender::clearFailure()
 
 CameraSender::Stats CameraSender::stats() const
 {
+    const Layer &full = layers[FULL];
+    const Layer &second = layers[SECOND];
+
     Stats now;
-    now.encoder = encoderStats;
+    now.encoder = full.encoderStats;
     now.network = networkStats;
-    now.targetBitrate = asked.bitrate;
-    now.receivers = receivers;
-    now.servedWant = plan.servedWant();
-    now.mutedFramerate = pipeline && plan.countsAsMuted(clock.elapsed());
-    now.encodingSuspended = encodingSuspended;
+    now.targetBitrate = full.asked.bitrate;
+    now.receivers = full.receivers;
+    now.servedWant = full.plan.servedWant();
+    now.mutedFramerate = pipeline && full.plan.countsAsMuted(clock.elapsed());
+    now.encodingSuspended = full.suspended;
+    now.hasSecondLayer = hasSecondLayer;
+    now.secondEncoder = second.encoderStats;
+    now.secondTargetBitrate = second.asked.bitrate;
+    now.secondReceivers = second.receivers;
+    now.secondServedWant = second.plan.servedWant();
+    now.secondEncodingSuspended = second.suspended;
     return now;
 }
 
@@ -112,10 +123,12 @@ void CameraSender::turnOn(const QString &wantedDeviceId)
 
     deviceId = wantedDeviceId;
     cameraChannelId = voice->currentChannelId();
-    plan.start(clock.elapsed());
-    plan.setSelfMuted(voice->isSelfMuted());
-    plan.setSpeaking(speaking, clock.elapsed());
-    plan.setSharingScreen(screenShare->isSharing());
+    for (Layer &layer : layers) {
+        layer.plan.start(clock.elapsed());
+        layer.plan.setSelfMuted(voice->isSelfMuted());
+        layer.plan.setSpeaking(speaking, clock.elapsed());
+        layer.plan.setSharingScreen(screenShare->isSharing());
+    }
     setState(State::Starting);
     sendVoiceState();
 
@@ -210,20 +223,23 @@ void CameraSender::onVoiceMembershipChanged()
 
 void CameraSender::onOwnVoiceStateChanged()
 {
-    plan.setSelfMuted(voice->isSelfMuted());
+    for (Layer &layer : layers)
+        layer.plan.setSelfMuted(voice->isSelfMuted());
     applyPlan();
 }
 
 void CameraSender::onSpeakingChanged(bool nowSpeaking)
 {
     speaking = nowSpeaking;
-    plan.setSpeaking(nowSpeaking, clock.elapsed());
+    for (Layer &layer : layers)
+        layer.plan.setSpeaking(nowSpeaking, clock.elapsed());
     applyPlan();
 }
 
 void CameraSender::onScreenShareChanged()
 {
-    plan.setSharingScreen(screenShare->isSharing());
+    for (Layer &layer : layers)
+        layer.plan.setSharingScreen(screenShare->isSharing());
     applyPlan();
 }
 
@@ -248,17 +264,21 @@ void CameraSender::onRtcClientCreated(VoiceClient *created)
         if (serial == connectionSerial)
             onSendStats(sent);
     });
-    connect(rtc, &VoiceClient::videoKeyframeRequested, this, [this, serial] {
+    connect(rtc, &VoiceClient::videoSendLayersKnown, this, [this, serial](const QList<int> &qualities) {
         if (serial == connectionSerial)
-            onKeyframeRequested();
+            onSendLayersKnown(qualities);
     });
-    connect(rtc, &VoiceClient::videoReceiversChanged, this, [this, serial](int count) {
+    connect(rtc, &VoiceClient::videoKeyframeRequested, this, [this, serial](int quality) {
         if (serial == connectionSerial)
-            onReceiversChanged(count);
+            onKeyframeRequested(quality);
     });
-    connect(rtc, &VoiceClient::videoWantsReceived, this, [this, serial](int want, int) {
+    connect(rtc, &VoiceClient::videoReceiversChanged, this, [this, serial](int count, int quality) {
         if (serial == connectionSerial)
-            onWantsReceived(want);
+            onReceiversChanged(count, quality);
+    });
+    connect(rtc, &VoiceClient::videoWantsReceived, this, [this, serial](int want, int, int quality) {
+        if (serial == connectionSerial)
+            onWantsReceived(want, quality);
     });
     sendFramesToRtc();
 }
@@ -275,7 +295,9 @@ void CameraSender::onRtcClientClosing()
     rtcConnected = false;
     videoAnnounced = false;
     sendCodec = VideoCodec::Unknown;
-    receivers = -1;
+    hasSecondLayer = false;
+    for (Layer &layer : layers)
+        layer.receivers = -1;
     codecTimeout.stop();
 
     if (currentState == State::On)
@@ -310,26 +332,41 @@ void CameraSender::onSendStats(const VideoSendStats &sent)
     networkStats = sent;
     if (!pipelineStarted)
         return;
-    plan.setReceiverLimit(Video::estimatedCeiling(sent.receiverEstimateBps, sent.delayEstimateBps));
-    plan.reportLoss(sent.lossFraction, clock.elapsed());
+
+    // What the way carries goes to the smaller layer first and the rest to the full one, as
+    // WebRTC shares a rate out among the layers of a stream.
+    Layer &full = layers[FULL];
+    Layer &second = layers[SECOND];
+    const qint64 ceiling = Video::estimatedCeiling(sent.receiverEstimateBps, sent.delayEstimateBps);
+    const bool sharedWithSecond = ceiling > 0 && hasSecondLayer && !second.suspended;
+    second.plan.setReceiverLimit(ceiling);
+    full.plan.setReceiverLimit(sharedWithSecond ? std::max<qint64>(ceiling - second.asked.bitrate, 1) : ceiling);
+    for (Layer &layer : layers)
+        layer.plan.reportLoss(sent.lossFraction, clock.elapsed());
     applyPlan();
 }
 
-void CameraSender::onKeyframeRequested()
+void CameraSender::onSendLayersKnown(const QList<int> &qualities)
 {
-    if (pipeline)
-        pipeline->requestKeyframe();
-}
-
-void CameraSender::onReceiversChanged(int count)
-{
-    receivers = count;
+    hasSecondLayer = qualities.contains(layers[SECOND].quality);
     applySuspension();
 }
 
-void CameraSender::onWantsReceived(int want)
+void CameraSender::onKeyframeRequested(int quality)
 {
-    plan.setWant(want);
+    if (pipeline)
+        pipeline->requestKeyframe(layerOf(quality));
+}
+
+void CameraSender::onReceiversChanged(int count, int quality)
+{
+    layers[static_cast<size_t>(layerOf(quality))].receivers = count;
+    applySuspension();
+}
+
+void CameraSender::onWantsReceived(int want, int quality)
+{
+    layers[static_cast<size_t>(layerOf(quality))].plan.setWant(want);
     applyPlan();
 }
 
@@ -360,8 +397,8 @@ void CameraSender::startPipeline()
     pipeline = std::make_unique<Video::CameraPipeline>();
     pipelineCodec = sendCodec;
     const quint64 serial = ++pipelineSerial;
-    connect(pipeline.get(), &Video::CameraPipeline::started, this, [this, serial](const QSize &size, int) {
-        if (serial == pipelineSerial)
+    connect(pipeline.get(), &Video::CameraPipeline::started, this, [this, serial](const QSize &size, int, int layer) {
+        if (serial == pipelineSerial && layer == FULL)
             onPipelineStarted(size);
     });
     connect(pipeline.get(), &Video::CameraPipeline::previewReady, this, [this, serial](const QImage &preview) {
@@ -372,21 +409,27 @@ void CameraSender::startPipeline()
         if (serial == pipelineSerial)
             onPipelineFailed(reason);
     });
-    connect(pipeline.get(), &Video::CameraPipeline::statsUpdated, this, [this, serial](const Video::BroadcastStats &encoder) {
+    connect(pipeline.get(), &Video::CameraPipeline::statsUpdated, this, [this, serial](const Video::BroadcastStats &encoder, int layer) {
         if (serial == pipelineSerial)
-            onPipelineStats(encoder);
+            onPipelineStats(encoder, layer);
     });
     sendFramesToRtc();
 
-    asked = plan.advance(clock.elapsed());
+    for (Layer &layer : layers)
+        layer.asked = layer.plan.advance(clock.elapsed());
+    const Layer &full = layers[FULL];
+    const Layer &second = layers[SECOND];
     Video::CameraSettings settings;
     settings.deviceId = deviceId;
     settings.codec = sendCodec;
-    settings.encodeSize = asked.size;
-    settings.framerate = asked.framerate;
-    settings.bitrate = asked.bitrate;
+    settings.encodeSize = full.asked.size;
+    settings.framerate = full.asked.framerate;
+    settings.bitrate = full.asked.bitrate;
     // The most the camera is ever sent at, whichever row of the ladder it starts on.
     settings.maxBitrate = Video::CAMERA_MAX_BITRATE;
+    // The second layer is encoded once someone is known to receive it.
+    pipeline->setEncoding(second.asked.size, second.asked.framerate, SECOND);
+    pipeline->setBitrate(second.asked.bitrate, SECOND);
     pipeline->start(settings);
     applyPlan();
 }
@@ -403,8 +446,10 @@ void CameraSender::stopPipeline()
     pipeline.reset();
 
     pipelineStarted = false;
-    encodingSuspended = false;
-    encoderStats = {};
+    for (Layer &layer : layers) {
+        layer.suspended = &layer == &layers[SECOND];
+        layer.encoderStats = {};
+    }
 }
 
 void CameraSender::sendFramesToRtc()
@@ -413,8 +458,8 @@ void CameraSender::sendFramesToRtc()
     if (!pipeline || !rtc)
         return;
 
-    framesToRtc = connect(pipeline.get(), &Video::CameraPipeline::frameEncoded, rtc, [connection = rtc](const Video::EncodedFramePointer &frame) {
-        connection->sendVideoFrame(*frame);
+    framesToRtc = connect(pipeline.get(), &Video::CameraPipeline::frameEncoded, rtc, [connection = rtc, secondQuality = layers[SECOND].quality](const Video::EncodedFramePointer &frame, int layer) {
+        connection->sendVideoFrame(*frame, layer == SECOND ? secondQuality : VoiceClient::FULL_QUALITY);
     });
 }
 
@@ -440,28 +485,34 @@ void CameraSender::onPipelineFailed(const QString &reason)
     fail(tr("Your camera was turned off: %1").arg(reason));
 }
 
-void CameraSender::onPipelineStats(const Video::BroadcastStats &encoder)
+void CameraSender::onPipelineStats(const Video::BroadcastStats &encoder, int layer)
 {
-    encoderStats = encoder;
+    if (layer == FULL || layer == SECOND)
+        layers[static_cast<size_t>(layer)].encoderStats = encoder;
 }
 
 void CameraSender::announceVideo()
 {
+    // Both layers are announced at the camera's own size, as the official client announces
+    // them, and each at the most its place on the ladder is sent at.
     LocalVideoDescription description;
     description.maxWidth = Video::CAMERA_CAPTURE_SIZE.width();
     description.maxHeight = Video::CAMERA_CAPTURE_SIZE.height();
     description.maxFramerate = Video::CAMERA_FRAMERATE;
     description.maxBitrate = Video::CAMERA_MAX_BITRATE;
+    description.secondLayerMaxBitrate = layers[SECOND].plan.maxBitrate();
 
     videoAnnounced = true;
-    QMetaObject::invokeMethod(rtc, [connection = rtc, description, bitrate = asked.bitrate] {
+    QMetaObject::invokeMethod(rtc, [connection = rtc, description, bitrate = layers[FULL].asked.bitrate, secondBitrate = layers[SECOND].asked.bitrate, secondQuality = layers[SECOND].quality] {
         connection->startVideo(description);
         connection->setVideoBitrate(bitrate);
+        connection->setVideoBitrate(secondBitrate, secondQuality);
     });
     applySuspension();
     // What was encoded before the client took the announcement was dropped by it, and that
     // included the frame every viewer needs first.
-    pipeline->requestKeyframe();
+    pipeline->requestKeyframe(FULL);
+    pipeline->requestKeyframe(SECOND);
     setState(State::On);
 }
 
@@ -474,32 +525,45 @@ void CameraSender::applyPlan()
         return;
 
     const qint64 now = clock.elapsed();
-    const Video::CameraEncoding wanted = plan.advance(now);
-    // The bitrate first, so that an encoder reopened for a new size opens at the rate that
-    // goes with it.
-    if (wanted.bitrate != asked.bitrate) {
-        pipeline->setBitrate(wanted.bitrate);
-        if (rtc)
-            QMetaObject::invokeMethod(rtc, [connection = rtc, bitrate = wanted.bitrate] { connection->setVideoBitrate(bitrate); });
-    }
-    if (wanted.size != asked.size || wanted.framerate != asked.framerate)
-        pipeline->setEncoding(wanted.size, wanted.framerate);
-    asked = wanted;
+    std::optional<qint64> nextChange;
+    for (int index = 0; index < static_cast<int>(layers.size()); index++) {
+        Layer &layer = layers[static_cast<size_t>(index)];
+        const Video::CameraEncoding wanted = layer.plan.advance(now);
+        // The bitrate first, so that an encoder reopened for a new size opens at the rate that
+        // goes with it.
+        if (wanted.bitrate != layer.asked.bitrate) {
+            pipeline->setBitrate(wanted.bitrate, index);
+            if (rtc)
+                QMetaObject::invokeMethod(rtc, [connection = rtc, bitrate = wanted.bitrate, quality = layer.quality] { connection->setVideoBitrate(bitrate, quality); });
+        }
+        if (wanted.size != layer.asked.size || wanted.framerate != layer.asked.framerate)
+            pipeline->setEncoding(wanted.size, wanted.framerate, index);
+        layer.asked = wanted;
 
-    if (const std::optional<qint64> wait = plan.nextChangeIn(now))
-        planTimer.start(static_cast<int>(*wait));
+        if (const std::optional<qint64> wait = layer.plan.nextChangeIn(now))
+            nextChange = nextChange ? std::min(*nextChange, *wait) : *wait;
+    }
+    if (nextChange)
+        planTimer.start(static_cast<int>(*nextChange));
 }
 
 // Nothing is encoded while nobody is there to receive it, as in the official client; the
-// camera stays open and its preview live. Only once the pipeline has started, though: it is
-// not promised to report a start while it encodes nothing.
+// camera stays open and its preview live. The full layer only once the pipeline has started,
+// though: it is not promised to report a start while it encodes nothing. The second layer
+// is encoded only on a connection that has one, once the video has been announced.
 void CameraSender::applySuspension()
 {
-    const bool suspend = pipelineStarted && (!videoAnnounced || receivers == 0);
-    if (suspend == encodingSuspended)
+    if (!pipeline)
         return;
-    encodingSuspended = suspend;
-    pipeline->setEncodingSuspended(suspend);
+
+    Layer &full = layers[FULL];
+    Layer &second = layers[SECOND];
+    const bool suspendFull = pipelineStarted && (!videoAnnounced || full.receivers == 0);
+    const bool suspendSecond = !hasSecondLayer || !pipelineStarted || !videoAnnounced || second.receivers == 0;
+    if (suspendFull != std::exchange(full.suspended, suspendFull))
+        pipeline->setEncodingSuspended(suspendFull, FULL);
+    if (suspendSecond != std::exchange(second.suspended, suspendSecond))
+        pipeline->setEncodingSuspended(suspendSecond, SECOND);
 }
 
 } // namespace Core

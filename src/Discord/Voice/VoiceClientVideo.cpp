@@ -56,17 +56,19 @@ void VoiceClient::cleanupVideo()
     videoSendReportTimer = nullptr;
     delete localKeyframeTimer;
     localKeyframeTimer = nullptr;
-    videoSender.reset();
+    for (LocalVideoLayer &layer : localLayers) {
+        LocalVideoLayer fresh;
+        fresh.quality = layer.quality;
+        fresh.ssrc = layer.ssrc;
+        fresh.rtxSsrc = layer.rtxSsrc;
+        layer = std::move(fresh);
+    }
     sendEstimator = SendSideEstimator();
     reportedDelayEstimateBps = 0;
     localVideo.reset();
-    videoBitrate = 0;
     videoReceiverEstimateBps = 0;
     announcedVideoStreams.clear();
-    localKeyframeAskedMs = -1;
     localKeyframeRequests = 0;
-    videoSendAwaitsKeyframe = false;
-    videoReceivers = -1;
 }
 
 void VoiceClient::setVideoFrameHandler(VideoFrameHandler handler)
@@ -344,19 +346,48 @@ void VoiceClient::takeLocalVideoStreams(const VoiceReady &ready)
         localVideoStreams.append(stream);
     }
 
-    // The official client's limits for what it captures go to the full-quality layer.
-    localVideoLayer = 0;
-    for (int i = 0; i < localVideoStreams.size(); i++) {
-        if (localVideoStreams[i].quality.valueOr(0) == 100) {
-            localVideoLayer = i;
-            break;
-        }
+    localLayers.clear();
+    QList<int> qualities;
+    for (const StreamDescription &stream : std::as_const(localVideoStreams)) {
+        const quint32 ssrc = stream.ssrc.valueOr(0);
+        if (ssrc == 0)
+            continue;
+        LocalVideoLayer layer;
+        layer.quality = stream.quality.valueOr(100);
+        layer.ssrc = ssrc;
+        layer.rtxSsrc = stream.rtxSsrc.hasValue() && stream.rtxSsrc.get() != 0 ? stream.rtxSsrc.get() : ssrc + 1;
+        qualities.append(layer.quality);
+        localLayers.push_back(std::move(layer));
     }
+    emit videoSendLayersKnown(qualities);
+}
+
+VoiceClient::LocalVideoLayer *VoiceClient::localLayer(int quality)
+{
+    const auto found = std::find_if(localLayers.begin(), localLayers.end(), [quality](const LocalVideoLayer &layer) { return layer.quality == quality; });
+    return found == localLayers.end() ? nullptr : &*found;
+}
+
+VoiceClient::LocalVideoLayer *VoiceClient::localLayerOf(quint32 ssrc)
+{
+    const auto found = std::find_if(localLayers.begin(), localLayers.end(), [ssrc](const LocalVideoLayer &layer) { return layer.ssrc == ssrc; });
+    return found == localLayers.end() ? nullptr : &*found;
+}
+
+// The official client's limits for what it captures go to the full-quality layer, and its
+// SSRC is the one an announcement names at the top.
+const VoiceClient::LocalVideoLayer *VoiceClient::fullLayer() const
+{
+    const auto full = std::find_if(localLayers.cbegin(), localLayers.cend(), [](const LocalVideoLayer &layer) { return layer.quality == FULL_QUALITY; });
+    if (full != localLayers.cend())
+        return &*full;
+    return localLayers.empty() ? nullptr : &localLayers.front();
 }
 
 quint32 VoiceClient::localVideoSsrc() const
 {
-    return localVideoLayer < localVideoStreams.size() ? localVideoStreams[localVideoLayer].ssrc.valueOr(0) : 0;
+    const LocalVideoLayer *full = fullLayer();
+    return full ? full->ssrc : 0;
 }
 
 void VoiceClient::offerVideoEncoding(const QList<VideoCodec> &encodable)
@@ -400,80 +431,101 @@ void VoiceClient::setVideoSendCodec(const QString &name)
     if (localVideo) {
         prepareVideoSender();
         // Frames of the old codec may still be on their way here.
-        videoSendAwaitsKeyframe = true;
+        for (LocalVideoLayer &layer : localLayers)
+            layer.awaitsKeyframe = true;
     }
     emit videoSendCodecChanged(codec);
 }
 
 bool VoiceClient::prepareVideoSender()
 {
-    const quint32 ssrc = localVideoSsrc();
     const auto offered = std::find_if(params.videoCodecs.cbegin(), params.videoCodecs.cend(), [this](const Codec &codec) { return videoCodecFromName(codec.name) == sendCodec && codec.encode.valueOr(false); });
-    if (ssrc == 0 || offered == params.videoCodecs.cend() || !VideoPacketizer::supports(sendCodec)) {
-        if (videoSender)
-            videoSender->setCodec(VideoCodec::Unknown, 0, std::nullopt);
+    if (localLayers.empty() || offered == params.videoCodecs.cend() || !VideoPacketizer::supports(sendCodec)) {
+        for (LocalVideoLayer &layer : localLayers) {
+            if (layer.sender)
+                layer.sender->setCodec(VideoCodec::Unknown, 0, std::nullopt);
+        }
         return false;
-    }
-
-    if (!videoSender) {
-        const StreamDescription &layer = localVideoStreams[localVideoLayer];
-        const quint32 rtxSsrc = layer.rtxSsrc.hasValue() && layer.rtxSsrc.get() != 0 ? layer.rtxSsrc.get() : ssrc + 1;
-
-        // As WebRTC starts them: the sequence numbers and the picture id anywhere in the lower
-        // half of their range, the transport-wide numbering at one.
-        QRandomGenerator *random = QRandomGenerator::global();
-        VideoSendStream::Numbering first;
-        first.sequence = static_cast<uint16_t>(random->bounded(1, 0x8000));
-        first.rtxSequence = static_cast<uint16_t>(random->bounded(1, 0x8000));
-        first.pictureId = static_cast<uint16_t>(random->bounded(0x8000));
-        first.transportSequence = 1;
-        videoSender = std::make_unique<VideoSendStream>(ssrc, rtxSsrc, first);
-        sendEstimator.restart(first.transportSequence);
-        videoSender->numberWith(&sendEstimator);
-        videoSender->setPacingFactor(params.streamContext ? VideoSendStream::SCREEN_PACING_FACTOR : VideoSendStream::CAMERA_PACING_FACTOR);
     }
 
     std::optional<uint8_t> rtxPayloadType;
     if (offered->rtxPayloadType.hasValue())
         rtxPayloadType = static_cast<uint8_t>(offered->rtxPayloadType.get());
-    videoSender->setCodec(sendCodec, static_cast<uint8_t>(offered->payloadType.get()), rtxPayloadType);
+
+    for (LocalVideoLayer &layer : localLayers) {
+        if (!layer.sender) {
+            // As WebRTC starts them: the sequence numbers and the picture id anywhere in the
+            // lower half of their range, the transport-wide numbering at one. That one is the
+            // connection's, and runs through every layer's packets.
+            QRandomGenerator *random = QRandomGenerator::global();
+            VideoSendStream::Numbering first;
+            first.sequence = static_cast<uint16_t>(random->bounded(1, 0x8000));
+            first.rtxSequence = static_cast<uint16_t>(random->bounded(1, 0x8000));
+            first.pictureId = static_cast<uint16_t>(random->bounded(0x8000));
+            first.transportSequence = 1;
+            if (std::none_of(localLayers.cbegin(), localLayers.cend(), [](const LocalVideoLayer &each) { return each.sender != nullptr; }))
+                sendEstimator.restart(first.transportSequence);
+            layer.sender = std::make_unique<VideoSendStream>(layer.ssrc, layer.rtxSsrc, first);
+            layer.sender->numberWith(&sendEstimator);
+            layer.sender->setPacingFactor(params.streamContext ? VideoSendStream::SCREEN_PACING_FACTOR : VideoSendStream::CAMERA_PACING_FACTOR);
+        }
+        layer.sender->setCodec(sendCodec, static_cast<uint8_t>(offered->payloadType.get()), rtxPayloadType);
+    }
     paceVideoByBitrate();
     registerLocalVideoWithDave();
     return true;
 }
 
-void VoiceClient::setVideoBitrate(int bitsPerSecond)
+void VoiceClient::setVideoBitrate(int bitsPerSecond, int quality)
 {
-    videoBitrate = bitsPerSecond;
+    LocalVideoLayer *layer = localLayer(quality);
+    if (!layer)
+        return;
+    layer->bitrate = bitsPerSecond;
     paceVideoByBitrate();
+}
+
+int VoiceClient::announcedMaxBitrate(const LocalVideoLayer &layer) const
+{
+    return &layer == fullLayer() || localVideo->secondLayerMaxBitrate <= 0 ? localVideo->maxBitrate : localVideo->secondLayerMaxBitrate;
 }
 
 void VoiceClient::paceVideoByBitrate()
 {
-    if (videoSender && localVideo)
-        videoSender->setBitrate(videoBitrate > 0 ? videoBitrate : localVideo->maxBitrate);
+    if (!localVideo)
+        return;
+    for (LocalVideoLayer &layer : localLayers) {
+        if (layer.sender)
+            layer.sender->setBitrate(layer.bitrate > 0 ? layer.bitrate : announcedMaxBitrate(layer));
+    }
 }
 
+// The official client registers the codec for every layer's SSRC, and its retransmissions
+// need nothing: a frame is encrypted before it is cut into packets.
 void VoiceClient::registerLocalVideoWithDave()
 {
-    if (!daveSession || !videoSender)
+    if (!daveSession)
         return;
 
-    switch (videoSender->codec()) {
-    case VideoCodec::H264:
-        daveSession->setLocalVideoCodec(videoSender->ssrc(), discord::dave::Codec::H264);
-        break;
-    case VideoCodec::H265:
-        daveSession->setLocalVideoCodec(videoSender->ssrc(), discord::dave::Codec::H265);
-        break;
-    case VideoCodec::VP8:
-        daveSession->setLocalVideoCodec(videoSender->ssrc(), discord::dave::Codec::VP8);
-        break;
-    case VideoCodec::AV1:
-        daveSession->setLocalVideoCodec(videoSender->ssrc(), discord::dave::Codec::AV1);
-        break;
-    case VideoCodec::Unknown:
-        break;
+    for (const LocalVideoLayer &layer : localLayers) {
+        if (!layer.sender)
+            continue;
+        switch (layer.sender->codec()) {
+        case VideoCodec::H264:
+            daveSession->setLocalVideoCodec(layer.ssrc, discord::dave::Codec::H264);
+            break;
+        case VideoCodec::H265:
+            daveSession->setLocalVideoCodec(layer.ssrc, discord::dave::Codec::H265);
+            break;
+        case VideoCodec::VP8:
+            daveSession->setLocalVideoCodec(layer.ssrc, discord::dave::Codec::VP8);
+            break;
+        case VideoCodec::AV1:
+            daveSession->setLocalVideoCodec(layer.ssrc, discord::dave::Codec::AV1);
+            break;
+        case VideoCodec::Unknown:
+            break;
+        }
     }
 }
 
@@ -491,7 +543,8 @@ void VoiceClient::startVideo(const LocalVideoDescription &description)
             qCWarning(LogVoice) << "Video is announced but cannot be sent as" << videoCodecName(sendCodec);
 
         videoSendReportedUs = videoClock.nsecsElapsed() / 1000;
-        videoBytesAtSendReport = videoSender ? videoSender->stats().bytesWritten : 0;
+        for (LocalVideoLayer &layer : localLayers)
+            layer.bytesAtSendReport = layer.sender ? layer.sender->stats().bytesWritten : 0;
         if (!videoSendReportTimer) {
             videoSendReportTimer = new QTimer(this);
             connect(videoSendReportTimer, &QTimer::timeout, this, &VoiceClient::onVideoSendReportTick);
@@ -500,6 +553,12 @@ void VoiceClient::startVideo(const LocalVideoDescription &description)
     }
     paceVideoByBitrate();
     announceLocalVideo(true);
+
+    // Said again for whoever began to listen after the connection was made.
+    QList<int> qualities;
+    for (const LocalVideoLayer &layer : localLayers)
+        qualities.append(layer.quality);
+    emit videoSendLayersKnown(qualities);
 }
 
 void VoiceClient::describeVideo(const LocalVideoDescription &description)
@@ -518,11 +577,14 @@ void VoiceClient::stopVideo()
     if (!localVideo)
         return;
     localVideo.reset();
-    videoBitrate = 0;
-    videoSendAwaitsKeyframe = false;
 
-    if (videoSender)
-        videoSender->clear();
+    for (LocalVideoLayer &layer : localLayers) {
+        layer.bitrate = 0;
+        layer.awaitsKeyframe = false;
+        layer.keyframeAskWaiting = false;
+        if (layer.sender)
+            layer.sender->clear();
+    }
     for (QTimer *timer : { videoPaceTimer, videoSendReportTimer, localKeyframeTimer }) {
         if (timer)
             timer->stop();
@@ -536,20 +598,25 @@ void VoiceClient::announceLocalVideo(bool on)
         return;
 
     if (on) {
-        announcedVideoStreams = localVideoStreams;
-        for (int i = 0; i < announcedVideoStreams.size(); i++)
-            announcedVideoStreams[i].active = i == localVideoLayer;
-
         StreamResolution resolution;
         const bool sourceSized = localVideo->maxWidth == 0 && localVideo->maxHeight == 0;
         resolution.type = sourceSized ? QStringLiteral("source") : QStringLiteral("fixed");
         resolution.width = localVideo->maxWidth;
         resolution.height = localVideo->maxHeight;
 
-        StreamDescription &layer = announcedVideoStreams[localVideoLayer];
-        layer.maxBitrate = localVideo->maxBitrate;
-        layer.maxFramerate = localVideo->maxFramerate;
-        layer.maxResolution = resolution;
+        // The official client says of every layer that it is active while it sends video at
+        // all, and announces the same size and frame rate for each: which of them is being
+        // encoded is between the server and its native module, and goes by who receives it.
+        announcedVideoStreams = localVideoStreams;
+        for (StreamDescription &stream : announcedVideoStreams) {
+            const LocalVideoLayer *layer = localLayerOf(stream.ssrc.valueOr(0));
+            stream.active = layer != nullptr;
+            if (!layer)
+                continue;
+            stream.maxBitrate = announcedMaxBitrate(*layer);
+            stream.maxFramerate = localVideo->maxFramerate;
+            stream.maxResolution = resolution;
+        }
     } else {
         for (StreamDescription &stream : announcedVideoStreams)
             stream.active = false;
@@ -566,44 +633,45 @@ void VoiceClient::announceLocalVideo(bool on)
     gateway->sendVideo(state);
 }
 
-void VoiceClient::sendVideoFrame(const EncodedVideoFrame &frame)
+void VoiceClient::sendVideoFrame(const EncodedVideoFrame &frame, int quality)
 {
-    if (currentState != State::Connected || !encryption || !udpTransport || !localVideo || !videoSender)
+    LocalVideoLayer *layer = localLayer(quality);
+    if (currentState != State::Connected || !encryption || !udpTransport || !localVideo || !layer || !layer->sender)
         return;
 
     if (daveSession && !daveSession->isDaveEnabled() && !daveSession->isDowngraded()) {
         // Keys are still being agreed, and no picture goes out without them. The official
         // client fills the gap with placeholder frames; sending nothing serves as well.
-        videoSendAwaitsKeyframe = true;
+        layer->awaitsKeyframe = true;
         return;
     }
-    if (videoSendAwaitsKeyframe && !frame.keyframe)
+    if (layer->awaitsKeyframe && !frame.keyframe)
         return;
 
     const qint64 now = videoClock.nsecsElapsed() / 1000;
     bool queued = false;
     if (isDaveEnabled()) {
         std::vector<uint8_t> encrypted;
-        if (!daveEncryptVideo(frame.data, encrypted)) {
-            videoSendAwaitsKeyframe = true;
-            askForLocalKeyframe();
+        if (!daveEncryptVideo(frame.data, layer->ssrc, encrypted)) {
+            layer->awaitsKeyframe = true;
+            askLayerForKeyframe(*layer);
             return;
         }
-        queued = videoSender->queueFrame(encrypted, frame.rtpTimestamp, frame.keyframe, now);
+        queued = layer->sender->queueFrame(encrypted, frame.rtpTimestamp, frame.keyframe, now);
     } else {
-        queued = videoSender->queueFrame(frame.data, frame.rtpTimestamp, frame.keyframe, now);
+        queued = layer->sender->queueFrame(frame.data, frame.rtpTimestamp, frame.keyframe, now);
     }
     if (!queued)
         return;
 
-    videoSendAwaitsKeyframe = false;
+    layer->awaitsKeyframe = false;
     startVideoPacing();
 }
 
 // The whole frame is encrypted before it is cut into packets, and comes out in another shape:
 // the encryptor appends its trailer, widens the short start codes of H264 and H265, and of AV1
 // drops the OBUs that are not sent and the size field of the last one.
-bool VoiceClient::daveEncryptVideo(std::span<const uint8_t> frame, std::vector<uint8_t> &encrypted)
+bool VoiceClient::daveEncryptVideo(std::span<const uint8_t> frame, quint32 ssrc, std::vector<uint8_t> &encrypted)
 {
     auto *encryptor = daveSession->encryptor();
     // The encryptor writes its trailer without looking at how much room it was given, and the
@@ -613,7 +681,7 @@ bool VoiceClient::daveEncryptVideo(std::span<const uint8_t> frame, std::vector<u
     encrypted.resize(encryptor->GetMaxCiphertextByteSize(discord::dave::MediaType::Video, frame.size()) + frame.size() * 5);
 
     size_t bytesWritten = 0;
-    const auto result = encryptor->Encrypt(discord::dave::MediaType::Video, videoSender->ssrc(), discord::dave::ArrayView<const uint8_t>(frame.data(), frame.size()), discord::dave::ArrayView<uint8_t>(encrypted.data(), encrypted.size()), &bytesWritten);
+    const auto result = encryptor->Encrypt(discord::dave::MediaType::Video, ssrc, discord::dave::ArrayView<const uint8_t>(frame.data(), frame.size()), discord::dave::ArrayView<uint8_t>(encrypted.data(), encrypted.size()), &bytesWritten);
     if (result != discord::dave::IEncryptor::Success) {
         qCWarning(LogDave) << "DAVE video encrypt failed: result =" << static_cast<int>(result) << "frameSize =" << frame.size();
         return false;
@@ -637,16 +705,21 @@ void VoiceClient::startVideoPacing()
 // the far end as loss, so each tick lets only a share of them go.
 void VoiceClient::onVideoPaceTick()
 {
-    if (currentState != State::Connected || !encryption || !udpTransport || !videoSender || !videoSender->hasWaiting()) {
+    const bool waiting = std::any_of(localLayers.cbegin(), localLayers.cend(), [](const LocalVideoLayer &layer) { return layer.sender && layer.sender->hasWaiting(); });
+    if (currentState != State::Connected || !encryption || !udpTransport || !waiting) {
         videoPaceTimer->stop();
         return;
     }
 
-    videoSender->startInterval(videoClock.nsecsElapsed() / 1000);
     PacketPool::Handle packet = udpTransport->acquirePacket();
-    while (videoSender->writeNext(videoClock.nsecsElapsed() / 1000, *packet)) {
-        if (encryption->seal(*packet, VideoSendStream::CLEAR_SIZE))
-            udpTransport->send(*packet);
+    for (LocalVideoLayer &layer : localLayers) {
+        if (!layer.sender || !layer.sender->hasWaiting())
+            continue;
+        layer.sender->startInterval(videoClock.nsecsElapsed() / 1000);
+        while (layer.sender->writeNext(videoClock.nsecsElapsed() / 1000, *packet)) {
+            if (encryption->seal(*packet, VideoSendStream::CLEAR_SIZE))
+                udpTransport->send(*packet);
+        }
     }
 }
 
@@ -655,38 +728,44 @@ void VoiceClient::onVideoSendReportTick()
     if (!localVideo)
         return;
     const qint64 now = videoClock.nsecsElapsed() / 1000;
+    const LocalVideoLayer *full = fullLayer();
 
     VideoSendStats stats;
     stats.codec = videoCodecName(sendCodec);
     stats.keyframeRequests = localKeyframeRequests;
-    stats.receivers = videoReceivers;
+    stats.receivers = full ? full->receivers : -1;
     stats.receiverEstimateBps = videoReceiverEstimateBps;
     stats.delayEstimateBps = static_cast<quint64>(sendEstimator.estimate());
     stats.acknowledgedBps = static_cast<quint64>(sendEstimator.acknowledged());
     reportedDelayEstimateBps = stats.delayEstimateBps;
 
-    if (videoSender) {
-        if (videoSender->canReport() && currentState == State::Connected && encryption && udpTransport) {
+    // What every layer sent, taken together.
+    quint64 bytesSince = 0;
+    for (LocalVideoLayer &layer : localLayers) {
+        if (!layer.sender)
+            continue;
+        if (layer.sender->canReport() && currentState == State::Connected && encryption && udpTransport) {
             PacketPool::Handle packet = udpTransport->acquirePacket();
             packet->resize(packet->tailroom() - VoiceEncryption::TRAILER_SIZE);
-            const int size = videoSender->writeSenderReport(packet->bytes(), now, ntpTimeNow());
+            const int size = layer.sender->writeSenderReport(packet->bytes(), now, ntpTimeNow());
             if (size > 0 && packet->resize(size) && encryption->seal(*packet, RTCP_CLEAR_SIZE))
                 udpTransport->send(*packet);
         }
 
-        const VideoSendStream::Stats &sent = videoSender->stats();
-        stats.packets = sent.packets;
-        stats.bytes = sent.bytes;
-        stats.frames = sent.frames;
-        stats.keyframes = sent.keyframes;
-        stats.retransmitted = sent.retransmitted;
-        stats.nacksReceived = sent.nacksReceived;
-        stats.lossFraction = sent.lossFraction;
-        stats.roundTripMs = sent.roundTripMs;
-        if (now > videoSendReportedUs)
-            stats.bitrateBps = (sent.bytesWritten - videoBytesAtSendReport) * 8 * 1000000 / static_cast<quint64>(now - videoSendReportedUs);
-        videoBytesAtSendReport = sent.bytesWritten;
+        const VideoSendStream::Stats &sent = layer.sender->stats();
+        stats.packets += sent.packets;
+        stats.bytes += sent.bytes;
+        stats.frames += sent.frames;
+        stats.keyframes += sent.keyframes;
+        stats.retransmitted += sent.retransmitted;
+        stats.nacksReceived += sent.nacksReceived;
+        stats.lossFraction = std::max(stats.lossFraction, sent.lossFraction);
+        stats.roundTripMs = std::max(stats.roundTripMs, sent.roundTripMs);
+        bytesSince += sent.bytesWritten - layer.bytesAtSendReport;
+        layer.bytesAtSendReport = sent.bytesWritten;
     }
+    if (now > videoSendReportedUs)
+        stats.bitrateBps = bytesSince * 8 * 1000000 / static_cast<quint64>(now - videoSendReportedUs);
     videoSendReportedUs = now;
 
     emit videoSendStatsUpdated(stats);
@@ -694,13 +773,12 @@ void VoiceClient::onVideoSendReportTick()
 
 void VoiceClient::receiveVideoFeedback(const ReceivedRtcp &received)
 {
-    const quint32 ssrc = localVideoSsrc();
-    if (ssrc == 0)
+    if (localLayers.empty())
         return;
 
     for (const ReceivedRtcp::ReceiverCount &count : received.receiverCounts) {
-        if (count.ssrc == ssrc)
-            noteVideoReceivers(count.receivers);
+        if (LocalVideoLayer *layer = localLayerOf(count.ssrc))
+            noteVideoReceivers(*layer, count.receivers);
     }
 
     if (received.hasReceiverEstimate) {
@@ -709,23 +787,25 @@ void VoiceClient::receiveVideoFeedback(const ReceivedRtcp &received)
         videoReceiverEstimateBps = received.receiverEstimateBitsPerSecond;
     }
 
-    if (!localVideo || !videoSender)
+    if (!localVideo)
         return;
 
     const qint64 now = videoClock.nsecsElapsed() / 1000;
     for (const ReceivedRtcp::Nack &nack : received.nacks) {
-        if (nack.mediaSsrc == ssrc)
-            videoSender->retransmit(nack.sequences, now);
+        if (LocalVideoLayer *layer = localLayerOf(nack.mediaSsrc); layer && layer->sender)
+            layer->sender->retransmit(nack.sequences, now);
     }
-    if (videoSender->hasWaiting())
+    if (std::any_of(localLayers.cbegin(), localLayers.cend(), [](const LocalVideoLayer &layer) { return layer.sender && layer.sender->hasWaiting(); }))
         startVideoPacing();
 
     for (const ReceptionReport &report : received.receptionReports) {
-        if (report.ssrc == ssrc)
-            videoSender->onReceptionReport(report, now);
+        LocalVideoLayer *layer = localLayerOf(report.ssrc);
+        if (!layer || !layer->sender)
+            continue;
+        layer->sender->onReceptionReport(report, now);
+        if (layer->sender->stats().roundTripMs >= 0)
+            sendEstimator.setRoundTrip(qint64(layer->sender->stats().roundTripMs) * 1000);
     }
-    if (videoSender->stats().roundTripMs >= 0)
-        sendEstimator.setRoundTrip(qint64(videoSender->stats().roundTripMs) * 1000);
 
     for (const ReceivedRtcp::TransportReport &report : received.transportReports) {
         if (sendEstimator.reportsTaken() == 0)
@@ -741,10 +821,12 @@ void VoiceClient::receiveVideoFeedback(const ReceivedRtcp &received)
         videoSendReportTimer->start(VIDEO_SEND_REPORT_INTERVAL_MS);
     }
 
-    const auto keyframeRequests = std::count(received.keyframeRequests.cbegin(), received.keyframeRequests.cend(), ssrc);
-    if (keyframeRequests > 0) {
-        localKeyframeRequests += static_cast<quint64>(keyframeRequests);
-        askForLocalKeyframe();
+    for (const uint32_t ssrc : received.keyframeRequests) {
+        LocalVideoLayer *layer = localLayerOf(ssrc);
+        if (!layer)
+            continue;
+        localKeyframeRequests++;
+        askLayerForKeyframe(*layer);
     }
 }
 
@@ -769,41 +851,65 @@ void VoiceClient::receiveVideoAfresh(quint32 ssrc)
     }
 }
 
-void VoiceClient::noteVideoReceivers(int receivers)
+void VoiceClient::noteVideoReceivers(LocalVideoLayer &layer, int receivers)
 {
-    if (receivers == videoReceivers)
+    if (receivers == layer.receivers)
         return;
 
     // Whoever has only now begun to receive has seen none of what was sent so far.
-    const bool firstReceiver = videoReceivers <= 0 && receivers > 0;
-    videoReceivers = receivers;
-    emit videoReceiversChanged(receivers);
+    const bool firstReceiver = layer.receivers <= 0 && receivers > 0;
+    layer.receivers = receivers;
+    emit videoReceiversChanged(receivers, layer.quality);
     if (firstReceiver)
-        askForLocalKeyframe();
+        askLayerForKeyframe(layer);
 }
 
 void VoiceClient::askForLocalKeyframe()
+{
+    for (LocalVideoLayer &layer : localLayers)
+        askLayerForKeyframe(layer);
+}
+
+void VoiceClient::askForAwaitedLocalKeyframes()
+{
+    for (LocalVideoLayer &layer : localLayers) {
+        if (layer.awaitsKeyframe)
+            askLayerForKeyframe(layer);
+    }
+}
+
+void VoiceClient::askForWaitingLocalKeyframes()
+{
+    for (LocalVideoLayer &layer : localLayers) {
+        if (layer.keyframeAskWaiting)
+            askLayerForKeyframe(layer);
+    }
+}
+
+void VoiceClient::askLayerForKeyframe(LocalVideoLayer &layer)
 {
     if (!localVideo)
         return;
 
     const qint64 now = videoClock.elapsed();
-    const qint64 wait = localKeyframeAskedMs < 0 ? 0 : localKeyframeAskedMs + LOCAL_KEYFRAME_INTERVAL_MS - now;
+    const qint64 wait = layer.keyframeAskedMs < 0 ? 0 : layer.keyframeAskedMs + LOCAL_KEYFRAME_INTERVAL_MS - now;
     if (wait > 0) {
         // Too soon after the last one: this request is passed on when the interval is over,
         // together with any others that come until then.
+        layer.keyframeAskWaiting = true;
         if (!localKeyframeTimer) {
             localKeyframeTimer = new QTimer(this);
             localKeyframeTimer->setSingleShot(true);
-            connect(localKeyframeTimer, &QTimer::timeout, this, &VoiceClient::askForLocalKeyframe);
+            connect(localKeyframeTimer, &QTimer::timeout, this, &VoiceClient::askForWaitingLocalKeyframes);
         }
         if (!localKeyframeTimer->isActive())
             localKeyframeTimer->start(static_cast<int>(wait));
         return;
     }
 
-    localKeyframeAskedMs = now;
-    emit videoKeyframeRequested();
+    layer.keyframeAskWaiting = false;
+    layer.keyframeAskedMs = now;
+    emit videoKeyframeRequested(layer.quality);
 }
 
 void VoiceClient::onSessionUpdated(const SessionUpdate &update)
@@ -812,20 +918,21 @@ void VoiceClient::onSessionUpdated(const SessionUpdate &update)
         setVideoSendCodec(update.videoCodec.get());
 }
 
+// What is said of a layer's own SSRC counts before what is said of any, and when neither
+// says anything all of it is wanted: a want of nothing is read as a want of everything, as
+// the official client reads it.
 void VoiceClient::onMediaSinkWants(const MediaSinkWants &wants)
 {
-    const quint32 ssrc = localVideoSsrc();
+    for (const LocalVideoLayer &layer : localLayers) {
+        int want = 100;
+        if (const auto own = wants.bySsrc.constFind(layer.ssrc); own != wants.bySsrc.constEnd() && own.value() > 0)
+            want = own.value();
+        else if (wants.any && *wants.any > 0)
+            want = *wants.any;
 
-    // What is said of this client's own stream counts before what is said of any, and when
-    // neither says anything all of it is wanted.
-    int want = 100;
-    if (const auto own = wants.bySsrc.constFind(ssrc); own != wants.bySsrc.constEnd() && own.value() > 0)
-        want = own.value();
-    else if (wants.any && *wants.any > 0)
-        want = *wants.any;
-
-    const auto pixelCount = wants.pixelCounts.constFind(ssrc);
-    emit videoWantsReceived(want, pixelCount != wants.pixelCounts.constEnd() ? pixelCount.value() : 0);
+        const auto pixelCount = wants.pixelCounts.constFind(layer.ssrc);
+        emit videoWantsReceived(want, pixelCount != wants.pixelCounts.constEnd() ? pixelCount.value() : 0, layer.quality);
+    }
 }
 
 void VoiceClient::sendVideoWants()

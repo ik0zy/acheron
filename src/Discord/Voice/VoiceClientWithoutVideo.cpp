@@ -16,12 +16,15 @@ void VoiceClient::requestVideoKeyframeFromEveryone() {}
 void VoiceClient::withdrawVideoCodec(VideoCodec) {}
 
 void VoiceClient::offerVideoEncoding(const QList<VideoCodec> &) {}
-VideoCodec VoiceClient::videoSendCodec() const { return VideoCodec::Unknown; }
+VideoCodec VoiceClient::videoSendCodec() const
+{
+    return VideoCodec::Unknown;
+}
 void VoiceClient::startVideo(const LocalVideoDescription &) {}
 void VoiceClient::describeVideo(const LocalVideoDescription &) {}
-void VoiceClient::setVideoBitrate(int) {}
+void VoiceClient::setVideoBitrate(int, int) {}
 void VoiceClient::stopVideo() {}
-void VoiceClient::sendVideoFrame(const EncodedVideoFrame &) {}
+void VoiceClient::sendVideoFrame(const EncodedVideoFrame &, int) {}
 
 void VoiceClient::onSessionUpdated(const SessionUpdate &) {}
 void VoiceClient::onMediaSinkWants(const MediaSinkWants &) {}
@@ -40,6 +43,7 @@ void VoiceClient::startVideoTimer() {}
 void VoiceClient::sendVideoWants() {}
 void VoiceClient::registerLocalVideoWithDave() {}
 void VoiceClient::askForLocalKeyframe() {}
+void VoiceClient::askForAwaitedLocalKeyframes() {}
 
 } // namespace Voice
 } // namespace Discord

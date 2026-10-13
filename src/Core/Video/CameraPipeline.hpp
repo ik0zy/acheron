@@ -53,29 +53,35 @@ public:
     explicit CameraPipeline(QObject *parent = nullptr);
     ~CameraPipeline() override;
 
+    // The camera's pictures can be encoded more than once, each layer at a size, frame rate
+    // and bitrate of its own with an encoder of its own. Layer 0 is the one the settings
+    // describe. The others encode nothing until they are taken out of suspension, and start
+    // as layer 0 does unless they are told otherwise first.
+    static constexpr int LAYERS = 2;
+
     // All of these may be called from any thread and return at once.
     void start(const CameraSettings &settings);
     void stop();
-    // The first frame encoded after this is a key frame.
-    void requestKeyframe();
+    // The first frame the layer encodes after this is a key frame.
+    void requestKeyframe(int layer = 0);
     // Encoders that cannot follow a new rate while running are reopened, which costs a key
     // frame, so callers should move this in steps and not continuously.
-    void setBitrate(int bitrate);
+    void setBitrate(int bitrate, int layer = 0);
     // A new size or frame rate to encode at, the camera staying open. Starts with a key frame.
-    void setEncoding(const QSize &encodeSize, int framerate);
-    // While nobody is watching: the camera stays open, so the preview stays live, and nothing
-    // is encoded. Sending again starts with a key frame.
-    void setEncodingSuspended(bool suspended);
+    void setEncoding(const QSize &encodeSize, int framerate, int layer = 0);
+    // While nobody is watching: the camera stays open, so the preview stays live, and the
+    // layer encodes nothing. Sending again starts with a key frame.
+    void setEncodingSuspended(bool suspended, int layer = 0);
 
 signals:
-    void started(const QSize &encodedSize, int framerate);
-    void frameEncoded(const Acheron::Core::Video::EncodedFramePointer &frame);
+    void started(const QSize &encodedSize, int framerate, int layer);
+    void frameEncoded(const Acheron::Core::Video::EncodedFramePointer &frame, int layer);
     // The camera's own picture for its owner to look at: no larger than 640x360, about fifteen
     // times a second, not mirrored.
     void previewReady(const QImage &preview);
     // Nothing more will come: the camera is gone or in use elsewhere, or no encoder opened.
     void failed(const QString &reason);
-    void statsUpdated(const Acheron::Core::Video::BroadcastStats &stats);
+    void statsUpdated(const Acheron::Core::Video::BroadcastStats &stats, int layer);
 
 private:
     class Worker;

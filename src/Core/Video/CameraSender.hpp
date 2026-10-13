@@ -6,6 +6,7 @@
 #include <QSize>
 #include <QTimer>
 
+#include <array>
 #include <functional>
 #include <memory>
 
@@ -64,6 +65,14 @@ public:
         int servedWant = 100;
         bool mutedFramerate = false;
         bool encodingSuspended = false;
+
+        // The second layer, where the connection has one: the same again for it.
+        bool hasSecondLayer = false;
+        Video::BroadcastStats secondEncoder;
+        int secondTargetBitrate = 0;
+        int secondReceivers = -1;
+        int secondServedWant = 100;
+        bool secondEncodingSuspended = true;
     };
 
     // Whether the account may turn its camera on where it is in voice now.
@@ -121,15 +130,16 @@ private:
     void onRtcStateChanged(Discord::Voice::VoiceClient::State state);
     void onSendCodecChanged(Discord::Voice::VideoCodec codec);
     void onSendStats(const Discord::Voice::VideoSendStats &stats);
-    void onKeyframeRequested();
-    void onReceiversChanged(int count);
-    void onWantsReceived(int want);
+    void onSendLayersKnown(const QList<int> &qualities);
+    void onKeyframeRequested(int quality);
+    void onReceiversChanged(int count, int quality);
+    void onWantsReceived(int want, int quality);
 
     void onEncodersKnown(const QList<Discord::Voice::VideoCodec> &codecs);
     void onPipelineStarted(const QSize &encodedSize);
     void onPreviewReady(const QImage &preview);
     void onPipelineFailed(const QString &reason);
-    void onPipelineStats(const Video::BroadcastStats &stats);
+    void onPipelineStats(const Video::BroadcastStats &stats, int layer);
 
     void setState(State state);
     void end(bool tellGateway, State endState);
@@ -165,23 +175,37 @@ private:
     bool rtcConnected = false;
     Discord::Voice::VideoCodec sendCodec = Discord::Voice::VideoCodec::Unknown;
     bool videoAnnounced = false;
-    int receivers = -1;
+
+    // One encoding of the camera, by its layer in the pipeline: the full picture, and beside
+    // it the second layer, which is sent only where the connection has one.
+    struct Layer
+    {
+        int quality = Video::CAMERA_FULL_QUALITY;
+        Video::CameraSendPlan plan;
+        Video::CameraEncoding asked;
+        // As the server counts them; negative until it has said.
+        int receivers = -1;
+        bool suspended = false;
+        Video::BroadcastStats encoderStats;
+    };
+    static constexpr int FULL = 0;
+    static constexpr int SECOND = 1;
+    [[nodiscard]] int layerOf(int quality) const { return quality == layers[SECOND].quality ? SECOND : FULL; }
+
+    std::array<Layer, 2> layers;
+    bool hasSecondLayer = false;
 
     std::unique_ptr<Video::CameraPipeline> pipeline;
     Discord::Voice::VideoCodec pipelineCodec = Discord::Voice::VideoCodec::Unknown;
     QMetaObject::Connection framesToRtc;
     bool pipelineStarted = false;
-    bool encodingSuspended = false;
 
     bool speaking = false;
-    Video::CameraSendPlan plan;
-    Video::CameraEncoding asked;
     QElapsedTimer clock;
     QTimer planTimer;
     QTimer codecTimeout;
 
     QImage latestPreview;
-    Video::BroadcastStats encoderStats;
     Discord::Voice::VideoSendStats networkStats;
 };
 

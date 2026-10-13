@@ -705,6 +705,10 @@ QStringList CallView::ownCameraStats() const
         lines << tr("Muted frame rate");
     if (stats.encodingSuspended)
         lines << tr("Encoding suspended: nobody is watching");
+    if (stats.hasSecondLayer && stats.secondEncodingSuspended)
+        lines << tr("Second layer: not encoded, nobody is watching it");
+    else if (stats.hasSecondLayer)
+        lines << tr("Second layer: %1x%2, %3 kbps asked of the encoder, wanted %4%, viewers %5").arg(stats.secondEncoder.encodedSize.width()).arg(stats.secondEncoder.encodedSize.height()).arg(stats.secondTargetBitrate / 1000).arg(stats.secondServedWant).arg(stats.secondReceivers < 0 ? tr("not reported yet") : QString::number(stats.secondReceivers));
     return lines;
 }
 

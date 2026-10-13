@@ -6,6 +6,7 @@
 #ifdef ACHERON_HAVE_STREAM_VIEW
 #include "Core/Media/VideoDecoder.hpp"
 #include "Core/Video/CallVideo.hpp"
+#include "Core/Video/SendQuality.hpp"
 #endif
 
 #ifdef Q_OS_WIN
@@ -557,7 +558,7 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
     // Declared whether or not the camera is ever turned on: without it the server does not
     // forward other people's video.
     params.video = true;
-    params.streams = Discord::Voice::cameraStreams();
+    params.streams = Discord::Voice::cameraStreams(Video::cameraSecondLayerEnabled());
     params.videoCodecs = Media::offeredVideoCodecs(encodableVideoCodecs);
 #endif
 
