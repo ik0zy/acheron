@@ -368,6 +368,8 @@ private slots:
     void statisticsAreLeftOffASmallTile();
     void whatShowingAFrameCosts_data();
     void whatShowingAFrameCosts();
+    void whatShowingCamerasCosts_data();
+    void whatShowingCamerasCosts();
     // Last: a card found not to hand its pictures over is not asked again while the program runs.
     void pictureFromAnotherCardIsReadBack();
 };
@@ -1121,6 +1123,111 @@ void TestVideoSurface::whatShowingAFrameCosts()
     av_buffer_unref(&pool);
 #else
     QSKIP("VAAPI only");
+#endif
+}
+
+void TestVideoSurface::whatShowingCamerasCosts_data()
+{
+    QTest::addColumn<QSize>("size");
+    QTest::newRow("416x234") << QSize(416, 234);
+    QTest::newRow("640x360") << QSize(640, 360);
+    QTest::newRow("896x504") << QSize(896, 504);
+    QTest::newRow("1280x720") << QSize(1280, 720);
+}
+
+// A measurement: nine tiles each given thirty pictures a second, as a call full of cameras is,
+// once as a hardware decoder leaves them on the card and once as a software decoder leaves
+// them in memory. What decoding them costs is not in it.
+void TestVideoSurface::whatShowingCamerasCosts()
+{
+#ifdef HAVE_D3D11VA
+    QFETCH(QSize, size);
+    constexpr int TILES = 9;
+    constexpr int PICTURES = 4;
+    constexpr int SETTLING = 15;
+    constexpr int TICKS = 90;
+    constexpr int TICK_MS = 33;
+
+    QWidget window;
+    window.resize(3 * 320, 3 * 180);
+    std::vector<VideoSurface *> surfaces;
+    for (int i = 0; i < TILES; i++) {
+        auto *surface = new VideoSurface(&window);
+        surface->setGeometry((i % 3) * 320, (i / 3) * 180, 320, 180);
+        surface->setCaption(QStringLiteral("Somebody"));
+        surfaces.push_back(surface);
+    }
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    for (VideoSurface *surface : surfaces)
+        drawnOnce(*surface);
+    if (!surfaces.front()->sink()->acceptsHardwareFrames(CARD_FORMAT))
+        QSKIP("This surface cannot draw the card's picture where it is");
+
+    // One decoder's worth of textures, as a camera's decoder has.
+    AVBufferRef *device = nullptr;
+    if (av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) < 0)
+        QSKIP("No video device whose pictures this surface can draw");
+    AVBufferRef *pool = av_hwframe_ctx_alloc(device);
+    av_buffer_unref(&device);
+    auto *frames = reinterpret_cast<AVHWFramesContext *>(pool->data);
+    frames->format = AV_PIX_FMT_D3D11;
+    frames->sw_format = AV_PIX_FMT_NV12;
+    frames->width = size.width();
+    frames->height = size.height();
+    frames->initial_pool_size = PICTURES;
+    static_cast<AVD3D11VAFramesContext *>(frames->hwctx)->BindFlags = D3D11_BIND_DECODER;
+    QVERIFY(av_hwframe_ctx_init(pool) >= 0);
+
+    std::array<AVFrame *, PICTURES> onCard;
+    std::array<AVFrame *, PICTURES> inMemory;
+    for (int i = 0; i < PICTURES; i++) {
+        const auto luma = static_cast<uint8_t>(60 + 40 * i);
+        AVFrame *nv12 = solidNv12Frame(size.width(), size.height(), luma, 128, 128);
+        onCard[static_cast<size_t>(i)] = av_frame_alloc();
+        QVERIFY(av_hwframe_get_buffer(pool, onCard[static_cast<size_t>(i)], 0) >= 0 && av_hwframe_transfer_data(onCard[static_cast<size_t>(i)], nv12, 0) >= 0);
+        av_frame_free(&nv12);
+        inMemory[static_cast<size_t>(i)] = solidFrame(size.width(), size.height(), luma, 128, 128);
+    }
+
+    const auto cyclesNow = [] {
+        ULONG64 cycles = 0;
+        QueryProcessCycleTime(GetCurrentProcess(), &cycles);
+        return cycles;
+    };
+    // What this processor does of cycles in a millisecond of one thread's work.
+    ULONG64 spinBefore = 0;
+    ULONG64 spinAfter = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &spinBefore);
+    QElapsedTimer spinning;
+    spinning.start();
+    while (spinning.nsecsElapsed() < 20'000'000) {}
+    QueryThreadCycleTime(GetCurrentThread(), &spinAfter);
+    const double cyclesPerMs = static_cast<double>(spinAfter - spinBefore) / 20.0;
+
+    for (const bool fromCard : { false, true }) {
+        ULONG64 before = 0;
+        for (int tick = 0; tick < SETTLING + TICKS; tick++) {
+            if (tick == SETTLING)
+                before = cyclesNow();
+            const AVFrame *picture = (fromCard ? onCard : inMemory)[static_cast<size_t>(tick) % PICTURES];
+            for (VideoSurface *surface : surfaces)
+                surface->sink()->present(picture);
+            QTest::qWait(TICK_MS);
+        }
+        const double cpuMs = static_cast<double>(cyclesNow() - before) / cyclesPerMs / (TICKS * TILES);
+        for (VideoSurface *surface : surfaces)
+            QCOMPARE(surface->drawsFromCard(), fromCard);
+        qInfo().noquote() << QStringLiteral("%1x%2 %3: %4 ms of processor time a picture a tile, which is %5% of a processor for nine cameras").arg(size.width()).arg(size.height()).arg(fromCard ? QStringLiteral("left on the card") : QStringLiteral("in memory and uploaded")).arg(cpuMs, 0, 'f', 3).arg(cpuMs * TILES * 30 / 10, 0, 'f', 1);
+    }
+
+    for (AVFrame *picture : onCard)
+        av_frame_free(&picture);
+    for (AVFrame *picture : inMemory)
+        av_frame_free(&picture);
+    av_buffer_unref(&pool);
+#else
+    QSKIP("Direct3D 11 only");
 #endif
 }
 

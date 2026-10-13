@@ -14,6 +14,14 @@ namespace {
 const char *const DISABLED_USERS_KEY = "video/disabled_users";
 const char *const MAX_DECODERS_KEY = "video/max_decoders";
 
+// Handing a picture over on the graphics card takes the same time whatever its size, and for a
+// small one that is more than decoding it in memory and sending it up: with nine tiles on a
+// Radeon RX 7800 XT, about 1.0 ms of processor time a picture against 0.6 ms for one of
+// 640x360, before either is decoded. So a picture asked for at no more than this, which is
+// 640x360 on the ladder and what everyone is asked for from four cameras up, is decoded in
+// memory. A decoder stays as it was made when what is asked of its sender changes later.
+constexpr int MOST_ASKED_OF_A_PICTURE_DECODED_IN_MEMORY = 70;
+
 } // namespace
 
 CallVideo::CallVideo(QObject *parent)
@@ -244,8 +252,10 @@ void CallVideo::replan()
             const quint64 key = static_cast<quint64>(it.key());
             if (decoders.count(key))
                 continue;
+            const int asked = plan.wants.bySsrc.value(it.value(), plan.wants.any.value_or(Discord::Voice::sinkWantLevel(1)));
+            const bool onCard = Media::hardwareDecodingEnabled() && asked > MOST_ASKED_OF_A_PICTURE_DECODED_IN_MEMORY;
             // A camera is at most 720p, which one thread decodes with room to spare.
-            auto decoder = std::make_shared<Media::VideoDecoder>(Media::hardwareDecodingEnabled(), 1);
+            auto decoder = std::make_shared<Media::VideoDecoder>(onCard, 1);
             decoder->setSink(tiles.value(it.key()).sink);
             decoder->setKeyframeRequester([target = client, userId = it.key()] { QMetaObject::invokeMethod(target, [target, userId] { target->requestVideoKeyframeFrom(userId); }); });
             decoder->setCodecFailureHandler([target = client](Discord::Voice::VideoCodec codec) { QMetaObject::invokeMethod(target, [target, codec] { target->withdrawVideoCodec(codec); }); });
