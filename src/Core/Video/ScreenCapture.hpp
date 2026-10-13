@@ -150,10 +150,14 @@ public:
     void configure(const Request &request);
     // Blocks until the next picture is due.
     Status read(AVFrame *into);
+    // While no picture is wanted the source is still read, as often as before, for whether it
+    // is still there. What a picture costs to scale and convert is left out, and each read
+    // says there is nothing new.
+    void setPicturesWanted(bool wanted) { picturesWanted = wanted; }
     [[nodiscard]] QString failure() const { return failureText; }
 
-    // Graphics capture has a picture only when the source shows something new. Its last
-    // picture may be kept, and is what a viewer is to be sent again while nothing comes.
+    // Whether a picture comes only when the source shows something new. The last one may
+    // then be kept, and is what a viewer is to be sent again while nothing comes.
     [[nodiscard]] bool deliversOnlyChanges() const;
     // What the pictures have come from, for the statistics. For a window captured by
     // duplication it counts those cut out of the screen and those the window drew itself.
@@ -177,6 +181,7 @@ private:
 
     struct Backends;
     struct CutOut;
+    enum class Drawing;
 
     Status watchWindow();
     Status readDuplication(AVFrame *into);
@@ -184,7 +189,8 @@ private:
     Status readWindowByDuplication(AVFrame *into);
     bool cutOutOfScreen(const QRect &client, CutOut *cut);
     bool duplicateScreenOf(const QRect &client);
-    bool drawnByItself(const QRect &client);
+    Drawing drawnByItself(const QRect &client);
+    Status deliverFromCard(AVFrame *captured, AVFrame *into);
     [[nodiscard]] bool scalesOnCard() const;
     bool scaleOnCard(const AVFrame *from, const QRect &area, const QSize &size, const QRect &placed, AVFrame *into);
     int buildDuplication();
@@ -199,9 +205,7 @@ private:
     Path path = Path::Duplication;
     AVFilterGraph *graph = nullptr;
     AVFilterContext *sink = nullptr;
-    // The screen's pictures are left on the card by the graph and scaled there after it.
-    bool graphScalesOnCard = false;
-    bool graphIsBt601 = false;
+    bool picturesWanted = true;
     bool everDelivered = false;
     // The card stopped scaling in the middle of this capture, which goes on in software.
     bool cardScalingFailed = false;

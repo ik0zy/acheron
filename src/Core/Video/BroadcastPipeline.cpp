@@ -76,7 +76,9 @@ public:
         const QSize size = fits ? full : full.scaled(PREVIEW_BOUND, Qt::KeepAspectRatio).expandedTo(QSize(1, 1));
         if (image.size() != size)
             image = Media::RgbScaler::allocate(size, QImage::Format_RGB32);
-        return scaler.scale(picture, image) ? image : QImage();
+        const bool scaled = scaler.scale(picture, image);
+        av_frame_unref(downloaded.get());
+        return scaled ? image : QImage();
     }
 
 private:
@@ -205,6 +207,8 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, Captu
     // The last picture of a source that has one only when it shows something new.
     const FramePointer kept(av_frame_alloc());
     PreviewMaker previews;
+    QImage preview;
+    bool previewIsOfThisPicture = false;
     std::vector<EncodedVideoFrame> encoded;
     QElapsedTimer sincePicture;
     QElapsedTimer sincePreview;
@@ -222,6 +226,10 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, Captu
     quint64 bytesLately = 0;
 
     while (generation == session) {
+        // With nobody watching, a picture is only wanted for a preview.
+        const bool suspendedNow = suspended;
+        const bool pictureWanted = !suspendedNow || !announcedSize.isValid() || !sincePreview.isValid() || sincePreview.elapsed() >= PREVIEW_INTERVAL_MS;
+        screen.setPicturesWanted(pictureWanted);
         const ScreenCapture::Status status = screen.read(frame.get());
         if (status == ScreenCapture::Status::Failed) {
             emit pipeline->failed(screen.failure());
@@ -249,8 +257,12 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, Captu
         if (std::exchange(stalled, stalledNow) != stalledNow)
             emit pipeline->captureStalled(stalledNow);
 
-        const bool suspendedNow = suspended;
+        if (!pictureWanted)
+            continue;
+
         AVFrame *picture = nullptr;
+        if (status == ScreenCapture::Status::Frame)
+            previewIsOfThisPicture = false;
         if (status == ScreenCapture::Status::Frame && screen.deliversOnlyChanges()) {
             av_frame_unref(kept.get());
             av_frame_move_ref(kept.get(), frame.get());
@@ -317,7 +329,9 @@ void BroadcastPipeline::Worker::capture(const BroadcastSettings &settings, Captu
 
         if (!sincePreview.isValid() || sincePreview.elapsed() >= PREVIEW_INTERVAL_MS) {
             sincePreview.start();
-            const QImage preview = previews.make(picture);
+            // A picture sent again because nothing new has come is the one the last preview is of.
+            if (!std::exchange(previewIsOfThisPicture, true))
+                preview = previews.make(picture);
             if (!preview.isNull())
                 emit pipeline->previewReady(preview);
         }

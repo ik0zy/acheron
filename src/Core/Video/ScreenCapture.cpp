@@ -427,7 +427,13 @@ bool shellSurfaceCovers(std::vector<HWND> ordinary, const QRect &client)
     return false;
 }
 
-bool isCoveredOnScreen(HWND window, const QRect &client)
+enum class ShellSurfaces {
+    LookedFor,
+    // For a first look that a second, after the screen is read, decides over.
+    LeftForLater,
+};
+
+bool isCoveredOnScreen(HWND window, const QRect &client, ShellSurfaces shellSurfaces)
 {
     WindowStack stack;
     stack.target = window;
@@ -436,7 +442,7 @@ bool isCoveredOnScreen(HWND window, const QRect &client)
     EnumWindows(stackDownToTarget, reinterpret_cast<LPARAM>(&stack));
     if (!stack.reachedTarget || windowIsCovered(stack.topDown, static_cast<int>(stack.topDown.size()) - 1))
         return true;
-    return shellSurfaceCovers(std::move(stack.ordinary), client);
+    return shellSurfaces == ShellSurfaces::LookedFor && shellSurfaceCovers(std::move(stack.ordinary), client);
 }
 
 // A window a user would call one: on the screen or minimised, with a title, and not a tool
@@ -729,6 +735,23 @@ QSize windowPictureSize(const QSize &client)
 
 // Whether a BGRA picture on the card is transparent wherever it is looked at, which no picture
 // of a window that has drawn itself is. `scratch` is what it is read back into.
+// Into memory in the format the card has it in, into what `memory` holds already when that fits.
+int readBack(const AVFrame *onCard, AVFrame *memory)
+{
+    const int format = reinterpret_cast<const AVHWFramesContext *>(onCard->hw_frames_ctx->data)->sw_format;
+    const bool fits = memory->buf[0] && memory->format == format && memory->width == onCard->width && memory->height == onCard->height && av_frame_make_writable(memory) >= 0;
+    if (!fits) {
+        av_frame_unref(memory);
+        memory->format = format;
+        memory->width = onCard->width;
+        memory->height = onCard->height;
+        const int made = av_frame_get_buffer(memory, 0);
+        if (made < 0)
+            return made;
+    }
+    return av_hwframe_transfer_data(memory, onCard, 0);
+}
+
 bool isEmptyPicture(const AVFrame *onCard, AVFrame *scratch)
 {
     constexpr int POINTS_ACROSS = 4;
@@ -746,6 +769,19 @@ bool isEmptyPicture(const AVFrame *onCard, AVFrame *scratch)
 }
 
 // The bitmap from its top left corner, with black where it does not reach.
+// Whether `bgra`, which copyTopLeft filled from a bitmap of this size, still shows what the
+// bitmap does.
+bool showsTopLeftOf(const Bitmap &from, const AVFrame *bgra)
+{
+    const int columns = std::min(from.size().width(), bgra->width);
+    const int rows = std::min(from.size().height(), bgra->height);
+    for (int y = 0; y < rows; y++) {
+        if (memcmp(bgra->data[0] + static_cast<qsizetype>(y) * bgra->linesize[0], from.row(y), static_cast<size_t>(columns) * 4) != 0)
+            return false;
+    }
+    return true;
+}
+
 void copyTopLeft(const Bitmap &from, AVFrame *bgra)
 {
     const int columns = std::min(from.size().width(), bgra->width);
@@ -928,6 +964,20 @@ UINT sliceOf(const AVFrame *card)
     return static_cast<UINT>(reinterpret_cast<quintptr>(card->data[1]));
 }
 
+// ddagrab hands the picture it handed over last over again while the screen shows nothing
+// new. `last` is a reference to that one, which keeps its place on the card from being given
+// to another.
+bool isSamePictureOnCard(const AVFrame *last, const AVFrame *now)
+{
+    return last->buf[0] && now->hw_frames_ctx && last->data[0] == now->data[0] && last->data[1] == now->data[1];
+}
+
+void keepReferenceTo(AVFrame *last, const AVFrame *now)
+{
+    av_frame_unref(last);
+    av_frame_ref(last, now);
+}
+
 QRect wholeOf(const AVFrame *picture)
 {
     return QRect(0, 0, picture->width, picture->height);
@@ -991,6 +1041,15 @@ struct ScreenCapture::CutOut
 {
     QRect onScreen;
     QRect inPicture;
+
+    bool operator==(const CutOut &other) const = default;
+};
+
+enum class ScreenCapture::Drawing {
+    Failed,
+    // What the window drew is what the last picture, which it also drew, shows.
+    Unchanged,
+    Drawn,
 };
 
 struct ScreenCapture::Backends
@@ -1038,6 +1097,17 @@ struct ScreenCapture::Backends
     FramePointer wholeScreen{ av_frame_alloc() };
     FramePointer bgra{ av_frame_alloc() };
     FramePointer asDrawn{ av_frame_alloc() };
+
+    // How a screen's pictures last went on from the card, for the log.
+    const char *wentOn = "";
+    // The screen's picture the last picture delivered was made of, and for a window where
+    // in it the window was.
+    FramePointer lastOfScreen{ av_frame_alloc() };
+    CutOut lastCut;
+    // The size of the bitmap `bgra` was filled from, while the last picture delivered is that
+    // one. Not valid otherwise.
+    QSize drawingDelivered;
+    QSize drawingInBgra;
 };
 
 bool screenCaptureAvailable()
@@ -1159,7 +1229,7 @@ void ScreenCapture::configure(const Request &wanted)
 
 bool ScreenCapture::deliversOnlyChanges() const
 {
-    return path == Path::GraphicsCapture;
+    return true;
 }
 
 QString ScreenCapture::captureName() const
@@ -1187,6 +1257,11 @@ ScreenCapture::Status ScreenCapture::read(AVFrame *into)
         const Status watched = watchWindow();
         if (watched != Status::Frame)
             return watched;
+    }
+    // Only duplication of a screen has to be read to stay in time with it.
+    if (!picturesWanted && path != Path::Duplication) {
+        std::this_thread::sleep_for(pictureInterval(request.framerate));
+        return Status::NoFrame;
     }
     switch (path) {
     case Path::GraphicsCapture:
@@ -1241,6 +1316,8 @@ ScreenCapture::Status ScreenCapture::watchWindow()
             state.session->abandon();
         state.session.reset();
         av_buffer_unref(&state.pool);
+        av_frame_unref(state.lastOfScreen.get());
+        state.drawingDelivered = QSize();
     }
     return Status::Frame;
 }
@@ -1279,27 +1356,22 @@ ScreenCapture::Status ScreenCapture::readDuplication(AVFrame *into)
             return afterFailure(built);
     }
 
-    AVFrame *captured = graphScalesOnCard ? backends->captured.get() : into;
+    // Read whether or not a picture is wanted: ddagrab keeps the time between pictures, and
+    // makes up for a read that did not come by handing the next ones over at once.
+    Backends &state = *backends;
+    AVFrame *captured = state.captured.get();
     const int got = av_buffersink_get_frame(sink, captured);
     if (got == AVERROR(EAGAIN))
         return Status::NoFrame;
     if (got < 0)
         return afterFailure(got);
 
-    if (graphScalesOnCard) {
-        const QSize size = encodeSizeFor(QSize(captured->width, captured->height), request.maxHeight);
-        const bool scaled = scaleOnCard(captured, wholeOf(captured), size, QRect(QPoint(0, 0), size), into);
+    if (!picturesWanted || isSamePictureOnCard(state.lastOfScreen.get(), captured)) {
         av_frame_unref(captured);
-        if (!scaled) {
-            // The next read makes a capture that scales in software.
-            dropDuplication();
-            return Status::NoFrame;
-        }
-    } else {
-        markColours(into, graphIsBt601);
+        return Status::NoFrame;
     }
-    delivered();
-    return Status::Frame;
+    keepReferenceTo(state.lastOfScreen.get(), captured);
+    return deliverFromCard(captured, into);
 }
 
 ScreenCapture::Status ScreenCapture::readGraphicsCapture(AVFrame *into)
@@ -1343,37 +1415,47 @@ ScreenCapture::Status ScreenCapture::readGraphicsCapture(AVFrame *into)
     bool undrawn = state.window && !showsItself(state.window);
     if (state.window && !undrawn && Clock::now() < state.emptyPicturesUntil) {
         undrawn = isEmptyPicture(state.captured.get(), state.bgra.get());
-        if (!undrawn)
+        if (!undrawn) {
             state.emptyPicturesUntil = {};
+            av_frame_unref(state.bgra.get());
+        }
     }
     if (undrawn) {
         av_frame_unref(state.captured.get());
         return Status::NoFrame;
     }
 
-    AVFrame *captured = state.captured.get();
+    return deliverFromCard(state.captured.get(), into);
+}
+
+// A picture on the card made what the encoder is to have: handed over as it is, scaled on the
+// card, or read back and scaled in software. `captured` is left empty.
+ScreenCapture::Status ScreenCapture::deliverFromCard(AVFrame *captured, AVFrame *into)
+{
+    Backends &state = *backends;
     const QSize ownSize(captured->width, captured->height);
     const QSize size = encodeSizeFor(ownSize, request.maxHeight);
+    const char *wentOn = "read back and scaled in software";
+    const bool bt601 = request.bt601Only || size.height() < HD_HEIGHT;
     if (request.keepOnCard && request.rgbOnCard && size == ownSize) {
+        wentOn = "kept on the graphics card as it is";
         av_frame_move_ref(into, captured);
         markColours(into, false);
-        delivered();
-        return Status::Frame;
-    }
-    if (scalesOnCard() && scaleOnCard(captured, wholeOf(captured), size, QRect(QPoint(0, 0), size), into)) {
+    } else if (scalesOnCard() && scaleOnCard(captured, wholeOf(captured), size, QRect(QPoint(0, 0), size), into)) {
+        wentOn = "scaled on the graphics card and kept there";
         av_frame_unref(captured);
-        delivered();
-        return Status::Frame;
+    } else {
+        int converted = readBack(captured, state.bgra.get());
+        av_frame_unref(captured);
+        if (converted >= 0)
+            converted = state.converter.convert(state.bgra.get(), size, request.softwareFormat, bt601, into);
+        if (converted < 0)
+            return afterFailure(converted);
+        markColours(into, bt601);
     }
 
-    const bool bt601 = request.bt601Only || size.height() < HD_HEIGHT;
-    int converted = prepareBgra(state.bgra.get(), ownSize) ? av_hwframe_transfer_data(state.bgra.get(), captured, 0) : AVERROR(ENOMEM);
-    av_frame_unref(captured);
-    if (converted >= 0)
-        converted = state.converter.convert(state.bgra.get(), size, request.softwareFormat, bt601, into);
-    if (converted < 0)
-        return afterFailure(converted);
-    markColours(into, bt601);
+    if (path == Path::Duplication && std::exchange(state.wentOn, wentOn) != wentOn)
+        qCInfo(LogVideo) << "Capturing" << request.sourceId << "as" << size.width() << "x" << size.height() << wentOn;
     delivered();
     return Status::Frame;
 }
@@ -1401,7 +1483,11 @@ ScreenCapture::Status ScreenCapture::readWindowByDuplication(AVFrame *into)
     CutOut cut;
     state.drawnBecause = "its screen cannot be duplicated";
     const bool cutOut = screenDuplicated && cutOutOfScreen(client, &cut);
-    if (!cutOut && !drawnByItself(client))
+    if (cutOut && isSamePictureOnCard(state.lastOfScreen.get(), whole) && cut == state.lastCut) {
+        av_frame_unref(whole);
+        return Status::NoFrame;
+    }
+    if (!cutOut && drawnByItself(client) != Drawing::Drawn)
         return Status::NoFrame;
 
     bool ready = true;
@@ -1425,6 +1511,12 @@ ScreenCapture::Status ScreenCapture::readWindowByDuplication(AVFrame *into)
             markColours(into, bt601);
     }
     av_frame_unref(card);
+    av_frame_unref(state.lastOfScreen.get());
+    if (ready && cutOut) {
+        av_frame_move_ref(state.lastOfScreen.get(), whole);
+        state.lastCut = cut;
+    }
+    state.drawingDelivered = ready && !cutOut ? state.drawingInBgra : QSize();
     av_frame_unref(whole);
     if (!ready)
         return Status::NoFrame;
@@ -1500,7 +1592,7 @@ bool ScreenCapture::cutOutOfScreen(const QRect &client, CutOut *cut)
     if (evenSize(client.size()) != state.pictureSize)
         return false;
     state.drawnBecause = "a window above overlaps it";
-    if (isCoveredOnScreen(state.window, client))
+    if (isCoveredOnScreen(state.window, client, ShellSurfaces::LeftForLater))
         return false;
 
     state.drawnBecause = "it reaches past its screen";
@@ -1526,7 +1618,7 @@ bool ScreenCapture::cutOutOfScreen(const QRect &client, CutOut *cut)
     // The read waits for the screen, and a window moved or covered meanwhile has left its
     // place there to something else.
     state.drawnBecause = "it moved or was covered while its screen was read";
-    if (clientOnScreen(state.window) != client || isCoveredOnScreen(state.window, client)) {
+    if (clientOnScreen(state.window) != client || isCoveredOnScreen(state.window, client, ShellSurfaces::LookedFor)) {
         av_frame_unref(whole);
         return false;
     }
@@ -1534,33 +1626,39 @@ bool ScreenCapture::cutOutOfScreen(const QRect &client, CutOut *cut)
     return true;
 }
 
-// The window's picture as the window draws it, into the BGRA picture kept for it. False when
-// it would not draw.
-bool ScreenCapture::drawnByItself(const QRect &client)
+// The window's picture as the window draws it, into the BGRA picture kept for it.
+ScreenCapture::Drawing ScreenCapture::drawnByItself(const QRect &client)
 {
     Backends &state = *backends;
     if (!state.drawer)
         state.drawer = WindowDrawer::start(state.window, true);
     if (!state.drawer->draw(std::chrono::milliseconds(DRAWING_LIMIT_MS)))
-        return false;
+        return Drawing::Failed;
     state.drawer->drawPointer(client);
 
     const Bitmap &drawn = state.drawer->drawn();
     AVFrame *bgra = state.bgra.get();
+    const QSize delivered = std::exchange(state.drawingDelivered, QSize());
+    state.drawingInBgra = QSize();
     if (drawn.size() == client.size()) {
         if (!prepareBgra(bgra, state.pictureSize))
-            return false;
+            return Drawing::Failed;
+        if (delivered == drawn.size() && showsTopLeftOf(drawn, bgra)) {
+            state.drawingDelivered = delivered;
+            return Drawing::Unchanged;
+        }
         copyTopLeft(drawn, bgra);
-        return true;
+        state.drawingInBgra = drawn.size();
+        return Drawing::Drawn;
     }
 
     // A program Windows scales for the screen draws itself at its own, smaller size.
     AVFrame *asDrawn = state.asDrawn.get();
     if (!prepareBgra(asDrawn, drawn.size()))
-        return false;
+        return Drawing::Failed;
     copyTopLeft(drawn, asDrawn);
     av_frame_unref(bgra);
-    return state.rescaler.convert(asDrawn, state.pictureSize, AV_PIX_FMT_BGRA, false, bgra) >= 0;
+    return state.rescaler.convert(asDrawn, state.pictureSize, AV_PIX_FMT_BGRA, false, bgra) >= 0 ? Drawing::Drawn : Drawing::Failed;
 }
 
 // Neither source recovers from losing what it captures: ddagrab not from losing the screen nor
@@ -1587,9 +1685,10 @@ ScreenCapture::Status ScreenCapture::afterFailure(int error)
     return Status::Stalled;
 }
 
+// The screen's pictures come out of the duplication on the card whatever is made of them
+// after, because that is where one that shows nothing new can be told from the one before it.
 int ScreenCapture::buildDuplication()
 {
-    graphScalesOnCard = false;
     const std::vector<Monitor> monitors = attachedMonitors();
     const Monitor *monitor = numberedMonitor(monitors, request.sourceId);
     if (!monitor)
@@ -1601,24 +1700,10 @@ int ScreenCapture::buildDuplication()
     if (result < 0)
         return result;
 
-    const QSize ownSize = monitor->onItsSide ? monitor->geometry.size().transposed() : monitor->geometry.size();
-    const QSize size = encodeSizeFor(ownSize, request.maxHeight);
-    const bool asCaptured = request.keepOnCard && request.rgbOnCard && size == ownSize;
-    graphScalesOnCard = !asCaptured && scalesOnCard();
-    // An encoder converting for itself is asked for BT.709 at any size: AMF makes something
-    // else of a request for BT.601.
-    graphIsBt601 = !asCaptured && (request.bt601Only || size.height() < HD_HEIGHT);
-
-    QByteArray chain = "ddagrab=output_idx=" + QByteArray::number(monitor->output) + ":framerate=" + QByteArray::number(request.framerate);
-    if (!asCaptured && !graphScalesOnCard)
-        chain += ",hwdownload,format=bgra," + softwareScaling(size, graphIsBt601, request.softwareFormat);
-
+    const QByteArray chain = "ddagrab=output_idx=" + QByteArray::number(monitor->output) + ":framerate=" + QByteArray::number(request.framerate);
     result = assemble(chain, device, &graph, &sink);
     av_buffer_unref(&device);
-
-    if (result >= 0)
-        qCInfo(LogVideo) << "Capturing" << request.sourceId << "as" << size.width() << "x" << size.height() << (asCaptured ? "kept on the graphics card as it is" : graphScalesOnCard ? "scaled on the graphics card and kept there"
-                                                                                                                                                                                      : "read back and scaled in software");
+    backends->wentOn = "";
     return result;
 }
 
@@ -1681,6 +1766,7 @@ void ScreenCapture::dropDuplication()
 {
     avfilter_graph_free(&graph);
     sink = nullptr;
+    av_frame_unref(backends->lastOfScreen.get());
 }
 
 void ScreenCapture::tearDown()

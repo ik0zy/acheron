@@ -108,8 +108,8 @@ public:
     // Encoders that cannot follow a new rate while running are reopened, which costs a key
     // frame, so callers should move this in steps and not continuously.
     void setBitrate(int bitrate);
-    // While nobody is watching: capture carries on, so previews stay current, and nothing is
-    // encoded. Sending again starts with a key frame.
+    // While nobody is watching: nothing is encoded, and the source is read only as often as
+    // the previews need it. Sending again starts with a key frame.
     void setEncodingSuspended(bool suspended);
 
 signals:
