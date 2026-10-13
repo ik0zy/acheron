@@ -1067,8 +1067,8 @@ AVCodecContext *VideoEncoder::configured(const AVFrame *frame, int h264Profile) 
         av_opt_set_int(options, "max-intra-rate", std::max(300, 30 * settings.framerate), 0);
         break;
     case EncoderFamily::X264:
-        // Left alone it makes a slice for every core, each of which costs bits and holds the
-        // rate further below what was asked.
+        // Left alone it makes a slice for every core, each of which costs bits the picture
+        // then goes without. What holds it to the rate is the buffer it is given.
         made->thread_count = softwareThreads(frame->width, frame->height);
         av_opt_set(options, "preset", "veryfast", 0);
         av_opt_set(options, "tune", "zerolatency", 0);
