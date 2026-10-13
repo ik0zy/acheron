@@ -3360,10 +3360,10 @@ void TestVideoEncode::whatScalingAScreenCosts()
     if (!aScreenIsOnAGraphicsCard())
         QSKIP("no screen of this machine is on a graphics card");
 
-    // Graphics capture has a picture only when its screen changes, which a window sees to.
+    // There is a picture only when the screen changes, which a window sees to.
     CaptureSource source = sources.first();
     std::unique_ptr<TestWindow> stirring;
-    if (method == CaptureMethod::GraphicsCapture) {
+    {
         SKIP_WITHOUT_A_QUIET_SCREEN(quiet);
         const auto shared = std::find_if(sources.begin(), sources.end(), [&quiet](const CaptureSource &each) { return each.geometry == quiet->whole; });
         QVERIFY(shared != sources.end());

@@ -1100,6 +1100,9 @@ struct ScreenCapture::Backends
 
     // How a screen's pictures last went on from the card, for the log.
     const char *wentOn = "";
+    // `video/skip_unchanged_pictures`, for turning off what follows: a picture that duplication
+    // or the window itself gives again unchanged is not delivered again.
+    bool skipsUnchanged = true;
     // The screen's picture the last picture delivered was made of, and for a window where
     // in it the window was.
     FramePointer lastOfScreen{ av_frame_alloc() };
@@ -1221,6 +1224,7 @@ void ScreenCapture::configure(const Request &wanted)
 
     backends = std::make_unique<Backends>();
     backends->window = windowOf(request.sourceId);
+    backends->skipsUnchanged = QSettings().value(QStringLiteral("video/skip_unchanged_pictures"), true).toBool();
     if (usesGraphicsCapture(request.method, backends->window != nullptr))
         path = Path::GraphicsCapture;
     else
@@ -1366,7 +1370,7 @@ ScreenCapture::Status ScreenCapture::readDuplication(AVFrame *into)
     if (got < 0)
         return afterFailure(got);
 
-    if (!picturesWanted || isSamePictureOnCard(state.lastOfScreen.get(), captured)) {
+    if (!picturesWanted || (state.skipsUnchanged && isSamePictureOnCard(state.lastOfScreen.get(), captured))) {
         av_frame_unref(captured);
         return Status::NoFrame;
     }
@@ -1483,7 +1487,7 @@ ScreenCapture::Status ScreenCapture::readWindowByDuplication(AVFrame *into)
     CutOut cut;
     state.drawnBecause = "its screen cannot be duplicated";
     const bool cutOut = screenDuplicated && cutOutOfScreen(client, &cut);
-    if (cutOut && isSamePictureOnCard(state.lastOfScreen.get(), whole) && cut == state.lastCut) {
+    if (cutOut && state.skipsUnchanged && isSamePictureOnCard(state.lastOfScreen.get(), whole) && cut == state.lastCut) {
         av_frame_unref(whole);
         return Status::NoFrame;
     }
@@ -1643,7 +1647,7 @@ ScreenCapture::Drawing ScreenCapture::drawnByItself(const QRect &client)
     if (drawn.size() == client.size()) {
         if (!prepareBgra(bgra, state.pictureSize))
             return Drawing::Failed;
-        if (delivered == drawn.size() && showsTopLeftOf(drawn, bgra)) {
+        if (state.skipsUnchanged && delivered == drawn.size() && showsTopLeftOf(drawn, bgra)) {
             state.drawingDelivered = delivered;
             return Drawing::Unchanged;
         }
