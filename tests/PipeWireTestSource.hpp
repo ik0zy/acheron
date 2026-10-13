@@ -62,8 +62,9 @@ public:
         context = pw_context_new(pw_thread_loop_get_loop(loop), nullptr, 0);
         pw_thread_loop_start(loop);
 
+        // A machine may have libpipewire and none of PipeWire's own files, and then no context.
         Locked lock(loop);
-        core = pw_context_connect(context, nullptr, 0);
+        core = context ? pw_context_connect(context, nullptr, 0) : nullptr;
         if (!core)
             return;
         stream = pw_stream_new(core, "acheron-test-source", nullptr);
@@ -81,7 +82,8 @@ public:
             pw_stream_destroy(stream);
         if (core)
             pw_core_disconnect(core);
-        pw_context_destroy(context);
+        if (context)
+            pw_context_destroy(context);
         pw_thread_loop_destroy(loop);
     }
 
