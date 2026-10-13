@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QByteArray>
+#include <QList>
 #include <QObject>
 #include <QString>
 
@@ -13,6 +14,16 @@ namespace Audio {
 // Whether this machine can capture what one program is playing, or everything but one program.
 // Nothing offers to share sound where it cannot.
 [[nodiscard]] bool processLoopbackAvailable();
+
+struct PlayingProgram
+{
+    quint32 processId = 0;
+    QString name;
+};
+
+// The programs that have a sound output open right now, this one left out. Empty where the
+// platform has no way to tell.
+[[nodiscard]] QList<PlayingProgram> playingPrograms();
 
 // Captures what is being played, as 20 ms frames of 48 kHz stereo 16-bit PCM, on a thread of
 // its own. Its signals are emitted from that thread.
