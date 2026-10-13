@@ -1,6 +1,7 @@
 #include "Core/Media/VideoDecoder.hpp"
 
 #include "Core/Logging.hpp"
+#include "Core/Media/HardwareDevices.hpp"
 
 #include <QElapsedTimer>
 #include <QSettings>
@@ -178,7 +179,7 @@ AVBufferRef *sharedHardwareDevice(AVHWDeviceType type)
     auto it = devices.byType.find(type);
     if (it == devices.byType.end()) {
         AVBufferRef *device = nullptr;
-        if (av_hwdevice_ctx_create(&device, type, nullptr, nullptr, 0) < 0)
+        if (!hardwareDeviceCanBeAskedFor(type) || av_hwdevice_ctx_create(&device, type, nullptr, nullptr, 0) < 0)
             device = nullptr;
         it = devices.byType.emplace(type, device).first;
     }

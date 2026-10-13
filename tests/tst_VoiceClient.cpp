@@ -66,6 +66,14 @@ struct RtpSeen
     Bytes payload;
 };
 
+// When the packet says it left, in seconds: its abs-send-time extension, 24 bits of 6.18
+// fixed point.
+double sendTimeOf(const RtpSeen &packet)
+{
+    const std::span<const uint8_t> time = findRtpExtension(packet.extensions, VideoSendStream::ABS_SEND_TIME_EXTENSION);
+    return time.size() == 3 ? ((time[0] << 16) | (time[1] << 8) | time[2]) / 262144.0 : -1.0;
+}
+
 Bytes pictureLoss(quint32 mediaSsrc)
 {
     Bytes packet(12);
@@ -977,28 +985,29 @@ void TestVoiceClient::aFrameLeavesAtThePaceOfTheBitrateItWasEncodedAt()
     call.startVideo();
 
     // Twelve kilobytes at half a megabit: a burst of 40 ms' worth at once, the rest over more
-    // than a tenth of a second.
+    // than a tenth of a second. The time is read off the packets' own send times, which say
+    // when the pace let each go and nothing of how busy this machine is.
     constexpr int PACKETS = 11;
-    const auto timeToArrive = [&](quint32 timestamp) {
+    const auto timeToLeave = [&](quint32 timestamp) {
         call.server.rtp.clear();
-        QElapsedTimer timer;
-        timer.start();
         call.client->sendVideoFrame(videoFrame(12000, true, timestamp));
         [&] { QTRY_COMPARE(call.server.rtp.size(), PACKETS); }();
-        return call.server.rtp.size() == PACKETS ? timer.elapsed() : qint64(-1);
+        if (call.server.rtp.size() != PACKETS)
+            return -1.0;
+        return (sendTimeOf(call.server.rtp.last()) - sendTimeOf(call.server.rtp.first())) * 1000.0;
     };
 
     call.client->setVideoBitrate(500000);
-    const qint64 slow = timeToArrive(1000);
+    const double slow = timeToLeave(1000);
     QVERIFY2(slow >= 90 && slow < 1000, qPrintable(QString::number(slow)));
 
     // Until it is told otherwise the pace is that of the most that was announced, which
-    // stopping and starting the video brings back.
+    // stopping and starting the video brings back: at 3.5 Mbps the whole frame is one burst.
     call.client->stopVideo();
     call.startVideo();
     QTest::qWait(300);
-    const qint64 fast = timeToArrive(200000);
-    QVERIFY2(fast >= 0 && fast < slow / 2, qPrintable(QStringLiteral("%1 against %2").arg(fast).arg(slow)));
+    const double fast = timeToLeave(200000);
+    QVERIFY2(fast >= 0 && fast < 20, qPrintable(QStringLiteral("%1 against %2").arg(fast).arg(slow)));
 }
 
 void TestVoiceClient::aFrameArrivesAsPacketsThatReassemble()

@@ -96,7 +96,7 @@ jobs:
         run: cmake --build build --config ${{ matrix.build_type }} --parallel
 
       - name: Test
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 600
 
       - name: Deploy Qt
         shell: pwsh
@@ -185,7 +185,7 @@ jobs:
         run: cmake --build build --config RelWithDebInfo --parallel
 
       - name: Test
-        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure --timeout 600
 
       - name: Deploy Qt
         shell: pwsh
@@ -298,7 +298,7 @@ jobs:
         run: cmake --build build --config MinSizeRel --parallel
 
       - name: Test
-        run: ctest --test-dir build -C MinSizeRel --output-on-failure
+        run: ctest --test-dir build -C MinSizeRel --output-on-failure --timeout 600
 
       - name: Deploy Qt
         shell: pwsh
@@ -408,7 +408,7 @@ jobs:
         run: cmake --build build --parallel $(nproc) -- --keep-going
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --timeout 600
 
   build-appimage:
     # ubuntu-22.04, not -latest: the AppImage bundles Qt but not glibc, so the
@@ -490,7 +490,7 @@ jobs:
       - name: Test
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/ffmpeg/lib
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --timeout 600
 
       - name: Build AppDir
         run: |
@@ -615,8 +615,10 @@ jobs:
       - name: Build
         run: cmake --build build --parallel $(sysctl -n hw.logicalcpu) -- --keep-going
 
+      # No camera can be opened on macOS yet, and the stand-in the camera tests use cannot
+      # keep thirty pictures a second on the hosted runners, whose timers wake it late.
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --timeout 600 -E CameraCaptureTests
 
       - name: Prepare artifact
         run: |

@@ -2,6 +2,7 @@
 
 #include "Core/Logging.hpp"
 #include "Core/Media/H264Sps.hpp"
+#include "Core/Media/HardwareDevices.hpp"
 
 #include <QElapsedTimer>
 
@@ -99,6 +100,7 @@ constexpr std::array CANDIDATES = {
 constexpr std::array CODECS_BEST_FIRST = { VideoCodec::AV1, VideoCodec::H265, VideoCodec::H264, VideoCodec::VP8 };
 
 constexpr int RTP_CLOCK = 90000;
+constexpr int X264_BUFFER_FRAMES = 5;
 
 // ffmpeg's numbers for the profiles, which it has renamed between versions.
 constexpr int H264_PROFILE_MAIN = 77;
@@ -845,11 +847,14 @@ void EncodedFrameFinisher::rememberParameterSets(const uint8_t *data, size_t siz
 // encoders keep to the buffer they are given by leaving pictures out, which they cannot be
 // told not to: a Radeon's H265 one then shows nothing new for a second and more after a key
 // frame of a screen full of text. Zero leaves them the buffer they choose themselves, with
-// which they hold the rate as well and leave nothing out.
+// which they hold the rate as well and leave nothing out. x264 stays so far under a buffer of
+// one frame that a sixth of the bitrate and more goes unused; with five it uses nearly all.
 int VideoEncoder::bufferBits() const
 {
     if (candidate->family == EncoderFamily::Vpx)
         return settings.bitrate;
+    if (candidate->family == EncoderFamily::X264)
+        return static_cast<int>(static_cast<qint64>(settings.bitrate) * X264_BUFFER_FRAMES / std::max(1, settings.framerate));
     if (candidate->family == EncoderFamily::MediaFoundation)
         return 0;
     return settings.bitrate / std::max(1, settings.framerate);
@@ -1074,7 +1079,7 @@ void VideoEncoder::describeColours()
 bool VideoEncoder::prepareUpload(const AVFrame *frame)
 {
     AVBufferRef *device = nullptr;
-    if (av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0) < 0)
+    if (!hardwareDeviceCanBeAskedFor(AV_HWDEVICE_TYPE_VAAPI) || av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0) < 0)
         return false;
     uploadFrames = av_hwframe_ctx_alloc(device);
     av_buffer_unref(&device);

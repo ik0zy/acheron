@@ -550,5 +550,14 @@ void TestVideoSurface::statisticsAreLeftOffASmallTile()
     QVERIFY(isNear(image.pixel(5, 5), 255, 255, 255));
 }
 
-QTEST_MAIN(TestVideoSurface)
+int main(int argc, char **argv)
+{
+    if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM"))
+        qputenv("QT_QPA_PLATFORM", "offscreen");
+
+    QApplication app(argc, argv);
+    TestVideoSurface test;
+    return QTest::qExec(&test, argc, argv);
+}
+
 #include "tst_VideoSurface.moc"

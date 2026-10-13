@@ -154,6 +154,10 @@ endif()
 include(rnnoise.cmake)
 
 include(ffmpeg.cmake)
+# Core/Media/HardwareDevices.hpp looks for libva with dlopen, which older C libraries keep apart.
+if(TARGET ffmpeg AND UNIX AND CMAKE_DL_LIBS)
+    target_link_libraries(ffmpeg INTERFACE ${CMAKE_DL_LIBS})
+endif()
 
 include(lottie.cmake)
 
