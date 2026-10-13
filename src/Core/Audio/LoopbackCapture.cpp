@@ -16,6 +16,8 @@
 #include <audioclientactivationparams.h>
 #include <mmdeviceapi.h>
 #elif defined(ACHERON_HAVE_PIPEWIRE)
+#include "Core/Media/PipeWireLibrary.hpp"
+
 #include <QElapsedTimer>
 #include <QFile>
 #include <QMap>
@@ -422,10 +424,13 @@ QString failureText(const QString &detail)
     return LoopbackCapture::tr("PipeWire could not capture the sound (%1).").arg(detail);
 }
 
-void initPipeWire()
+bool initPipeWire()
 {
+    if (!Media::pipeWireCanBeCalled())
+        return false;
     static std::once_flag once;
     std::call_once(once, [] { pw_init(nullptr, nullptr); });
+    return true;
 }
 
 quint32 parentOf(quint32 processId)
@@ -677,8 +682,7 @@ private:
 
 void consult(int roundTrips, const std::function<void(const Graph &)> &read)
 {
-    initPipeWire();
-    pw_main_loop *loop = pw_main_loop_new(nullptr);
+    pw_main_loop *loop = initPipeWire() ? pw_main_loop_new(nullptr) : nullptr;
     pw_context *context = loop ? pw_context_new(pw_main_loop_get_loop(loop), nullptr, 0) : nullptr;
     {
         Graph graph(context);
@@ -726,10 +730,11 @@ public:
         wanted = target;
         requests++;
         if (target && !loop) {
-            initPipeWire();
-            loop = pw_thread_loop_new("acheron-loopback", nullptr);
+            const bool installed = initPipeWire();
+            loop = installed ? pw_thread_loop_new("acheron-loopback", nullptr) : nullptr;
             asked = loop ? pw_loop_add_event(pw_thread_loop_get_loop(loop), [](void *worker, uint64_t) { static_cast<Worker *>(worker)->serve(); }, this) : nullptr;
-            const int started = asked ? pw_thread_loop_start(loop) : -errno;
+            const int unstarted = installed ? -errno : -ENOENT;
+            const int started = asked ? pw_thread_loop_start(loop) : unstarted;
             if (started < 0) {
                 if (loop)
                     pw_thread_loop_destroy(std::exchange(loop, nullptr));

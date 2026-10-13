@@ -18,6 +18,8 @@ env:
   # AppImage builds against this prebuilt prefix and bundles it.
   FFMPEG_LINUX_BUILD: ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-lgpl-shared-8.1
   FFMPEG_LINUX_SHA256: c882a80f06617149198a98a07a0880a7e881953ae9f9cb931f5be09a4f93caae
+  # Makes the stubs through which the AppImage loads libpipewire when it is first called.
+  IMPLIB_COMMIT: a3e167cf978a5b8a38ec0f710d8c4331e8dcdd9a
   # aqtinstall 3.3.0, still the newest release, cannot find Qt 6.11+ for Windows: the
   # repository moved to one folder per compiler (jurplel/install-qt-action#374).
   AQT_FOR_WINDOWS_QT6: git+https://github.com/miurahr/aqtinstall.git@076e1659807d0b362a3ed684d54c2e9c775eb9c7
@@ -452,7 +454,7 @@ jobs:
           sudo apt-get install -y libcurl4-openssl-dev libsecret-1-dev zlib1g-dev \
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
             libxcb-render-util0 libxcb-shape0 libxcb-xkb1 libxkbcommon-x11-0 \
-            libxcb1-dev libxcb-randr0-dev libxcb-composite0-dev
+            libxcb1-dev libxcb-randr0-dev libxcb-composite0-dev libpipewire-0.3-dev
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
@@ -495,11 +497,20 @@ jobs:
           mkdir -p ffmpeg
           tar -xf ffmpeg.tar.xz -C ffmpeg --strip-components=1
 
+      # libpipewire has to be the one of the machine the AppImage runs on, which is why
+      # linuxdeploy leaves it out. Linked in the ordinary way, Acheron would then not start
+      # where there is none, so it is loaded when it is first called (linuxcapture.cmake).
+      - name: Get Implib.so
+        run: |
+          git clone https://github.com/yugr/Implib.so implib
+          git -C implib checkout ${{ env.IMPLIB_COMMIT }}
+
       - name: Configure
         run: >
           cmake -B build -S .
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_INSTALL_PREFIX=/usr
+          -DIMPLIB_GEN=${{ github.workspace }}/implib/implib-gen.py
           -DVCPKG_TARGET_TRIPLET=x64-linux
           -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR;${{ github.workspace }}/ffmpeg"
           -DCURL_INCLUDE_DIR=${{ github.workspace }}/curl-impersonate/include
@@ -580,6 +591,12 @@ jobs:
             [ -s "$(ls AppDir/usr/lib/$lib.so.* 2>/dev/null | head -1)" ] \
               || { echo "$lib was not bundled into AppDir/usr/lib"; exit 1; }
           done
+
+      - name: Check Acheron starts without libpipewire
+        run: |
+          if readelf -d AppDir/usr/bin/acheron | grep NEEDED | grep -q pipewire; then
+            echo "acheron cannot start without libpipewire"; exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

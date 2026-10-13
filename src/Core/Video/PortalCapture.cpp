@@ -1,6 +1,8 @@
 #include "Core/Video/LinuxCapture.hpp"
 
 #if defined(ACHERON_HAVE_PIPEWIRE) && defined(ACHERON_HAVE_DBUS)
+#include "Core/Media/PipeWireLibrary.hpp"
+
 #include <QCoreApplication>
 #include <QDBusArgument>
 #include <QDBusConnection>
@@ -178,6 +180,8 @@ Portal portal()
 bool pipeWireStarts()
 {
     static const bool starts = [] {
+        if (!Media::pipeWireCanBeCalled())
+            return false;
         pw_init(nullptr, nullptr);
         pw_loop *loop = pw_loop_new(nullptr);
         if (loop)
