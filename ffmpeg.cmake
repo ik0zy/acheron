@@ -12,8 +12,9 @@ set(FFMPEG_RUNTIME_DLLS "" CACHE INTERNAL "ffmpeg shared libraries to stage next
 # beside them; staging those too costs 33 MB of DLLs nothing here ever loads.
 set(FFMPEG_COMPONENTS avcodec avformat avutil swscale swresample)
 
-# Screen capture and on-card scaling for sending video live in avfilter. It is taken when the
-# prebuilt package has it and done without otherwise, in which case nothing can be shared.
+# Screen capture and on-card scaling for sending video live in avfilter. It is taken when
+# cameras and screen shares are built (ENABLE_VIDEO) and the prebuilt package has it, and done
+# without otherwise, in which case nothing can be shared.
 set(FFMPEG_HAVE_AVFILTER OFF CACHE INTERNAL "whether the ffmpeg target includes libavfilter" FORCE)
 # Cameras are opened through avdevice, on the same terms.
 set(FFMPEG_HAVE_AVDEVICE OFF CACHE INTERNAL "whether the ffmpeg target includes libavdevice" FORCE)
@@ -124,10 +125,16 @@ if(FFMPEG_INCLUDE_DIR AND NOT _ffmpeg_missing
     message(STATUS "Using ffmpeg from ${FFMPEG_INCLUDE_DIR}")
 
     set(_ffmpeg_staged_components ${FFMPEG_COMPONENTS})
-    if(NOT FFMPEG_avfilter_LIBRARY)
+    set(_ffmpeg_for_video OFF)
+    if(ENABLE_VIDEO AND ENABLE_VOICE)
+        set(_ffmpeg_for_video ON)
+    endif()
+    if(NOT FFMPEG_avfilter_LIBRARY OR NOT _ffmpeg_for_video)
         unset(FFMPEG_avfilter_LIBRARY CACHE)
     endif()
-    find_library(FFMPEG_avfilter_LIBRARY NAMES avfilter libavfilter PATH_SUFFIXES lib)
+    if(_ffmpeg_for_video)
+        find_library(FFMPEG_avfilter_LIBRARY NAMES avfilter libavfilter PATH_SUFFIXES lib)
+    endif()
     if(FFMPEG_avfilter_LIBRARY)
         target_link_libraries(ffmpeg INTERFACE "${FFMPEG_avfilter_LIBRARY}")
         target_compile_definitions(ffmpeg INTERFACE ACHERON_HAVE_AVFILTER)
@@ -135,10 +142,12 @@ if(FFMPEG_INCLUDE_DIR AND NOT _ffmpeg_missing
         set(FFMPEG_HAVE_AVFILTER ON CACHE INTERNAL "whether the ffmpeg target includes libavfilter" FORCE)
     endif()
 
-    if(NOT FFMPEG_avdevice_LIBRARY)
+    if(NOT FFMPEG_avdevice_LIBRARY OR NOT _ffmpeg_for_video)
         unset(FFMPEG_avdevice_LIBRARY CACHE)
     endif()
-    find_library(FFMPEG_avdevice_LIBRARY NAMES avdevice libavdevice PATH_SUFFIXES lib)
+    if(_ffmpeg_for_video)
+        find_library(FFMPEG_avdevice_LIBRARY NAMES avdevice libavdevice PATH_SUFFIXES lib)
+    endif()
     if(FFMPEG_avdevice_LIBRARY)
         target_link_libraries(ffmpeg INTERFACE "${FFMPEG_avdevice_LIBRARY}")
         target_compile_definitions(ffmpeg INTERFACE ACHERON_HAVE_AVDEVICE)

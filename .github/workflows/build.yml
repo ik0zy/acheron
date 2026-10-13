@@ -343,6 +343,12 @@ jobs:
 
   build-linux:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Cameras and screen shares are optional, so the build without them is kept working.
+        video: ['ON', 'OFF']
+    name: build-linux (video ${{ matrix.video }})
 
     steps:
       - uses: actions/checkout@v4
@@ -395,6 +401,7 @@ jobs:
           -DCURL_INCLUDE_DIR=${{ github.workspace }}/curl-impersonate/include
           -DCURL_LIBRARY=${{ github.workspace }}/curl-impersonate/libcurl-impersonate-local.a
           -DBUILD_TESTS=ON
+          -DENABLE_VIDEO=${{ matrix.video }}
 
       - name: Build
         run: cmake --build build --parallel $(nproc)

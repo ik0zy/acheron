@@ -32,6 +32,7 @@ option(ENABLE_VOICE "Build with voice/audio support" ON)
 option(ENABLE_RNNOISE "Build with RNNoise noise suppression (requires ENABLE_VOICE)" ON)
 option(ENABLE_RNNOISE_RTCD "Use RNNoise x86 runtime SIMD dispatch (SSE4.1/AVX2)" ON)
 option(ENABLE_FFMPEG "Build with ffmpeg/libav video playback support" ON)
+option(ENABLE_VIDEO "Build with cameras and screen shares in calls, watched and sent (requires ENABLE_VOICE and ENABLE_FFMPEG)" ON)
 option(ALLOW_PLAIN_CURL "Permit building against plain libcurl without curl-impersonate" OFF)
 if(BUILD_TESTS)
     enable_testing()
@@ -77,13 +78,6 @@ find_package(Qt${QT_VERSION_MAJOR}
         LinguistTools
 )
 find_package(Qt${QT_VERSION_MAJOR} COMPONENTS ZlibPrivate QUIET)
-# The video surface draws through OpenGL where it can. Qt 6 keeps that in modules of its own;
-# in Qt 5 it is part of Gui and Widgets.
-set(QT_OPENGL_LIBRARIES "")
-if(QT_VERSION_MAJOR GREATER_EQUAL 6)
-    find_package(Qt6 REQUIRED COMPONENTS OpenGL)
-    set(QT_OPENGL_LIBRARIES Qt6::OpenGL)
-endif()
 qt_standard_project_setup(I18N_TRANSLATED_LANGUAGES en)
 
 # If Qt::ZlibPrivate is not available, create a QtZlib compatibility include
@@ -162,6 +156,31 @@ include(rnnoise.cmake)
 include(ffmpeg.cmake)
 
 include(lottie.cmake)
+
+# Cameras and screen shares in calls. They need the RTC connection and ffmpeg, which are
+# there for other things as well, and bring in what nothing else uses: Qt's OpenGL module,
+# which the video surface draws through where it can (Qt 5 has it in Gui and Widgets), and
+# ffmpeg's avfilter and avdevice, which ffmpeg.cmake takes where it finds them.
+set(ACHERON_VIDEO OFF)
+set(QT_OPENGL_LIBRARIES "")
+if(ENABLE_VIDEO AND ENABLE_VOICE AND TARGET ffmpeg)
+    set(ACHERON_VIDEO ON)
+    if(QT_VERSION_MAJOR GREATER_EQUAL 6)
+        find_package(Qt6 QUIET COMPONENTS OpenGL)
+        if(NOT TARGET Qt6::OpenGL)
+            message(FATAL_ERROR
+                "ENABLE_VIDEO is on but Qt's OpenGL module was not found. It comes with Qt's "
+                "base; on Linux it also needs the OpenGL development headers. Configure with "
+                "-DENABLE_VIDEO=OFF to build without cameras and screen shares.")
+        endif()
+        set(QT_OPENGL_LIBRARIES Qt6::OpenGL)
+    endif()
+    message(STATUS "Cameras and screen shares: on")
+elseif(ENABLE_VIDEO)
+    message(STATUS "Cameras and screen shares: off, as they need ENABLE_VOICE and ENABLE_FFMPEG")
+else()
+    message(STATUS "Cameras and screen shares: off")
+endif()
 
 set(PROJECT_SOURCES
     resources.qrc
@@ -370,8 +389,7 @@ if(ENABLE_VOICE)
     )
 endif()
 
-# Watching video needs both the RTC connection and a decoder.
-if(ENABLE_VOICE AND TARGET ffmpeg)
+if(ACHERON_VIDEO)
     list(APPEND PROJECT_SOURCES
         src/Core/Media/DecodeDemand.cpp
         src/Core/Media/VideoDecoder.cpp
@@ -500,14 +518,6 @@ if(BUILD_TESTS)
         target_include_directories(TestRtp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME RtpTests COMMAND TestRtp)
 
-        qt_add_executable(TestLoopbackCapture tests/tst_LoopbackCapture.cpp src/Core/Logging.cpp src/Core/Audio/LoopbackCapture.cpp)
-        target_link_libraries(TestLoopbackCapture PRIVATE Qt::Core Qt::Test)
-        target_include_directories(TestLoopbackCapture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src "${CMAKE_CURRENT_SOURCE_DIR}/vendor/miniaudio")
-        if(WIN32)
-            target_link_libraries(TestLoopbackCapture PRIVATE ole32)
-        endif()
-        add_test(NAME LoopbackCaptureTests COMMAND TestLoopbackCapture)
-
         qt_add_executable(TestOpusEncoder tests/tst_OpusEncoder.cpp src/Core/Logging.cpp src/Core/Audio/OpusEncoder.cpp)
         target_link_libraries(TestOpusEncoder PRIVATE Qt::Core Qt::Test ${OPUS_TARGET})
         target_include_directories(TestOpusEncoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -541,7 +551,21 @@ if(BUILD_TESTS)
         target_compile_definitions(TestVoiceClient PRIVATE NOMINMAX)
         add_test(NAME VoiceClientTests COMMAND TestVoiceClient)
 
-        if(TARGET ffmpeg)
+        if(ACHERON_VIDEO)
+            qt_add_executable(TestLoopbackCapture tests/tst_LoopbackCapture.cpp src/Core/Logging.cpp src/Core/Audio/LoopbackCapture.cpp)
+            target_link_libraries(TestLoopbackCapture PRIVATE Qt::Core Qt::Test)
+            target_include_directories(TestLoopbackCapture PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src "${CMAKE_CURRENT_SOURCE_DIR}/vendor/miniaudio")
+            if(WIN32)
+                target_link_libraries(TestLoopbackCapture PRIVATE ole32)
+            endif()
+            add_test(NAME LoopbackCaptureTests COMMAND TestLoopbackCapture)
+
+            qt_add_executable(TestH264Sps tests/tst_H264Sps.cpp src/Core/Media/H264Sps.cpp src/Core/Media/VideoEncoder.cpp src/Discord/Voice/VideoDepacketizer.cpp src/Core/Logging.cpp)
+            target_link_libraries(TestH264Sps PRIVATE Qt::Core Qt::Gui Qt::Network Qt::Test ffmpeg)
+            target_compile_definitions(TestH264Sps PRIVATE ACHERON_HAVE_FFMPEG)
+            target_include_directories(TestH264Sps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            add_test(NAME H264SpsTests COMMAND TestH264Sps)
+
             qt_add_executable(TestRtpVideo tests/tst_RtpVideo.cpp src/Discord/Voice/RtpPacket.cpp
                 src/Discord/Voice/VideoDepacketizer.cpp src/Discord/Voice/VideoReceiver.cpp
                 src/Discord/Voice/Rtcp.cpp src/Discord/Voice/TransportFeedback.cpp)
@@ -638,12 +662,6 @@ if(BUILD_TESTS)
         target_include_directories(TestMediaInput PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME MediaInputTests COMMAND TestMediaInput)
 
-        qt_add_executable(TestH264Sps tests/tst_H264Sps.cpp src/Core/Media/H264Sps.cpp src/Core/Media/VideoEncoder.cpp src/Discord/Voice/VideoDepacketizer.cpp src/Core/Logging.cpp)
-        target_link_libraries(TestH264Sps PRIVATE Qt::Core Qt::Gui Qt::Network Qt::Test ffmpeg)
-        target_compile_definitions(TestH264Sps PRIVATE ACHERON_HAVE_FFMPEG)
-        target_include_directories(TestH264Sps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        add_test(NAME H264SpsTests COMMAND TestH264Sps)
-
         qt_add_executable(TestApng tests/tst_Apng.cpp src/Core/ApngDecoder.cpp)
         target_link_libraries(TestApng PRIVATE Qt::Core Qt::Gui Qt::Test ffmpeg)
         target_compile_definitions(TestApng PRIVATE ACHERON_HAVE_FFMPEG)
@@ -667,13 +685,13 @@ if (MSVC)
     if(BUILD_TESTS)
         set(_msvc_test_targets TestMarkdown TestUnicodeEmoji TestOrderedJson TestFrecency TestProto TestProxy TestEmojiGrid TestCdnUrls TestEmbeds TestFavoriteGifs TestVoicePayloads TestStreams TestCalls TestDecodeDemand TestSendQuality)
         if(TARGET TestApng)
-            list(APPEND _msvc_test_targets TestApng TestClips TestMediaInput TestH264Sps)
+            list(APPEND _msvc_test_targets TestApng TestClips TestMediaInput)
         endif()
         if(TARGET TestRtp)
-            list(APPEND _msvc_test_targets TestRtp TestOpusEncoder TestLoopbackCapture TestUdpTransport TestSinkWants TestVoiceClient)
+            list(APPEND _msvc_test_targets TestRtp TestOpusEncoder TestUdpTransport TestSinkWants TestVoiceClient)
         endif()
         if(TARGET TestRtpVideo)
-            list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface TestVideoSend TestVideoEncode TestCameraCapture)
+            list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface TestVideoSend TestVideoEncode TestCameraCapture TestLoopbackCapture TestH264Sps)
         endif()
         foreach(test_target ${_msvc_test_targets})
             target_link_options(${test_target} PRIVATE $<$<CONFIG:Debug>:/INCREMENTAL>)
@@ -733,7 +751,7 @@ if(TARGET ffmpeg)
     target_link_libraries(${PROJECT_NAME} PRIVATE ffmpeg)
     target_compile_definitions(${PROJECT_NAME} PRIVATE ACHERON_HAVE_FFMPEG)
 endif()
-if(ENABLE_VOICE AND TARGET ffmpeg)
+if(ACHERON_VIDEO)
     if(WIN32)
         target_link_libraries(${PROJECT_NAME} PRIVATE ole32)
     endif()
