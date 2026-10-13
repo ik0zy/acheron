@@ -93,7 +93,7 @@ int writeSenderReport(std::span<uint8_t> out, const SenderInfo &info)
     uint8_t *p = out.data();
     writeHeader(p, 0, TYPE_SENDER_REPORT, SENDER_REPORT_SIZE);
     qToBigEndian(info.ssrc, p + 4);
-    qToBigEndian(info.ntpTime, p + 8);
+    qToBigEndian(static_cast<quint64>(info.ntpTime), p + 8);
     qToBigEndian(info.rtpTimestamp, p + 16);
     qToBigEndian(info.packetCount, p + 20);
     qToBigEndian(info.octetCount, p + 24);

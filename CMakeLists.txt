@@ -676,6 +676,16 @@ endif()
 
 qt_add_translations(${PROJECT_NAME} SOURCE_TARGETS ${PROJECT_NAME})
 
+if(NOT MSVC AND QT_VERSION_MAJOR LESS 6)
+    get_property(_qt5_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_qt5_target ${_qt5_targets})
+        get_target_property(_qt5_target_type ${_qt5_target} TYPE)
+        if(_qt5_target_type STREQUAL "EXECUTABLE")
+            target_compile_options(${_qt5_target} PRIVATE -include "${CMAKE_CURRENT_SOURCE_DIR}/src/qt5_compat.h")
+        endif()
+    endforeach()
+endif()
+
 if (MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Debug>:/INCREMENTAL>)
     target_compile_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Debug>:/ZI> $<$<NOT:$<CONFIG:Debug>>:/Zi>)
