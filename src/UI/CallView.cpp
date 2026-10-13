@@ -644,7 +644,7 @@ void CallView::applyOwnCameraState(Tile &tile)
 void CallView::showOwnCameraPreview(const QImage &preview)
 {
     const auto tile = tiles.constFind(userTileId(accountId));
-    if (tile != tiles.constEnd() && !preview.isNull())
+    if (tile != tiles.constEnd() && !preview.isNull() && tile->surface->isVisible())
         presentPicture(tile->surface, mirrored(preview));
 }
 

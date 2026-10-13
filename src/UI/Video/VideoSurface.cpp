@@ -1255,6 +1255,8 @@ void VideoSurface::setCaption(const QString &text)
 
 void VideoSurface::setPlaceholder(const QPixmap &avatar)
 {
+    if (avatar.cacheKey() == placeholder.cacheKey())
+        return;
     placeholder = avatar;
     refreshOverlays();
 }
