@@ -23,6 +23,9 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <deque>
+#include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -133,6 +136,30 @@ struct SyntheticCamera
     std::atomic<int> picturesGiven{ 0 };
     std::mutex mutex;
     QString openedWithId;
+
+    // Each is done as the camera is asked for one of its coming pictures, the first at the next
+    // one, on the thread that asks. No sleep puts something between two pictures as surely.
+    void atComingPictures(std::initializer_list<std::function<void()>> each)
+    {
+        std::lock_guard lock(mutex);
+        dueAtComingPictures.insert(dueAtComingPictures.end(), each);
+    }
+
+    void doWhatIsDueAtThisPicture()
+    {
+        std::function<void()> due;
+        {
+            std::lock_guard lock(mutex);
+            if (dueAtComingPictures.empty())
+                return;
+            due = std::move(dueAtComingPictures.front());
+            dueAtComingPictures.pop_front();
+        }
+        due();
+    }
+
+private:
+    std::deque<std::function<void()>> dueAtComingPictures;
 };
 
 void paint(AVFrame *picture, const SyntheticCamera &camera, int index)
@@ -239,6 +266,7 @@ public:
     {
         if (camera->lostAfter && given >= *camera->lostAfter)
             return Status::Ended;
+        camera->doWhatIsDueAtThisPicture();
 
         const auto interval = std::chrono::duration_cast<Clock::duration>(std::chrono::microseconds(1'000'000 / camera->framerate));
         const qint64 newestTaken = (Clock::now() - openedAt) / interval;
@@ -999,7 +1027,6 @@ void TestCameraCapture::aNewBitrateAndSizeTogetherCostOneKeyFrame()
     SKIP_WITHOUT_AN_ENCODER(codec);
     constexpr int CHANGES = 5;
     constexpr int LOWER_BITRATE = 300'000;
-    constexpr int BETWEEN_THE_TWO_MS = 20;
     const QSize larger(640, 360);
     const QSize smaller(480, 270);
 
@@ -1016,18 +1043,17 @@ void TestCameraCapture::aNewBitrateAndSizeTogetherCostOneKeyFrame()
         const QSize size = toSmaller ? smaller : larger;
         const int bitrate = toSmaller ? LOWER_BITRATE : BITRATE;
         const size_t atChange = record.frames.size();
-        // At once, and with time for a picture to come between the two, in either order.
+        // At once, and with one picture between the two, in either order. Two pictures between
+        // them would be a change of each on its own.
+        const auto newBitrate = [&pipeline, bitrate] { pipeline.setBitrate(bitrate); };
+        const auto newSize = [&pipeline, size] { pipeline.setEncoding(size, 30); };
         if (change % 3 == 0) {
-            pipeline.setBitrate(bitrate);
-            pipeline.setEncoding(size, 30);
+            newBitrate();
+            newSize();
         } else if (change % 3 == 1) {
-            pipeline.setBitrate(bitrate);
-            QThread::msleep(BETWEEN_THE_TWO_MS);
-            pipeline.setEncoding(size, 30);
+            camera->atComingPictures({ newBitrate, newSize });
         } else {
-            pipeline.setEncoding(size, 30);
-            QThread::msleep(BETWEEN_THE_TWO_MS);
-            pipeline.setBitrate(bitrate);
+            camera->atComingPictures({ newSize, newBitrate });
         }
         QTRY_VERIFY_WITH_TIMEOUT(record.frames.size() >= atChange + 20, 3000);
         QVERIFY2(record.keyFramesFrom(atChange) == 1, qPrintable(QStringLiteral("change %1 made %2 key frames").arg(change).arg(record.keyFramesFrom(atChange))));
