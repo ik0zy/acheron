@@ -1,12 +1,12 @@
 # What sharing a screen and its sound needs on Linux beyond ffmpeg, normalized into a single
 # INTERFACE target named `linuxcapture`. Each part is optional: a build without one compiles
-# and offers that much less.
+# and offers that much less. None is looked for in a build without cameras and screen shares.
 #   libpipewire-0.3  the portal's pictures, and what programs are playing
 #   Qt DBus          asking the desktop portal for a screen or a window
 #   xcb              listing an X11 display's screens and windows
 
 add_library(linuxcapture INTERFACE)
-if(NOT UNIX OR APPLE)
+if(NOT UNIX OR APPLE OR NOT ENABLE_VIDEO OR NOT ENABLE_VOICE)
     return()
 endif()
 

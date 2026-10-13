@@ -373,9 +373,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libcurl4-openssl-dev libsecret-1-dev zlib1g-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
-            libavfilter-dev libavdevice-dev libpipewire-0.3-dev libxcb1-dev libxcb-randr0-dev \
-            libxcb-composite0-dev
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev
+
+      # Left out of the build without video, which has to do without them.
+      - name: Install what cameras and screen shares need
+        if: matrix.video == 'ON'
+        run: |
+          sudo apt-get install -y libavfilter-dev libavdevice-dev libpipewire-0.3-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-composite0-dev
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
