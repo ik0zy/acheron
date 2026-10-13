@@ -95,8 +95,13 @@ jobs:
       - name: Build
         run: cmake --build build --config ${{ matrix.build_type }} --parallel
 
+      # The voice client's tests load the curl-impersonate DLL, which is only put beside the
+      # executables when the artifact is made. Without it Windows shows a dialog and waits.
       - name: Test
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 600
+        shell: pwsh
+        run: |
+          $env:PATH = "${{ github.workspace }}/curl-impersonate/lib;$env:PATH"
+          ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 600
 
       - name: Deploy Qt
         shell: pwsh
@@ -298,7 +303,10 @@ jobs:
         run: cmake --build build --config MinSizeRel --parallel
 
       - name: Test
-        run: ctest --test-dir build -C MinSizeRel --output-on-failure --timeout 600
+        shell: pwsh
+        run: |
+          $env:PATH = "${{ github.workspace }}/curl-impersonate/lib;$env:PATH"
+          ctest --test-dir build -C MinSizeRel --output-on-failure --timeout 600
 
       - name: Deploy Qt
         shell: pwsh
