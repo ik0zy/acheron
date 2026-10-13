@@ -20,6 +20,12 @@ extern "C" {
 extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
 }
+#elif defined(ACHERON_HAVE_AVFILTER)
+extern "C" {
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
+}
 #endif
 
 namespace Acheron {
@@ -368,7 +374,154 @@ bool CardScaler::scale(const AVFrame *from, const QRect &area, const Output &out
     return false;
 }
 
-#else // Q_OS_WIN
+#elif defined(ACHERON_HAVE_AVFILTER)
+
+namespace {
+
+enum class Verdict {
+    Untried,
+    Works,
+    RuledOut,
+};
+std::atomic<Verdict> verdict{ Verdict::Untried };
+
+} // namespace
+
+struct CardScaler::Card
+{
+    ~Card()
+    {
+        release();
+        av_frame_free(&cut);
+    }
+
+    bool scale(const AVFrame *from, const QRect &area, const Output &wanted, AVFrame *into);
+    bool build(const AVFrame *from);
+    void release();
+
+    AVBufferRef *device = nullptr;
+    Output output;
+    QSize sourceSize;
+    AVPixelFormat sourceFormat = AV_PIX_FMT_NONE;
+    AVFilterGraph *graph = nullptr;
+    AVFilterContext *source = nullptr;
+    AVFilterContext *sink = nullptr;
+    AVFrame *cut = av_frame_alloc();
+    // What the card would not do, for the log.
+    const char *refused = "";
+    int refusedWith = 0;
+};
+
+void CardScaler::Card::release()
+{
+    avfilter_graph_free(&graph);
+    source = nullptr;
+    sink = nullptr;
+    av_buffer_unref(&device);
+}
+
+bool CardScaler::Card::scale(const AVFrame *from, const QRect &area, const Output &wanted, AVFrame *into)
+{
+    const auto *frames = reinterpret_cast<const AVHWFramesContext *>(from->hw_frames_ctx->data);
+    const QSize size(from->width, from->height);
+    if (!graph || device->data != frames->device_ref->data || !(wanted == output) || size != sourceSize || frames->sw_format != sourceFormat) {
+        release();
+        device = av_buffer_ref(frames->device_ref);
+        output = wanted;
+        sourceSize = size;
+        sourceFormat = frames->sw_format;
+        if (!build(from))
+            return false;
+    }
+
+    const QRect taken = area & QRect(QPoint(0, 0), size);
+    av_frame_unref(cut);
+    refused = "it would not take the picture";
+    refusedWith = av_frame_ref(cut, from);
+    if (refusedWith < 0)
+        return false;
+    cut->crop_left = static_cast<size_t>(taken.left());
+    cut->crop_top = static_cast<size_t>(taken.top());
+    cut->crop_right = static_cast<size_t>(size.width() - taken.left() - taken.width());
+    cut->crop_bottom = static_cast<size_t>(size.height() - taken.top() - taken.height());
+    cut->color_range = AVCOL_RANGE_JPEG;
+
+    refusedWith = av_buffersrc_add_frame_flags(source, cut, AV_BUFFERSRC_FLAG_PUSH | AV_BUFFERSRC_FLAG_NO_CHECK_FORMAT);
+    if (refusedWith < 0)
+        return false;
+    av_frame_unref(into);
+    refused = "its video processor made no picture";
+    refusedWith = av_buffersink_get_frame(sink, into);
+    return refusedWith >= 0;
+}
+
+bool CardScaler::Card::build(const AVFrame *from)
+{
+    refused = "this ffmpeg has no scale_vaapi";
+    refusedWith = 0;
+    const AVFilter *scaler = avfilter_get_by_name("scale_vaapi");
+    graph = scaler ? avfilter_graph_alloc() : nullptr;
+    if (!graph)
+        return false;
+
+    refused = "it made no video processor";
+    source = avfilter_graph_alloc_filter(graph, avfilter_get_by_name("buffer"), "in");
+    AVBufferSrcParameters *parameters = av_buffersrc_parameters_alloc();
+    parameters->format = AV_PIX_FMT_VAAPI;
+    parameters->width = from->width;
+    parameters->height = from->height;
+    parameters->time_base = { 1, 90000 };
+    parameters->hw_frames_ctx = from->hw_frames_ctx;
+    refusedWith = av_buffersrc_parameters_set(source, parameters);
+    av_free(parameters);
+    if (refusedWith >= 0)
+        refusedWith = avfilter_init_dict(source, nullptr);
+
+    const QByteArray settings = QStringLiteral("w=%1:h=%2:format=nv12:out_color_matrix=%3:out_range=limited").arg(output.size.width()).arg(output.size.height()).arg(QLatin1String(output.bt601 ? "smpte170m" : "bt709")).toLatin1();
+    AVFilterContext *scale = nullptr;
+    if (refusedWith >= 0)
+        refusedWith = avfilter_graph_create_filter(&scale, scaler, "scale", settings.constData(), nullptr, graph);
+    if (refusedWith >= 0)
+        refusedWith = avfilter_graph_create_filter(&sink, avfilter_get_by_name("buffersink"), "out", nullptr, nullptr, graph);
+    if (refusedWith >= 0)
+        refusedWith = avfilter_link(source, 0, scale, 0);
+    if (refusedWith >= 0)
+        refusedWith = avfilter_link(scale, 0, sink, 0);
+    if (refusedWith >= 0)
+        refusedWith = avfilter_graph_config(graph, nullptr);
+    return refusedWith >= 0;
+}
+
+CardScaler::CardScaler() : card(std::make_unique<Card>()) {}
+
+CardScaler::~CardScaler() = default;
+
+bool CardScaler::usable()
+{
+    return verdict != Verdict::RuledOut;
+}
+
+bool CardScaler::scale(const AVFrame *from, const QRect &area, const Output &output, const QRect &placed, AVFrame *into)
+{
+    if (from->format != AV_PIX_FMT_VAAPI || !from->hw_frames_ctx || output.size.isEmpty() || placed != QRect(QPoint(0, 0), output.size))
+        return false;
+
+    Verdict untried = Verdict::Untried;
+    if (card->scale(from, area, output, into)) {
+        verdict.compare_exchange_strong(untried, Verdict::Works);
+        return true;
+    }
+
+    const QString reason = QStringLiteral("%1 (%2)").arg(QLatin1String(card->refused)).arg(card->refusedWith);
+    if (verdict.compare_exchange_strong(untried, Verdict::RuledOut))
+        qCInfo(LogVideo).noquote() << "The graphics card does not scale pictures:" << reason << "; they are read back and scaled in software";
+    else if (verdict == Verdict::Works)
+        qCWarning(LogVideo).noquote() << "The graphics card did not scale a picture:" << reason;
+    card->release();
+    return false;
+}
+
+#else
 
 struct CardScaler::Card
 {
@@ -392,7 +545,8 @@ bool CardScaler::scale(const AVFrame *, const QRect &, const Output &, const QRe
 
 bool CardScaler::scale(const AVFrame *from, const Output &output, AVFrame *into)
 {
-    return scale(from, QRect(0, 0, from->width, from->height), output, QRect(QPoint(0, 0), output.size), into);
+    const QRect area(static_cast<int>(from->crop_left), static_cast<int>(from->crop_top), from->width - static_cast<int>(from->crop_left + from->crop_right), from->height - static_cast<int>(from->crop_top + from->crop_bottom));
+    return scale(from, area, output, QRect(QPoint(0, 0), output.size), into);
 }
 
 } // namespace Video

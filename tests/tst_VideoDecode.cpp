@@ -11,6 +11,7 @@
 #include <QTest>
 #include <QThread>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -36,7 +37,8 @@ struct CodecCase
 {
     VideoCodec codec;
     AVCodecID id;
-    const char *encoder;
+    // Tried in turn: not every ffmpeg has the same ones.
+    std::array<const char *, 2> encoders;
 };
 
 struct EncodedFrame
@@ -51,7 +53,11 @@ std::vector<EncodedFrame> encodeClip(const CodecCase &codecCase)
 {
     std::vector<EncodedFrame> frames;
 
-    const AVCodec *encoder = avcodec_find_encoder_by_name(codecCase.encoder);
+    const AVCodec *encoder = nullptr;
+    for (const char *name : codecCase.encoders) {
+        if (!encoder && name)
+            encoder = avcodec_find_encoder_by_name(name);
+    }
     if (!encoder)
         return frames;
 
@@ -254,10 +260,10 @@ private:
 void TestVideoDecode::codecCases()
 {
     QTest::addColumn<CodecCase>("codecCase");
-    QTest::newRow("H264") << CodecCase{ VideoCodec::H264, AV_CODEC_ID_H264, "libopenh264" };
-    QTest::newRow("H265") << CodecCase{ VideoCodec::H265, AV_CODEC_ID_HEVC, "libkvazaar" };
-    QTest::newRow("VP8") << CodecCase{ VideoCodec::VP8, AV_CODEC_ID_VP8, "libvpx" };
-    QTest::newRow("AV1") << CodecCase{ VideoCodec::AV1, AV_CODEC_ID_AV1, "libaom-av1" };
+    QTest::newRow("H264") << CodecCase{ VideoCodec::H264, AV_CODEC_ID_H264, { "libopenh264", "libx264" } };
+    QTest::newRow("H265") << CodecCase{ VideoCodec::H265, AV_CODEC_ID_HEVC, { "libkvazaar", "libx265" } };
+    QTest::newRow("VP8") << CodecCase{ VideoCodec::VP8, AV_CODEC_ID_VP8, { "libvpx" } };
+    QTest::newRow("AV1") << CodecCase{ VideoCodec::AV1, AV_CODEC_ID_AV1, { "libaom-av1" } };
 }
 
 void TestVideoDecode::decodableCodecsAreOffered()
@@ -392,7 +398,7 @@ void TestVideoDecode::hardwareDecodesOrGivesWayToSoftware()
 
 void TestVideoDecode::aDiscardedQueueStartsOverAtAKeyframe()
 {
-    const CodecCase vp8{ VideoCodec::VP8, AV_CODEC_ID_VP8, "libvpx" };
+    const CodecCase vp8{ VideoCodec::VP8, AV_CODEC_ID_VP8, { "libvpx" } };
     if (!Core::Media::decodableVideoCodecs().contains(vp8.codec))
         QSKIP("this ffmpeg cannot decode the codec");
     const std::vector<EncodedFrame> clip = encodeClip(vp8);
@@ -428,7 +434,7 @@ void TestVideoDecode::aDiscardedQueueStartsOverAtAKeyframe()
 
 void TestVideoDecode::aQueueThatHasWaitedTooLongIsDiscarded()
 {
-    const CodecCase vp8{ VideoCodec::VP8, AV_CODEC_ID_VP8, "libvpx" };
+    const CodecCase vp8{ VideoCodec::VP8, AV_CODEC_ID_VP8, { "libvpx" } };
     if (!Core::Media::decodableVideoCodecs().contains(vp8.codec))
         QSKIP("this ffmpeg cannot decode the codec");
     const std::vector<EncodedFrame> clip = encodeClip(vp8);
@@ -463,7 +469,7 @@ void TestVideoDecode::aQueueThatHasWaitedTooLongIsDiscarded()
 
 void TestVideoDecode::aDamagedStreamIsNotHeldAgainstTheHardware()
 {
-    const CodecCase h264{ VideoCodec::H264, AV_CODEC_ID_H264, "libopenh264" };
+    const CodecCase h264{ VideoCodec::H264, AV_CODEC_ID_H264, { "libopenh264", "libx264" } };
     const std::vector<EncodedFrame> clip = encodeClip(h264);
     if (clip.empty())
         QSKIP("this ffmpeg has no encoder for the codec");

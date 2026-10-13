@@ -40,10 +40,26 @@ struct VideoEncoderCandidate;
 // machine, by the same trial. Empty when none does.
 [[nodiscard]] QString videoEncoderFor(Discord::Voice::VideoCodec codec);
 
-// The size the named encoder codes a picture of `size` as. All but one code it as it is. AMD's
+// The size the named encoder codes a picture of `size` as. All but two code it as it is. AMD's
 // AV1 encoder, on the cards that code it in whole blocks of 64 by 16, fills the last blocks
 // with black, and `av1_amf` is taken to be on such a card: the only kind it was measured on.
+// `av1_vaapi` is asked in its trial, and taken to be on one unless it codes every size it is
+// tried with as it is.
 [[nodiscard]] QSize codedSize(const QString &encoderName, const QSize &size);
+
+// The size an AV1 key frame's sequence header says its pictures are coded at. Empty when the
+// frame has none that can be read, or one that says when pictures are to be shown.
+[[nodiscard]] QSize av1CodedSize(const std::vector<uint8_t> &keyFrame);
+
+// A picture of an encoder's trial: the size it was given at and the size it was coded at.
+struct Av1SizeProbe
+{
+    QSize given;
+    QSize coded;
+};
+// Whether an encoder whose trial went this way codes every size as it is: every picture of it
+// did, and there was one.
+[[nodiscard]] bool codesEverySizeAsItIs(const QList<Av1SizeProbe> &probes);
 
 inline constexpr int MOST_ROWS_ADDED = 8;
 // Whether a picture of `size` may be sent coded as `coded`. What is added is black to every
@@ -153,8 +169,9 @@ public:
     [[nodiscard]] bool hasEncoder() const { return candidate != nullptr; }
     // What the encoder the next picture goes to would code a picture of `size` as.
     [[nodiscard]] QSize codedSize(const QSize &size) const;
-    // Whether the encoder the next picture goes to takes NV12 pictures as Direct3D 11 frames,
-    // and whether it takes the screen's own BGRA ones as well, converting them itself to the
+    // Whether the encoder the next picture goes to takes NV12 pictures as frames on the graphics
+    // card (Direct3D 11's on Windows; elsewhere VAAPI's, and CUDA's for NVIDIA's encoders), and
+    // whether it takes the screen's own BGRA ones as well, converting them itself to the
     // colours the frame is marked with.
     [[nodiscard]] bool takesCardFrames() const;
     [[nodiscard]] bool takesRgbCardFrames() const;

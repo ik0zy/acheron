@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstring>
@@ -50,7 +51,7 @@ struct VideoEncoderCandidate
     VideoCodec codec;
     EncoderFamily family;
     bool hardware;
-    // Which pictures it takes as Direct3D 11 frames: NV12 ones, and the screen's own BGRA.
+    // Which pictures it takes as frames on the graphics card: NV12 ones, and the screen's own BGRA.
     bool takesCardFrames;
     bool takesRgbCardFrames;
     // Whether a new bit rate written into its context is picked up while it runs.
@@ -84,13 +85,13 @@ constexpr std::array CANDIDATES = {
 };
 #else
 constexpr std::array CANDIDATES = {
-    VideoEncoderCandidate{ "av1_vaapi", "av1_vaapi", VideoCodec::AV1, EncoderFamily::Vaapi, true, false, false, false },
-    VideoEncoderCandidate{ "av1_nvenc", "av1_nvenc", VideoCodec::AV1, EncoderFamily::Nvenc, true, false, false, true },
-    VideoEncoderCandidate{ "hevc_vaapi", "hevc_vaapi", VideoCodec::H265, EncoderFamily::Vaapi, true, false, false, false },
-    VideoEncoderCandidate{ "hevc_nvenc", "hevc_nvenc", VideoCodec::H265, EncoderFamily::Nvenc, true, false, false, true },
-    VideoEncoderCandidate{ "h264_vaapi", "h264_vaapi", VideoCodec::H264, EncoderFamily::Vaapi, true, false, false, false },
-    VideoEncoderCandidate{ "h264_nvenc", "h264_nvenc", VideoCodec::H264, EncoderFamily::Nvenc, true, false, false, true },
-    VideoEncoderCandidate{ "libx264", "libx264", VideoCodec::H264, EncoderFamily::X264, false, false, false, false },
+    VideoEncoderCandidate{ "av1_vaapi", "av1_vaapi", VideoCodec::AV1, EncoderFamily::Vaapi, true, true, false, false },
+    VideoEncoderCandidate{ "av1_nvenc", "av1_nvenc", VideoCodec::AV1, EncoderFamily::Nvenc, true, true, false, true },
+    VideoEncoderCandidate{ "hevc_vaapi", "hevc_vaapi", VideoCodec::H265, EncoderFamily::Vaapi, true, true, false, false },
+    VideoEncoderCandidate{ "hevc_nvenc", "hevc_nvenc", VideoCodec::H265, EncoderFamily::Nvenc, true, true, false, true },
+    VideoEncoderCandidate{ "h264_vaapi", "h264_vaapi", VideoCodec::H264, EncoderFamily::Vaapi, true, true, false, false },
+    VideoEncoderCandidate{ "h264_nvenc", "h264_nvenc", VideoCodec::H264, EncoderFamily::Nvenc, true, true, false, true },
+    VideoEncoderCandidate{ "libx264", "libx264", VideoCodec::H264, EncoderFamily::X264, false, false, false, true },
     VideoEncoderCandidate{ "libopenh264", "libopenh264", VideoCodec::H264, EncoderFamily::OpenH264, false, false, false, false },
     VideoEncoderCandidate{ "libvpx", "libvpx", VideoCodec::VP8, EncoderFamily::Vpx, false, false, false, false },
 };
@@ -130,6 +131,7 @@ constexpr uint8_t AV1_CONFIGURATION_MARKER = 0x81;
 constexpr size_t AV1_CONFIGURATION_SIZE = 4;
 
 const QLatin1String AMF_AV1_ENCODER("av1_amf");
+const QLatin1String VAAPI_AV1_ENCODER("av1_vaapi");
 // The blocks AMD's hardware codes AV1 in where it is not free to code any size. Rows that stop
 // half a block short are made up with two and not eight, so that 1080 lines come out as 1082:
 // ffmpeg's amfenc_av1.c has the same exception in the crop it reports ("special processing
@@ -142,6 +144,10 @@ constexpr std::array SIZES_NOT_OF_WHOLE_BLOCKS = { QSize(640, 360), QSize(1000, 
 
 constexpr int TRIAL_WIDTH = 640;
 constexpr int TRIAL_HEIGHT = 360;
+// A size that blocks of 64 by 16 and blocks of 8 by 2 each make another of, as the trial's own
+// is one for the first only. No narrower than 320, the least a Radeon of the 9000 series codes.
+constexpr QSize TRIAL_ODD_SIZE(364, 196);
+std::atomic<bool> vaapiAv1CodesEverySizeAsItIs{ false };
 constexpr int TRIAL_PICTURES = 30;
 constexpr int TRIAL_BITRATE = 1'000'000;
 // The pictures the rate is measured over: the ones after rate control has got over the key frame.
@@ -314,7 +320,7 @@ bool isAv1KeyFrame(std::span<const uint8_t> frameHeader, std::span<const uint8_t
 }
 
 // The thread counts libwebrtc gives libvpx, short of the eight it uses on the largest machines.
-int vpxThreads(int width, int height)
+int softwareThreads(int width, int height)
 {
     const int cores = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
     const int pixels = width * height;
@@ -354,6 +360,20 @@ void paintTrialPicture(AVFrame *picture, int index)
     }
     for (int plane = 1; plane < AV_NUM_DATA_POINTERS && picture->data[plane]; plane++)
         memset(picture->data[plane], 128, static_cast<size_t>(picture->linesize[plane]) * (TRIAL_HEIGHT / 2));
+}
+
+// What the encoder codes one picture of a size as, by its own account. Empty when it has none.
+QSize codedInTrial(VideoEncoder &encoder, const QSize &size, int64_t timestamp)
+{
+    AVFrame *picture = av_frame_alloc();
+    picture->format = encoder.softwareFormat();
+    picture->width = size.width();
+    picture->height = size.height();
+    std::vector<EncodedVideoFrame> frames;
+    if (av_frame_get_buffer(picture, 0) >= 0)
+        encoder.encode(picture, timestamp, frames);
+    av_frame_free(&picture);
+    return frames.empty() ? QSize() : av1CodedSize(frames.front().data);
 }
 
 bool encodesTrialPictures(const VideoEncoderCandidate &candidate)
@@ -398,6 +418,16 @@ bool encodesTrialPictures(const VideoEncoderCandidate &candidate)
     if (rate > TRIAL_BITRATE * TRIAL_MOST_OF_THE_RATE || rate < TRIAL_BITRATE * TRIAL_LEAST_OF_THE_RATE) {
         qCWarning(LogVideo) << "Encoder" << candidate.label << "was asked for" << TRIAL_BITRATE / 1000 << "kbps and made" << qRound(rate / 1000);
         return false;
+    }
+
+    if (QLatin1String(candidate.label) == VAAPI_AV1_ENCODER) {
+        const QList<Av1SizeProbe> probes = {
+            { QSize(TRIAL_WIDTH, TRIAL_HEIGHT), av1CodedSize(frames.front().data) },
+            { TRIAL_ODD_SIZE, codedInTrial(encoder, TRIAL_ODD_SIZE, int64_t(TRIAL_PICTURES) * RTP_CLOCK / settings.framerate) },
+        };
+        vaapiAv1CodesEverySizeAsItIs = codesEverySizeAsItIs(probes);
+        for (const Av1SizeProbe &probe : probes)
+            qCInfo(LogVideo) << "Encoder" << candidate.label << "codes" << probe.given << "as" << probe.coded;
     }
     return true;
 }
@@ -476,8 +506,56 @@ QString videoEncoderFor(Discord::Voice::VideoCodec codec)
     return chosen == CANDIDATES.end() ? QString() : QString::fromLatin1(chosen->label);
 }
 
+QSize av1CodedSize(const std::vector<uint8_t> &keyFrame)
+{
+    const std::vector<Obu> obus = splitObus(keyFrame);
+    const auto header = std::find_if(obus.begin(), obus.end(), [](const Obu &obu) { return obu.type == OBU_SEQUENCE_HEADER; });
+    if (header == obus.end())
+        return {};
+
+    size_t at = header->payload * 8;
+    bool ended = false;
+    const auto bits = [&](uint32_t count) {
+        uint32_t value = 0;
+        for (; count > 0; count--, at++) {
+            ended = ended || at >= header->end * 8;
+            value = value << 1 | (ended ? 0u : (keyFrame[at / 8] >> (7 - at % 8)) & 1u);
+        }
+        return value;
+    };
+
+    // sequence_header_obu() of the AV1 specification, section 5.5.1, as far as the size.
+    bits(4);
+    const bool reducedStillPicture = bits(1);
+    const bool timingInfo = !reducedStillPicture && bits(1);
+    if (timingInfo)
+        return {};
+    const bool displayDelays = !reducedStillPicture && bits(1);
+    for (uint32_t operatingPoints = reducedStillPicture ? 0 : bits(5) + 1; operatingPoints > 0; operatingPoints--) {
+        bits(12);
+        const bool hasTier = bits(5) > 7;
+        bits(hasTier ? 1 : 0);
+        if (displayDelays && bits(1))
+            bits(4);
+    }
+    if (reducedStillPicture)
+        bits(5);
+    const uint32_t widthBits = bits(4) + 1;
+    const uint32_t heightBits = bits(4) + 1;
+    const int width = static_cast<int>(bits(widthBits)) + 1;
+    const int height = static_cast<int>(bits(heightBits)) + 1;
+    return ended ? QSize() : QSize(width, height);
+}
+
+bool codesEverySizeAsItIs(const QList<Av1SizeProbe> &probes)
+{
+    return !probes.isEmpty() && std::all_of(probes.begin(), probes.end(), [](const Av1SizeProbe &probe) { return probe.coded == probe.given; });
+}
+
 QSize codedSize(const QString &encoderName, const QSize &size)
 {
+    if (encoderName == VAAPI_AV1_ENCODER)
+        return videoEncoderWorks(encoderName) && vaapiAv1CodesEverySizeAsItIs ? size : inWholeAmfAv1Blocks(size);
     return encoderName == AMF_AV1_ENCODER ? inWholeAmfAv1Blocks(size) : size;
 }
 
@@ -525,7 +603,7 @@ VideoEncoder::~VideoEncoder()
 
 QSize VideoEncoder::codedSize(const QSize &size) const
 {
-    return candidate && QLatin1String(candidate->label) == AMF_AV1_ENCODER ? inWholeAmfAv1Blocks(size) : size;
+    return candidate ? Media::codedSize(QString::fromLatin1(candidate->label), size) : size;
 }
 
 bool VideoEncoder::takesCardFrames() const
@@ -965,7 +1043,9 @@ AVCodecContext *VideoEncoder::configured(const AVFrame *frame, int h264Profile) 
         av_opt_set(options, "rate_control", "cbr", 0);
         break;
     case EncoderFamily::Vaapi:
-        av_opt_set(options, "rc_mode", "CBR", 0);
+        // Mesa fills the frames of a constant bit rate up to it, those of a still screen too.
+        // A variable one whose most is what it aims at holds the rate as well and fills nothing.
+        av_opt_set(options, "rc_mode", "VBR", 0);
         av_opt_set_int(options, "async_depth", 1, 0);
         break;
     case EncoderFamily::Vpx:
@@ -974,7 +1054,7 @@ AVCodecContext *VideoEncoder::configured(const AVFrame *frame, int h264Profile) 
         made->rc_initial_buffer_occupancy = settings.bitrate / 2;
         made->qmin = VP8_MIN_QUANTIZER;
         made->qmax = VP8_MAX_QUANTIZER;
-        made->thread_count = vpxThreads(frame->width, frame->height);
+        made->thread_count = softwareThreads(frame->width, frame->height);
         av_opt_set(options, "deadline", "realtime", 0);
         av_opt_set_int(options, "cpu-used", -6, 0);
         // Left alone it holds back 25 frames.
@@ -987,6 +1067,9 @@ AVCodecContext *VideoEncoder::configured(const AVFrame *frame, int h264Profile) 
         av_opt_set_int(options, "max-intra-rate", std::max(300, 30 * settings.framerate), 0);
         break;
     case EncoderFamily::X264:
+        // Left alone it makes a slice for every core, each of which costs bits and holds the
+        // rate further below what was asked.
+        made->thread_count = softwareThreads(frame->width, frame->height);
         av_opt_set(options, "preset", "veryfast", 0);
         av_opt_set(options, "tune", "zerolatency", 0);
         av_opt_set_int(options, "forced-idr", 1, 0);
@@ -1002,7 +1085,7 @@ bool VideoEncoder::open(const AVFrame *frame)
 {
     close();
     reopenWanted = false;
-    if (candidate->family == EncoderFamily::Vaapi && !prepareUpload(frame))
+    if (candidate->family == EncoderFamily::Vaapi && !frame->hw_frames_ctx && !prepareUpload(frame))
         return false;
 
     const size_t profiles = candidate->codec == VideoCodec::H264 ? H264_PROFILES.size() : 1;
