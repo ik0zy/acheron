@@ -101,6 +101,8 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "${{ github.workspace }}/curl-impersonate/lib;$env:PATH"
+          # Without this Qt Test writes its report to the debugger, and a failure shows nothing here.
+          $env:QT_FORCE_STDERR_LOGGING = "1"
           ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 600
 
       - name: Deploy Qt
@@ -190,6 +192,8 @@ jobs:
         run: cmake --build build --config RelWithDebInfo --parallel
 
       - name: Test
+        env:
+          QT_FORCE_STDERR_LOGGING: 1
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure --timeout 600
 
       - name: Deploy Qt
@@ -306,6 +310,8 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "${{ github.workspace }}/curl-impersonate/lib;$env:PATH"
+          # Without this Qt Test writes its report to the debugger, and a failure shows nothing here.
+          $env:QT_FORCE_STDERR_LOGGING = "1"
           ctest --test-dir build -C MinSizeRel --output-on-failure --timeout 600
 
       - name: Deploy Qt

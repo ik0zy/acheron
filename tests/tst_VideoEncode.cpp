@@ -2422,6 +2422,8 @@ void TestVideoEncode::thePipelineSharesTheScreen_data()
 
 void TestVideoEncode::thePipelineSharesTheScreen()
 {
+    if (Core::Media::encodableVideoCodecs().isEmpty())
+        QSKIP("this machine has no encoder");
     QFETCH(EncoderCase, encoderCase);
     QFETCH(Core::Video::CaptureMethod, method);
     using namespace Core::Video;
