@@ -310,7 +310,7 @@ void CameraSender::onSendStats(const VideoSendStats &sent)
     networkStats = sent;
     if (!pipelineStarted)
         return;
-    plan.setReceiverLimit(static_cast<qint64>(sent.receiverEstimateBps));
+    plan.setReceiverLimit(Video::estimatedCeiling(sent.receiverEstimateBps, sent.delayEstimateBps));
     plan.reportLoss(sent.lossFraction, clock.elapsed());
     applyPlan();
 }

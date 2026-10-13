@@ -57,6 +57,8 @@ void VoiceClient::cleanupVideo()
     delete localKeyframeTimer;
     localKeyframeTimer = nullptr;
     videoSender.reset();
+    sendEstimator = SendSideEstimator();
+    reportedDelayEstimateBps = 0;
     localVideo.reset();
     videoBitrate = 0;
     videoReceiverEstimateBps = 0;
@@ -426,6 +428,8 @@ bool VoiceClient::prepareVideoSender()
         first.pictureId = static_cast<uint16_t>(random->bounded(0x8000));
         first.transportSequence = 1;
         videoSender = std::make_unique<VideoSendStream>(ssrc, rtxSsrc, first);
+        sendEstimator.restart(first.transportSequence);
+        videoSender->numberWith(&sendEstimator);
         videoSender->setPacingFactor(params.streamContext ? VideoSendStream::SCREEN_PACING_FACTOR : VideoSendStream::CAMERA_PACING_FACTOR);
     }
 
@@ -657,6 +661,9 @@ void VoiceClient::onVideoSendReportTick()
     stats.keyframeRequests = localKeyframeRequests;
     stats.receivers = videoReceivers;
     stats.receiverEstimateBps = videoReceiverEstimateBps;
+    stats.delayEstimateBps = static_cast<quint64>(sendEstimator.estimate());
+    stats.acknowledgedBps = static_cast<quint64>(sendEstimator.acknowledged());
+    reportedDelayEstimateBps = stats.delayEstimateBps;
 
     if (videoSender) {
         if (videoSender->canReport() && currentState == State::Connected && encryption && udpTransport) {
@@ -716,6 +723,22 @@ void VoiceClient::receiveVideoFeedback(const ReceivedRtcp &received)
     for (const ReceptionReport &report : received.receptionReports) {
         if (report.ssrc == ssrc)
             videoSender->onReceptionReport(report, now);
+    }
+    if (videoSender->stats().roundTripMs >= 0)
+        sendEstimator.setRoundTrip(qint64(videoSender->stats().roundTripMs) * 1000);
+
+    for (const ReceivedRtcp::TransportReport &report : received.transportReports) {
+        if (sendEstimator.reportsTaken() == 0)
+            qCInfo(LogVoice) << "The server reports when this client's video packets reach it";
+        sendEstimator.onReport(report, now);
+    }
+    // Whoever sets the encoder's bitrate hears of it with the statistics, which a way that
+    // has just been found to fall behind is not left to wait for.
+    const quint64 estimate = static_cast<quint64>(sendEstimator.estimate());
+    if (estimate > 0 && (reportedDelayEstimateBps == 0 || estimate < reportedDelayEstimateBps * DELAY_ESTIMATE_STEP) && videoSendReportTimer && videoSendReportTimer->isActive()) {
+        qCDebug(LogVoice) << "The way from here is falling behind: it is taken to carry" << estimate << "bps of the" << sendEstimator.acknowledged() << "the server acknowledges";
+        onVideoSendReportTick();
+        videoSendReportTimer->start(VIDEO_SEND_REPORT_INTERVAL_MS);
     }
 
     const auto keyframeRequests = std::count(received.keyframeRequests.cbegin(), received.keyframeRequests.cend(), ssrc);

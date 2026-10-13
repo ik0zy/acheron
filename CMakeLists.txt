@@ -409,6 +409,7 @@ if(ACHERON_VIDEO)
         src/Discord/Voice/VideoReceiver.cpp
         src/Discord/Voice/VideoPacketizer.cpp
         src/Discord/Voice/VideoSender.cpp
+        src/Discord/Voice/SendSideEstimator.cpp
         src/Discord/Voice/TransportFeedback.cpp
         src/Core/Media/DecodeDemand.cpp
         src/Core/Media/VideoDecoder.cpp
@@ -569,7 +570,7 @@ if(BUILD_TESTS)
             src/Discord/Voice/Socks5UdpAssociation.cpp src/Discord/Voice/TransportFeedback.cpp
             src/Discord/Voice/UdpTransport.cpp src/Discord/Voice/VideoDepacketizer.cpp
             src/Discord/Voice/VideoReceiver.cpp src/Discord/Voice/VoiceClient.cpp
-            src/Discord/Voice/VoiceClientVideo.cpp
+            src/Discord/Voice/VoiceClientVideo.cpp src/Discord/Voice/SendSideEstimator.cpp
             src/Discord/Voice/VideoPacketizer.cpp src/Discord/Voice/VideoSender.cpp
             src/Discord/Voice/VoiceEncryption.cpp src/Discord/Voice/VoiceGateway.cpp)
         target_link_libraries(TestVoiceClient PRIVATE Qt::Core Qt::Network Qt::Test CURL::libcurl ${SODIUM_TARGET} libdave MLSPP::mlspp)
@@ -610,10 +611,18 @@ if(BUILD_TESTS)
             qt_add_executable(TestVideoSend tests/tst_VideoSend.cpp src/Discord/Voice/RtpPacket.cpp
                 src/Discord/Voice/VideoPacketizer.cpp src/Discord/Voice/VideoSender.cpp
                 src/Discord/Voice/VideoDepacketizer.cpp src/Discord/Voice/VideoReceiver.cpp
+                src/Discord/Voice/SendSideEstimator.cpp
                 src/Discord/Voice/Rtcp.cpp src/Discord/Voice/TransportFeedback.cpp)
             target_link_libraries(TestVideoSend PRIVATE Qt::Core Qt::Test ffmpeg libdave MLSPP::mlspp)
             target_include_directories(TestVideoSend PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
             add_test(NAME VideoSendTests COMMAND TestVideoSend)
+
+            qt_add_executable(TestSendSideEstimator tests/tst_SendSideEstimator.cpp
+                src/Discord/Voice/SendSideEstimator.cpp src/Discord/Voice/Rtcp.cpp
+                src/Discord/Voice/TransportFeedback.cpp)
+            target_link_libraries(TestSendSideEstimator PRIVATE Qt::Core Qt::Test)
+            target_include_directories(TestSendSideEstimator PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            add_test(NAME SendSideEstimatorTests COMMAND TestSendSideEstimator)
 
             qt_add_executable(TestVideoEncode tests/tst_VideoEncode.cpp src/Core/Media/VideoEncoder.cpp
                 src/Core/Media/H264Sps.cpp src/Core/Media/VideoDecoder.cpp src/Core/Media/RgbScaler.cpp
@@ -748,7 +757,7 @@ if (MSVC)
             list(APPEND _msvc_test_targets TestRtp TestOpusEncoder TestUdpTransport TestSinkWants TestVoiceClient)
         endif()
         if(TARGET TestRtpVideo)
-            list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface TestVideoSend TestVideoEncode TestCameraCapture TestLoopbackCapture TestH264Sps)
+            list(APPEND _msvc_test_targets TestRtpVideo TestVideoDecode TestVideoSurface TestVideoSend TestSendSideEstimator TestVideoEncode TestCameraCapture TestLoopbackCapture TestH264Sps)
         endif()
         foreach(test_target ${_msvc_test_targets})
             target_link_options(${test_target} PRIVATE $<$<CONFIG:Debug>:/INCREMENTAL>)

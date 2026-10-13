@@ -27,8 +27,9 @@ public:
     // One report of the share of packets lost, 0 to 1; a negative share means nothing has
     // been reported yet and is ignored. Returns whether the bitrate changed.
     bool report(double lossFraction, qint64 nowMs);
-    // The receiving side's estimate of what the way carries (REMB), in bits per second; zero
-    // lifts it. A lower one is followed at once. A higher one only once it is a whole step up,
+    // An estimate of what the way carries, in bits per second: the receiving side's (REMB), or
+    // one made from the server's reports. Zero lifts it. A lower one is followed at once. A
+    // higher one only once it is a whole step up,
     // since the estimate moves all the time and every change here can cost a key frame.
     // Returns whether the bitrate changed.
     bool setReceiverLimit(qint64 bitsPerSecond);

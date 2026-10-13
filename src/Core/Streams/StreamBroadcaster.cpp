@@ -593,7 +593,7 @@ void StreamBroadcaster::onSendStats(const VideoSendStats &sent)
     networkStats = sent;
     if (!pipelineStarted)
         return;
-    const bool limited = rate.setReceiverLimit(static_cast<qint64>(sent.receiverEstimateBps));
+    const bool limited = rate.setReceiverLimit(Video::estimatedCeiling(sent.receiverEstimateBps, sent.delayEstimateBps));
     if (rate.report(sent.lossFraction, rateClock.elapsed()) || limited)
         applyBitrateOnceSettled();
 }

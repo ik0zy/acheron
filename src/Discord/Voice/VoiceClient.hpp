@@ -19,6 +19,7 @@
 #include "Core/Snowflake.hpp"
 #include "PacketBuffer.hpp"
 #include "RtpPacket.hpp"
+#include "SendSideEstimator.hpp"
 #include "SinkWants.hpp"
 #include "TransportFeedback.hpp"
 #include "VideoReceiver.hpp"
@@ -88,6 +89,11 @@ struct VideoSendStats
     // The most the receiving side says the way from here carries (REMB). Zero until it has
     // said.
     quint64 receiverEstimateBps = 0;
+    // The most the way carries going by when each packet reached the server, and what the
+    // server last acknowledged receiving. The first is zero until the way has once been
+    // overused, the second until the server has reported for half a second.
+    quint64 delayEstimateBps = 0;
+    quint64 acknowledgedBps = 0;
 };
 
 // What a voice connection's IDENTIFY declares for the account's camera. The official client
@@ -397,6 +403,10 @@ private:
     // Negative until the server has said.
     int videoReceivers = -1;
     quint64 videoReceiverEstimateBps = 0;
+    // Numbers every video packet of the connection, and judges the way from the server's
+    // reports on them.
+    SendSideEstimator sendEstimator;
+    quint64 reportedDelayEstimateBps = 0;
     // What the video is being encoded at, once its sender has said. Zero until then, when the
     // most that was announced stands in.
     int videoBitrate = 0;
@@ -410,6 +420,8 @@ private:
     static constexpr int VIDEO_TICK_MS = 20;
     static constexpr int VIDEO_REPORT_INTERVAL_MS = 1000;
     static constexpr int TRANSPORT_FEEDBACK_INTERVAL_MS = 100;
+    // A delay estimate this much under the one last passed on is passed on at once.
+    static constexpr double DELAY_ESTIMATE_STEP = 0.95;
     // The header extension that carries a packet's transport-wide sequence number.
     static constexpr uint8_t TRANSPORT_SEQUENCE_EXTENSION = 5;
 };

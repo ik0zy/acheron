@@ -81,6 +81,12 @@ private:
     qint64 adopted = 0;
 };
 
+// The lower of the estimates there are of what the way to the server carries, in bits per
+// second: the receiving side's own, and the one made from when each packet reached it. Zero
+// when there is neither. The second is left out when the setting `video/delay_estimate` is
+// false.
+[[nodiscard]] qint64 estimatedCeiling(quint64 receiverEstimate, quint64 delayEstimate);
+
 // The account's own camera. It is captured at one size and rate, and what is encoded of it
 // follows how much of it the viewers want, which the server relays as a number from 0 to 100.
 inline constexpr QSize CAMERA_CAPTURE_SIZE(1280, 720);

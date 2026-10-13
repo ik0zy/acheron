@@ -202,8 +202,9 @@ bool VideoSendStream::write(PacketBuffer &out, const Packet &packet, bool retran
     const uint8_t sendTimeBytes[3] = { static_cast<uint8_t>(sendTime >> 16), static_cast<uint8_t>(sendTime >> 8), static_cast<uint8_t>(sendTime) };
     // The transmission offset is there but always zero, as the official client sends it.
     const uint8_t noOffset[3] = {};
+    const int size = CLEAR_SIZE + EXTENSIONS_SIZE + (retransmission ? RTX_HEADER_SIZE : 0) + static_cast<int>(packet.payload.size());
     uint8_t transportSequence[2];
-    qToBigEndian(nextTransportSequence, transportSequence);
+    qToBigEndian(transport ? transport->numberPacket(nowUs, size) : nextTransportSequence, transportSequence);
     // In the order WebRTC lays them out, which is not the order of their ids.
     const RtpExtension elements[] = { { ABS_SEND_TIME_EXTENSION, sendTimeBytes }, { TRANSMISSION_OFFSET_EXTENSION, noOffset }, { TRANSPORT_SEQUENCE_EXTENSION, transportSequence } };
     uint8_t extensions[EXTENSIONS_SIZE];

@@ -20,6 +20,10 @@ constexpr uint8_t FORMAT_NACK = 1;
 constexpr uint8_t FORMAT_PLI = 1;
 constexpr uint8_t FORMAT_FIR = 4;
 constexpr uint8_t FORMAT_APPLICATION_LAYER = 15;
+constexpr uint8_t FORMAT_TRANSPORT_WIDE = 15;
+constexpr uint8_t PADDING_BIT = 0x20;
+// Past the feedback header: the first number, how many, the reference time and a counter.
+constexpr size_t TRANSPORT_REPORT_HEADER_SIZE = 20;
 constexpr uint8_t RECEIVER_ESTIMATE_NAME[4] = { 'R', 'E', 'M', 'B' };
 // Header, sender, an unused media source, the name, then a count of SSRCs (1) and the rate (3).
 constexpr int RECEIVER_ESTIMATE_SIZE = 20;
@@ -126,6 +130,74 @@ static void readFullIntraRequest(const uint8_t *packet, size_t size, std::vector
         ssrcs.push_back(qFromBigEndian<uint32_t>(packet + at));
 }
 
+// draft-holmer-rmcat-transport-wide-cc-extensions-01, 3.1: a status for each packet, packed
+// into 16-bit chunks, then a delta for each packet that arrived.
+static void readTransportReport(const uint8_t *packet, size_t size, std::vector<ReceivedRtcp::TransportReport> &reports)
+{
+    enum Status : uint8_t {
+        NotReceived,
+        SmallDelta,
+        LargeDelta,
+    };
+
+    if (size < TRANSPORT_REPORT_HEADER_SIZE)
+        return;
+    if (packet[0] & PADDING_BIT) {
+        const size_t padding = packet[size - 1];
+        if (padding == 0 || padding > size - TRANSPORT_REPORT_HEADER_SIZE)
+            return;
+        size -= padding;
+    }
+
+    ReceivedRtcp::TransportReport report;
+    report.mediaSsrc = qFromBigEndian<uint32_t>(packet + 8);
+    report.baseSequence = qFromBigEndian<uint16_t>(packet + 12);
+    const size_t count = qFromBigEndian<uint16_t>(packet + 14);
+    report.referenceTime = static_cast<int32_t>((static_cast<uint32_t>(packet[16]) << 24) | (static_cast<uint32_t>(packet[17]) << 16) | (static_cast<uint32_t>(packet[18]) << 8)) >> 8;
+
+    std::vector<uint8_t> statuses;
+    size_t at = TRANSPORT_REPORT_HEADER_SIZE;
+    while (statuses.size() < count) {
+        if (at + 2 > size)
+            return;
+        const uint16_t chunk = qFromBigEndian<uint16_t>(packet + at);
+        at += 2;
+        if (!(chunk & 0x8000)) {
+            // One status, and how many packets in a row have it.
+            statuses.insert(statuses.end(), chunk & 0x1FFF, static_cast<uint8_t>((chunk >> 13) & 3));
+        } else if (!(chunk & 0x4000)) {
+            for (int bit = 13; bit >= 0; bit--)
+                statuses.push_back(static_cast<uint8_t>((chunk >> bit) & 1));
+        } else {
+            for (int shift = 12; shift >= 0; shift -= 2)
+                statuses.push_back(static_cast<uint8_t>((chunk >> shift) & 3));
+        }
+    }
+    statuses.resize(count);
+
+    report.packets.reserve(count);
+    for (const uint8_t status : statuses) {
+        ReceivedRtcp::TransportReport::Packet reported;
+        if (status == SmallDelta) {
+            if (at + 1 > size)
+                return;
+            reported.received = true;
+            reported.delta = packet[at];
+            at += 1;
+        } else if (status == LargeDelta) {
+            if (at + 2 > size)
+                return;
+            reported.received = true;
+            reported.delta = qFromBigEndian<int16_t>(packet + at);
+            at += 2;
+        } else if (status != NotReceived) {
+            return;
+        }
+        report.packets.push_back(reported);
+    }
+    reports.push_back(std::move(report));
+}
+
 static void readReportBlocks(const uint8_t *packet, size_t size, size_t blocksAt, std::vector<ReceptionReport> &reports)
 {
     const int count = packet[0] & 0x1F;
@@ -200,6 +272,8 @@ ReceivedRtcp parseRtcp(std::span<const uint8_t> compound)
             readReceiverEstimate(p, size, received);
         } else if (p[1] == TYPE_TRANSPORT_FEEDBACK && (p[0] & 0x1F) == FORMAT_NACK && size >= FEEDBACK_HEADER_SIZE) {
             readNack(p, size, received.nacks);
+        } else if (p[1] == TYPE_TRANSPORT_FEEDBACK && (p[0] & 0x1F) == FORMAT_TRANSPORT_WIDE) {
+            readTransportReport(p, size, received.transportReports);
         } else if (p[1] == TYPE_PAYLOAD_FEEDBACK && (p[0] & 0x1F) == FORMAT_PLI && size >= FEEDBACK_HEADER_SIZE) {
             received.keyframeRequests.push_back(qFromBigEndian<uint32_t>(p + 8));
         } else if (p[1] == TYPE_PAYLOAD_FEEDBACK && (p[0] & 0x1F) == FORMAT_FIR && size >= FEEDBACK_HEADER_SIZE) {

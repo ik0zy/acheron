@@ -94,6 +94,8 @@ QStringList sendStatsLines(const Core::Video::BroadcastStats &encoder, const Dis
     lines << (network.lossFraction < 0 ? CallView::tr("Loss: not reported yet") : CallView::tr("Loss: %1%").arg(network.lossFraction * 100.0, 0, 'f', 1));
     if (network.receiverEstimateBps > 0)
         lines << CallView::tr("Receiver's estimate: %1 kbps").arg(network.receiverEstimateBps / 1000);
+    if (network.delayEstimateBps > 0)
+        lines << CallView::tr("Estimate from delays: %1 kbps, of %2 kbps acknowledged").arg(network.delayEstimateBps / 1000).arg(network.acknowledgedBps / 1000);
     return lines;
 }
 

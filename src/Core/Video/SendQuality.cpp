@@ -1,5 +1,7 @@
 #include "Core/Video/SendQuality.hpp"
 
+#include <QSettings>
+
 #include <algorithm>
 #include <cmath>
 
@@ -84,6 +86,15 @@ SendQuality atHeight(const SendQuality &quality, int height, const SharerTier &t
     if (!mayUseQuality(moved, tier))
         moved.framerate = STANDARD_FRAMERATE;
     return moved;
+}
+
+qint64 estimatedCeiling(quint64 receiverEstimate, quint64 delayEstimate)
+{
+    if (!QSettings().value(QStringLiteral("video/delay_estimate"), true).toBool())
+        delayEstimate = 0;
+    if (receiverEstimate == 0 || delayEstimate == 0)
+        return static_cast<qint64>(std::max(receiverEstimate, delayEstimate));
+    return static_cast<qint64>(std::min(receiverEstimate, delayEstimate));
 }
 
 QSize announcedSize(const SendQuality &quality)

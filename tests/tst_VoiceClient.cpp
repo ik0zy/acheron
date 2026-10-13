@@ -5,6 +5,7 @@
 #include "Discord/Voice/DaveSession.hpp"
 #include "Discord/Voice/Rtcp.hpp"
 #include "Discord/Voice/RtpPacket.hpp"
+#include "Discord/Voice/TransportFeedback.hpp"
 #include "Discord/Voice/VideoDepacketizer.hpp"
 #include "Discord/Voice/VideoSender.hpp"
 #include "Discord/Voice/VoiceClient.hpp"
@@ -679,6 +680,7 @@ private slots:
     void theReceiverCountIsPassedOn();
     void whatViewersWantIsPassedOn();
     void aSenderReportAndStatisticsFollowEverySecond();
+    void aWayFoundToFallBehindIsSaidAtOnce();
     void aChangeOfCodecIsTakenUp();
     void h265AndAv1AreSentWhenTheServerNamesThem();
     void aChangeToAv1WaitsForItsKeyframe();
@@ -1243,6 +1245,8 @@ void TestVoiceClient::aSenderReportAndStatisticsFollowEverySecond()
     QCOMPARE(first.roundTripMs, -1);
     QCOMPARE(first.receivers, -1);
     QCOMPARE(first.receiverEstimateBps, quint64(0));
+    QCOMPARE(first.delayEstimateBps, quint64(0));
+    QCOMPARE(first.acknowledgedBps, quint64(0));
 
     // The server answers the report, and says half of what was sent since did not arrive.
     ReceptionReport answer;
@@ -1266,6 +1270,54 @@ void TestVoiceClient::aSenderReportAndStatisticsFollowEverySecond()
     QCOMPARE(second.keyframeRequests, quint64(1));
     QCOMPARE(second.packets, quint64(3));
     QTRY_VERIFY(call.server.senderReports.size() >= 2);
+}
+
+void TestVoiceClient::aWayFoundToFallBehindIsSaidAtOnce()
+{
+    Call call(true);
+    QTRY_VERIFY(call.isUp());
+    call.startVideo();
+    call.client->setVideoBitrate(1'000'000);
+    QSignalSpy statistics(call.client.get(), &VoiceClient::videoSendStatsUpdated);
+
+    // About a megabit for a second and a half: four kilobytes thirty times a second.
+    constexpr int FRAMES = 45;
+    for (int i = 0; i < FRAMES; i++) {
+        call.client->sendVideoFrame(videoFrame(4000, i == 0, 90000 + static_cast<quint32>(i) * 3000));
+        QTest::qWait(33);
+    }
+    QTRY_VERIFY(call.server.rtp.size() >= FRAMES * 4);
+
+    // The server's reports on them, as of a way that carries half a megabit: no packet is
+    // through before the one ahead of it.
+    constexpr double CARRIED = 500'000;
+    TransportFeedback server;
+    double throughAt = 0;
+    for (const RtpSeen &packet : std::as_const(call.server.rtp)) {
+        const std::span<const uint8_t> number = findRtpExtension(packet.extensions, VideoSendStream::TRANSPORT_SEQUENCE_EXTENSION);
+        QCOMPARE(number.size(), size_t(2));
+        throughAt = std::max(throughAt, sendTimeOf(packet)) + packet.size * 8 / CARRIED;
+        server.onPacket(qFromBigEndian<quint16>(number.data()), static_cast<qint64>((throughAt + 100) * 1e6));
+    }
+
+    // Straight after the statistics, so that the next of those is a second off.
+    statistics.clear();
+    QTRY_VERIFY_WITH_TIMEOUT(statistics.count() >= 1, 1500);
+    QCOMPARE(statistics.last()[0].value<VideoSendStats>().delayEstimateBps, quint64(0));
+    statistics.clear();
+    while (server.hasPending()) {
+        Bytes report(1200);
+        const int size = server.write(report, SERVER_SSRC, OWN_VIDEO_SSRC);
+        QVERIFY(size > 0);
+        report.resize(static_cast<size_t>(size));
+        call.server.sendFeedback({ report });
+    }
+
+    QTRY_VERIFY_WITH_TIMEOUT(statistics.count() >= 1, 500);
+    const VideoSendStats said = statistics.last()[0].value<VideoSendStats>();
+    QVERIFY2(said.acknowledgedBps > 430'000 && said.acknowledgedBps < 570'000, qPrintable(QString::number(said.acknowledgedBps)));
+    // A little under what gets through.
+    QVERIFY2(said.delayEstimateBps > 330'000 && said.delayEstimateBps < said.acknowledgedBps, qPrintable(QString::number(said.delayEstimateBps)));
 }
 
 void TestVoiceClient::aChangeOfCodecIsTakenUp()

@@ -95,6 +95,26 @@ struct ReceivedRtcp
     bool hasReceiverEstimate = false;
     uint64_t receiverEstimateBitsPerSecond = 0;
 
+    // Which of the video packets this client numbered have reached the server, and when by
+    // its clock (transport-wide congestion control feedback).
+    struct TransportReport
+    {
+        uint32_t mediaSsrc = 0;
+        // The number of the first packet reported on; the rest follow it one by one.
+        uint16_t baseSequence = 0;
+        // When, in units of 64 ms, the arrival times below are counted from. 24 bits, signed.
+        int32_t referenceTime = 0;
+        struct Packet
+        {
+            bool received = false;
+            // Quarter milliseconds after the packet received before it, or for the first
+            // after the reference time. Negative for one that overtook another.
+            int32_t delta = 0;
+        };
+        std::vector<Packet> packets;
+    };
+    std::vector<TransportReport> transportReports;
+
     // Senders whose video the server asks this client to receive afresh, each named by one of
     // that sender's SSRCs. Discord asks in an application-defined packet, and the official
     // client then tears down and rebuilds every video receiver it has for that sender.

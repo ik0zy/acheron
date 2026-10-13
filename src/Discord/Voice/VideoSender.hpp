@@ -11,6 +11,7 @@
 #include "PacketBuffer.hpp"
 #include "Rtcp.hpp"
 #include "RtpPacket.hpp"
+#include "SendSideEstimator.hpp"
 #include "VideoPacketizer.hpp"
 
 namespace Acheron {
@@ -59,6 +60,10 @@ public:
     };
 
     VideoSendStream(uint32_t ssrc, uint32_t rtxSsrc, const Numbering &first);
+
+    // Has the connection number this stream's packets among all it sends, in place of the
+    // stream's own count. The estimator has to outlive the stream.
+    void numberWith(SendSideEstimator *estimator) { transport = estimator; }
 
     [[nodiscard]] uint32_t ssrc() const { return mediaSsrc; }
     [[nodiscard]] VideoCodec codec() const { return packetizer ? packetizer->codec() : VideoCodec::Unknown; }
@@ -178,6 +183,7 @@ private:
     uint16_t nextSequence;
     uint16_t nextRtxSequence;
     uint16_t nextTransportSequence;
+    SendSideEstimator *transport = nullptr;
     uint16_t firstPictureId;
 
     std::deque<Packet> queued;

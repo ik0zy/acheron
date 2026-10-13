@@ -66,6 +66,7 @@ private slots:
     void unlistedHeightsAndFrameratesAreRefused();
     void aQualityTheAccountMayNotUseFallsBackToTheDefault();
     void movingToAnotherHeightKeepsTheFramerateWhereAllowed();
+    void theLowerEstimateOfTheWayIsItsCeiling();
 
     void announcedSizeIsFourByThreeAt480AndSixteenByNineAbove();
     void maxBitrateFollowsHeightAndFramerate_data();
@@ -974,6 +975,15 @@ void TestSendQuality::lossLowersFromWhatTheReceiversEstimateAllows()
     QVERIFY(rate.report(0.0, 31'000));
     QCOMPARE(rate.bitrate(), 2'000'000);
     QVERIFY(!rate.report(0.0, 41'000));
+}
+
+void TestSendQuality::theLowerEstimateOfTheWayIsItsCeiling()
+{
+    QCOMPARE(estimatedCeiling(0, 0), qint64(0));
+    QCOMPARE(estimatedCeiling(2'000'000, 0), qint64(2'000'000));
+    QCOMPARE(estimatedCeiling(0, 900'000), qint64(900'000));
+    QCOMPARE(estimatedCeiling(2'000'000, 900'000), qint64(900'000));
+    QCOMPARE(estimatedCeiling(700'000, 900'000), qint64(700'000));
 }
 
 QTEST_GUILESS_MAIN(TestSendQuality)
