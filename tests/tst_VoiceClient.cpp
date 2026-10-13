@@ -1394,15 +1394,21 @@ void TestVoiceClient::aWayFoundToFallBehindIsSaidAtOnce()
     }
     QTRY_VERIFY(call.server.rtp.size() >= FRAMES * 4);
 
-    // The server's reports on them, as of a way that carries half a megabit: no packet is
-    // through before the one ahead of it.
-    constexpr double CARRIED = 500'000;
+    // The server's reports on them, as of a way that carries half of what was sent: no packet
+    // is through before the one ahead of it. Half of what was sent and not half a megabit,
+    // since a busy machine sends these more slowly, down to where half a megabit carries it all.
+    double bitsSent = 0;
+    for (const RtpSeen &packet : std::as_const(call.server.rtp))
+        bitsSent += packet.size * 8;
+    const double sentFor = sendTimeOf(call.server.rtp.last()) - sendTimeOf(call.server.rtp.first());
+    QVERIFY(sentFor > 0);
+    const double carried = bitsSent / sentFor / 2;
     TransportFeedback server;
     double throughAt = 0;
     for (const RtpSeen &packet : std::as_const(call.server.rtp)) {
         const std::span<const uint8_t> number = findRtpExtension(packet.extensions, VideoSendStream::TRANSPORT_SEQUENCE_EXTENSION);
         QCOMPARE(number.size(), size_t(2));
-        throughAt = std::max(throughAt, sendTimeOf(packet)) + packet.size * 8 / CARRIED;
+        throughAt = std::max(throughAt, sendTimeOf(packet)) + packet.size * 8 / carried;
         server.onPacket(qFromBigEndian<quint16>(number.data()), static_cast<qint64>((throughAt + 100) * 1e6));
     }
 
@@ -1419,11 +1425,11 @@ void TestVoiceClient::aWayFoundToFallBehindIsSaidAtOnce()
         call.server.sendFeedback({ report });
     }
 
-    QTRY_VERIFY_WITH_TIMEOUT(statistics.count() >= 1, 500);
+    QTRY_VERIFY2_WITH_TIMEOUT(statistics.count() >= 1, qPrintable(QStringLiteral("nothing said of a way that carries %1 bps").arg(carried)), 500);
     const VideoSendStats said = statistics.last()[0].value<VideoSendStats>();
-    QVERIFY2(said.acknowledgedBps > 430'000 && said.acknowledgedBps < 570'000, qPrintable(QString::number(said.acknowledgedBps)));
+    QVERIFY2(said.acknowledgedBps > carried * 0.86 && said.acknowledgedBps < carried * 1.14, qPrintable(QStringLiteral("%1 of %2").arg(said.acknowledgedBps).arg(carried)));
     // A little under what gets through.
-    QVERIFY2(said.delayEstimateBps > 330'000 && said.delayEstimateBps < said.acknowledgedBps, qPrintable(QString::number(said.delayEstimateBps)));
+    QVERIFY2(said.delayEstimateBps > carried * 0.66 && said.delayEstimateBps < said.acknowledgedBps, qPrintable(QStringLiteral("%1 of %2").arg(said.delayEstimateBps).arg(carried)));
 }
 
 void TestVoiceClient::aChangeOfCodecIsTakenUp()
