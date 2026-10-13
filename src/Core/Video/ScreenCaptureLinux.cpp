@@ -3,6 +3,7 @@
 #if defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN) && defined(ACHERON_HAVE_AVFILTER)
 
 #include "Core/Logging.hpp"
+#include "Core/Media/HardwareDevices.hpp"
 #include "Core/Video/CardScaler.hpp"
 #include "Core/Video/LinuxCapture.hpp"
 #include "Core/Video/PictureConverter.hpp"
@@ -168,7 +169,7 @@ bool ScreenCapture::Backends::mapOntoCard(const AVFrame *prime)
     const AVPixelFormat format = layout && layout->nb_layers > 0 ? formatOfFourcc(layout->layers[0].format) : AV_PIX_FMT_NONE;
     if (format == AV_PIX_FMT_NONE)
         return false;
-    if (!device && av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0) < 0)
+    if (!device && (!Media::hardwareDeviceCanBeAskedFor(AV_HWDEVICE_TYPE_VAAPI) || av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0) < 0))
         return false;
 
     auto *pictures = mappedPictures ? reinterpret_cast<AVHWFramesContext *>(mappedPictures->data) : nullptr;

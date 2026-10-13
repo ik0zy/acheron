@@ -3,6 +3,7 @@
 // that it puts on it. What the screen showed is only ever counted and measured here: never
 // printed, never written anywhere.
 
+#include "Core/Media/HardwareDevices.hpp"
 #include "Core/Media/VideoDecoder.hpp"
 #include "Core/Media/VideoEncoder.hpp"
 #include "Core/Video/BroadcastPipeline.hpp"
@@ -460,7 +461,7 @@ public:
         : device(onDevice(type)), colorspace(colorspace), inMemory(allocatePicture(format, width, height)), onCard(av_frame_alloc())
     {
         AVBufferRef *made = nullptr;
-        if (av_hwdevice_ctx_create(&made, type, nullptr, nullptr, 0) < 0)
+        if (!Core::Media::hardwareDeviceCanBeAskedFor(type) || av_hwdevice_ctx_create(&made, type, nullptr, nullptr, 0) < 0)
             return;
         frames = framesOnCard(made, format, QSize(width, height));
         av_buffer_unref(&made);
@@ -611,7 +612,7 @@ double processCpuMs()
 bool cardMakes(AVPixelFormat format, int poolSize)
 {
     AVBufferRef *device = nullptr;
-    if (av_hwdevice_ctx_create(&device, cardDevice(), nullptr, nullptr, 0) < 0)
+    if (!Core::Media::hardwareDeviceCanBeAskedFor(cardDevice()) || av_hwdevice_ctx_create(&device, cardDevice(), nullptr, nullptr, 0) < 0)
         return false;
     AVBufferRef *frames = framesOnCard(device, format, QSize(1280, 720), poolSize);
     av_buffer_unref(&device);
@@ -2682,7 +2683,7 @@ void TestVideoEncode::theCardScalesAndConvertsPictures()
     const CardScaler::Output output = { size, bt601, false };
 
     AVBufferRef *device = nullptr;
-    if (av_hwdevice_ctx_create(&device, cardDevice(), nullptr, nullptr, 0) < 0)
+    if (!Core::Media::hardwareDeviceCanBeAskedFor(cardDevice()) || av_hwdevice_ctx_create(&device, cardDevice(), nullptr, nullptr, 0) < 0)
         QSKIP("the graphics card has no device for pictures that stay on it");
     AVFrame *large = quartersOnCard(device, QSize(1280, 960));
     AVFrame *another = quartersOnCard(device, QSize(1280, 960));

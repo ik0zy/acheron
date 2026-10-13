@@ -2,6 +2,7 @@
 // the right place, at the right size and in the right colours, and the surface reports how
 // large the picture is drawn.
 
+#include "Core/Media/HardwareDevices.hpp"
 #include "UI/Video/VideoSurface.hpp"
 
 #include <QDir>
@@ -168,7 +169,7 @@ AVFrame *solidP010Frame(int width, int height, uint8_t y, uint8_t cb, uint8_t cr
 AVBufferRef *vaapiPool(const QByteArray &node, int width, int height, int surfaces = 0, AVPixelFormat layout = AV_PIX_FMT_NV12)
 {
     AVBufferRef *device = nullptr;
-    if (av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VAAPI, node.constData(), nullptr, 0) < 0)
+    if (!Acheron::Core::Media::hardwareDeviceCanBeAskedFor(AV_HWDEVICE_TYPE_VAAPI) || av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VAAPI, node.constData(), nullptr, 0) < 0)
         return nullptr;
     AVBufferRef *pool = av_hwframe_ctx_alloc(device);
     av_buffer_unref(&device);
