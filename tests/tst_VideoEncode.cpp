@@ -30,6 +30,7 @@
 #include <vector>
 
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixfmt.h>
@@ -1258,6 +1259,8 @@ void TestVideoEncode::aSourceIsFittedInsideTheSendSize()
     QCOMPARE(encodeSizeFor(QSize(1920, 1080), 480), QSize(852, 480));
 
 #ifdef Q_OS_WIN
+    if (!Core::Video::screenCaptureAvailable())
+        QSKIP("this build cannot capture a screen");
     // A screen is as large as it was listed, and a window that is not there has no size.
     Core::Video::CaptureSource screen;
     screen.geometry = QRect(1920, 0, 2560, 1440);
@@ -1353,7 +1356,7 @@ void TestVideoEncode::av1FromAmfIsCodedInWholeBlocks()
     for (VideoCodec codec : CODECS)
         others.append(Core::Media::videoEncoderNames(codec));
     others.removeAll(amf);
-    QVERIFY(others.contains(QStringLiteral("libvpx")));
+    QCOMPARE(others.contains(QStringLiteral("libvpx")), avcodec_find_encoder_by_name("libvpx") != nullptr);
     for (const QString &name : std::as_const(others)) {
         for (const QSize &size : { QSize(1920, 1080), QSize(640, 360), QSize(1000, 700), QSize(1452, 752) })
             QVERIFY2(codedSize(name, size) == size, qPrintable(name));
@@ -2489,7 +2492,8 @@ void TestVideoEncode::thePipelineSharesTheScreen()
     QElapsedTimer sinceStart;
     sinceStart.start();
     pipeline.start(settings);
-    QTRY_VERIFY2_WITH_TIMEOUT(frames.size() >= 20 || !failures.isEmpty(), "fewer than 20 frames in 3 s", 3000);
+    // Long enough for a machine that draws its screen in software.
+    QTRY_VERIFY2_WITH_TIMEOUT(frames.size() >= 20 || !failures.isEmpty(), "fewer than 20 frames in 10 s", 10000);
     QVERIFY2(failures.isEmpty(), qPrintable(failures.join(QLatin1Char(';'))));
     qInfo() << "20 frames after" << sinceStart.elapsed() << "ms";
 
@@ -2638,7 +2642,13 @@ void TestVideoEncode::whatScalingAScreenCosts()
         Way{ "kept on the card for an encoder that takes NV12 and the screen's own BGRA", true, true },
         Way{ "kept on the card for an encoder that takes only NV12", true, false },
     };
+    // Pictures are kept on the card only for an encoder that takes them there, so where there
+    // is none that is never asked of the capture, and need not work.
+    const QList<VideoCodec> encodable = Core::Media::encodableVideoCodecs();
+    const bool anEncoderTakesCardFrames = std::any_of(encodable.begin(), encodable.end(), [](VideoCodec codec) { return VideoEncoder(settingsFor({ codec, {} }, BITRATE)).takesCardFrames(); });
     for (const Way &way : ways) {
+        if (way.keepOnCard && !anEncoderTakesCardFrames)
+            continue;
         ScreenCapture::Request request;
         request.sourceId = source.id;
         request.method = method;

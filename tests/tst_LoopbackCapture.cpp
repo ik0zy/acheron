@@ -51,7 +51,11 @@ public:
         config.sampleRate = Audio::AUDIO_SAMPLE_RATE;
         config.dataCallback = &Tone::fill;
         config.pUserData = this;
-        opened = ma_device_init(nullptr, &config, &device) == MA_SUCCESS;
+        // Only through WASAPI, which is where the capture listens. Left to choose, miniaudio
+        // ends at a backend that plays to nowhere on a machine with no sound card.
+        const ma_backend backends[] = { ma_backend_wasapi };
+        hasContext = ma_context_init(backends, 1, nullptr, &context) == MA_SUCCESS;
+        opened = hasContext && ma_device_init(&context, &config, &device) == MA_SUCCESS;
         playing = opened && ma_device_start(&device) == MA_SUCCESS;
     }
 
@@ -59,6 +63,8 @@ public:
     {
         if (opened)
             ma_device_uninit(&device);
+        if (hasContext)
+            ma_context_uninit(&context);
     }
 
     [[nodiscard]] bool isPlaying() const { return playing; }
@@ -84,6 +90,8 @@ private:
         }
     }
 
+    ma_context context;
+    bool hasContext = false;
     ma_device device;
     bool opened = false;
     bool playing = false;
