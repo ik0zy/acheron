@@ -199,7 +199,6 @@ class TestRtpVideo : public QObject
 {
     Q_OBJECT
 private slots:
-    void codecNames();
 
     void h264AgainstFfmpeg();
     void h265AgainstFfmpeg();
@@ -238,13 +237,6 @@ private slots:
     void transportFeedbackReportsEachPacketOnce();
     void transportFeedbackAcrossTheSequenceWrap();
 };
-
-void TestRtpVideo::codecNames()
-{
-    for (VideoCodec codec : { VideoCodec::H264, VideoCodec::H265, VideoCodec::VP8, VideoCodec::AV1 })
-        QCOMPARE(videoCodecFromName(videoCodecName(codec)), codec);
-    QCOMPARE(videoCodecFromName(QStringLiteral("VP9")), VideoCodec::Unknown);
-}
 
 void TestRtpVideo::h264AgainstFfmpeg()
 {

@@ -5,6 +5,7 @@
 #include "Core/Audio/IAudioBackend.hpp"
 #include "Core/Audio/LoopbackCapture.hpp"
 #include "Core/Streams/StreamAudio.hpp"
+#include "HardwareTests.hpp"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -400,6 +401,7 @@ void TestLoopbackCapture::whetherItIsAvailableIsFoundOutOnce()
 
 void TestLoopbackCapture::whatThisProgramPlaysIsCaptured()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
     if (!Audio::processLoopbackAvailable())
         QSKIP(CANNOT_CAPTURE);
     const auto self = static_cast<quint32>(QCoreApplication::applicationPid());
@@ -430,6 +432,7 @@ void TestLoopbackCapture::whatThisProgramPlaysIsCaptured()
 
 void TestLoopbackCapture::everythingButThisProgramLeavesItsToneOut()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
     if (!Audio::processLoopbackAvailable())
         QSKIP(CANNOT_CAPTURE);
     const auto self = static_cast<quint32>(QCoreApplication::applicationPid());
@@ -457,6 +460,7 @@ void TestLoopbackCapture::everythingButThisProgramLeavesItsToneOut()
 
 void TestLoopbackCapture::aProcessThatDoesNotExistHasNoSound()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
     if (!Audio::processLoopbackAvailable())
         QSKIP(CANNOT_CAPTURE);
     constexpr quint32 NOBODY = 0x7FFFFFF0;

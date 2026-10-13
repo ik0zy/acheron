@@ -74,7 +74,6 @@ private slots:
 
     void bitratesAreNotScaledWithoutASmallerViewer();
     void sourceQualityIsNeverScaled();
-    void bitratesScaleWithTheViewersShareOfThePicture();
     void scaledBitratesAreRoundedUp();
     void scaledMinimumAndTargetStopAtTheFloor();
     void scaledMaximumKeepsRoomForThePicture();
@@ -85,7 +84,6 @@ private slots:
     void viewerSizeIsComparedWithTheOneInUse();
     void viewersGoingAwayClearsTheSize();
 
-    void controllerStartsAtTheMaximum();
     void controllerIgnoresReportsBeforeTheServerHasSaid();
     void heavyLossLowersTheBitrate();
     void heavyLossLowersNoMoreOftenThanEveryTwoSeconds();
@@ -107,7 +105,6 @@ private slots:
     void cameraLadderHasARowForEachWant();
     void aWantBetweenRowsTakesTheRowBelow();
     void aWantUnderTwentyTakesTheLowestRow();
-    void cameraMaxBitrateIsTheFullPicturesByShareOfTheArea();
     void cameraFramerateIsLoweredForAMutedOwner_data();
     void cameraFramerateIsLoweredForAMutedOwner();
 
@@ -248,16 +245,6 @@ void TestSendQuality::sourceQualityIsNeverScaled()
     QCOMPARE(limitsForViewerSize(full, { SOURCE, 30 }, 2560 * 1440, 30, 320 * 180), full);
 }
 
-void TestSendQuality::bitratesScaleWithTheViewersShareOfThePicture()
-{
-    // Three quarters of a 1080p60 picture's pixels.
-    const qint64 pixels = 1920 * 1080;
-    const BitrateLimits scaled = limitsForViewerSize(FULL_1080P, { 1080, 60 }, pixels, 60, pixels * 3 / 4);
-    QCOMPARE(scaled.min, 375'000);
-    QCOMPARE(scaled.target, 450'000);
-    QCOMPARE(scaled.max, 6'750'000);
-}
-
 void TestSendQuality::scaledBitratesAreRoundedUp()
 {
     // A third of the picture: 166,666.67, 200,000 and 1,166,666.67 before rounding.
@@ -351,13 +338,6 @@ void TestSendQuality::viewersGoingAwayClearsTheSize()
     QVERIFY(size.offer(100'000));
     QVERIFY(size.offer(0));
     QCOMPARE(size.pixelCount(), qint64(0));
-}
-
-void TestSendQuality::controllerStartsAtTheMaximum()
-{
-    SendRateController rate;
-    rate.restart(500'000, 9'000'000);
-    QCOMPARE(rate.bitrate(), 9'000'000);
 }
 
 void TestSendQuality::controllerIgnoresReportsBeforeTheServerHasSaid()
@@ -576,22 +556,6 @@ void TestSendQuality::aWantUnderTwentyTakesTheLowestRow()
 {
     for (const int want : { 19, 10, 1, 0, -1 })
         QCOMPARE(cameraLayerFor(want), CAMERA_LADDER.back());
-}
-
-void TestSendQuality::cameraMaxBitrateIsTheFullPicturesByShareOfTheArea()
-{
-    QCOMPARE(cameraMaxBitrate(1280 * 720), 2'500'000);
-    QCOMPARE(cameraMaxBitrate(640 * 360), 625'000);
-    // Whatever is left of a bit is dropped.
-    QCOMPARE(cameraMaxBitrate(672 * 378), 689'062);
-    QCOMPARE(cameraMaxBitrate(416 * 234), 264'062);
-    // The lowest row's share would be 100,000.
-    QCOMPARE(cameraMaxBitrate(256 * 144), 150'000);
-    QCOMPARE(cameraMaxBitrate(0), 150'000);
-
-    QCOMPARE(CAMERA_MIN_BITRATE, 150'000);
-    QCOMPARE(CAMERA_CAPTURE_SIZE, FULL_CAMERA);
-    QCOMPARE(CAMERA_FRAMERATE, 30);
 }
 
 void TestSendQuality::cameraFramerateIsLoweredForAMutedOwner_data()

@@ -611,8 +611,7 @@ if(BUILD_TESTS)
 
             qt_add_executable(TestVideoSend tests/tst_VideoSend.cpp src/Discord/Voice/RtpPacket.cpp
                 src/Discord/Voice/VideoPacketizer.cpp src/Discord/Voice/VideoSender.cpp
-                src/Discord/Voice/VideoDepacketizer.cpp src/Discord/Voice/VideoReceiver.cpp
-                src/Discord/Voice/SendSideEstimator.cpp
+                src/Discord/Voice/VideoDepacketizer.cpp src/Discord/Voice/SendSideEstimator.cpp
                 src/Discord/Voice/Rtcp.cpp src/Discord/Voice/TransportFeedback.cpp)
             target_link_libraries(TestVideoSend PRIVATE Qt::Core Qt::Test ffmpeg libdave MLSPP::mlspp)
             target_include_directories(TestVideoSend PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

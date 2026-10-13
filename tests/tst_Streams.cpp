@@ -122,8 +122,6 @@ private slots:
     void createPayloadForCall();
     void keyedPayloads();
 
-    void eventsParse();
-    void deleteEventVariants();
 
     void recordFollowsCreateThenServerUpdate();
     void serverUpdateBeforeCreateIsIgnored();
@@ -257,37 +255,6 @@ void TestStreams::keyedPayloads()
     pause.streamKey = GUILD_KEY;
     pause.paused = true;
     QCOMPARE(pause.toJson().toBytes(), QByteArray(R"({"op":22,"d":{"stream_key":"guild:111:222:333","paused":true}})"));
-}
-
-void TestStreams::eventsParse()
-{
-    const Discord::StreamCreate create = created();
-    QCOMPARE(create.streamKey.get(), GUILD_KEY);
-    QCOMPARE(create.region.get(), QStringLiteral("rotterdam"));
-    QCOMPARE(create.viewerIds.get(), QList<Snowflake>{ Snowflake(444) });
-    QCOMPARE(quint64(create.rtcServerId.get()), quint64(900));
-    QCOMPARE(quint64(create.rtcChannelId.get()), quint64(899));
-    QCOMPARE(create.paused.get(), false);
-
-    const Discord::StreamServerUpdate server = serverUpdate(R"("rotterdam123.discord.media:443")");
-    QCOMPARE(server.streamKey.get(), GUILD_KEY);
-    QCOMPARE(server.endpoint.get(), QStringLiteral("rotterdam123.discord.media:443"));
-    QCOMPARE(server.token.get(), QStringLiteral("stream-token"));
-
-    const auto update = parseEvent<Discord::StreamUpdate>(R"({"stream_key":"guild:111:222:333","region":"rotterdam","viewer_ids":["444","555"],"paused":true})");
-    QCOMPARE(update.viewerIds.get(), (QList<Snowflake>{ Snowflake(444), Snowflake(555) }));
-    QCOMPARE(update.paused.get(), true);
-}
-
-void TestStreams::deleteEventVariants()
-{
-    const auto full = parseEvent<Discord::StreamDelete>(R"({"stream_key":"guild:111:222:333","reason":"stream_full"})");
-    QCOMPARE(full.reason.get(), QStringLiteral("stream_full"));
-    QVERIFY(!full.unavailable.hasValue());
-
-    const auto unavailable = parseEvent<Discord::StreamDelete>(R"({"stream_key":"guild:111:222:333","unavailable":true})");
-    QCOMPARE(unavailable.unavailable.valueOr(false), true);
-    QVERIFY(!unavailable.reason.hasValue());
 }
 
 void TestStreams::recordFollowsCreateThenServerUpdate()

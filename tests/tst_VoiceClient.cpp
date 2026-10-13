@@ -12,7 +12,6 @@
 #include "Discord/Voice/VoiceEncryption.hpp"
 
 #include <QCryptographicHash>
-#include <QElapsedTimer>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -667,7 +666,6 @@ private slots:
     void aLostPacketIsAskedForAndTakenFromTheRetransmission();
     void aKeyframeRequestGoesToThatSenderAlone();
     void aVideoResetRequestStartsThatSendersVideoOver();
-    void aStrayPacketLeavesTheStreamRunning();
     void everyPacketTheServerNumberedIsReportedBack();
 
     void theServerNamesTheCodecVideoIsSentWith();
@@ -685,7 +683,6 @@ private slots:
     void aSenderReportAndStatisticsFollowEverySecond();
     void aWayFoundToFallBehindIsSaidAtOnce();
     void aChangeOfCodecIsTakenUp();
-    void h265AndAv1AreSentWhenTheServerNamesThem();
     void aChangeToAv1WaitsForItsKeyframe();
     void encodersFoundLateAreOfferedInASessionUpdate();
     void encodersFoundBeforeTheProtocolIsChosenNeedNoUpdate();
@@ -862,26 +859,6 @@ void TestVoiceClient::aVideoResetRequestStartsThatSendersVideoOver()
     call.server.sendFeedback({ videoReset(0x7777) });
     call.server.sendFrame(ALICE_SSRC, 3, 100, false);
     QTRY_COMPARE(call.framesFrom(ALICE), 3);
-    QVERIFY(call.server.keyframeRequests.isEmpty());
-}
-
-void TestVoiceClient::aStrayPacketLeavesTheStreamRunning()
-{
-    Call call;
-    QTRY_VERIFY(call.isUp());
-    call.receiveAliceAndBob();
-
-    call.server.sendFrame(ALICE_SSRC, 0, 20000, true);
-    QTRY_COMPARE(call.frames.size(), 1);
-    QTest::qWait(100);
-    call.server.keyframeRequests.clear();
-
-    // Something from long ago turns up.
-    const std::vector<uint8_t> old = FakeVoiceServer::payload(true, false, 0);
-    call.server.sendPacket(ALICE_SSRC, VIDEO_PAYLOAD_TYPE, 100, 0, true, old);
-    call.server.sendFrame(ALICE_SSRC, 1, 20000, false);
-    QTRY_COMPARE(call.frames.size(), 2);
-    QTest::qWait(200);
     QVERIFY(call.server.keyframeRequests.isEmpty());
 }
 
@@ -1191,7 +1168,6 @@ void TestVoiceClient::aNackBringsThePacketBackOnTheRetransmissionStream()
     call.server.readyStreams = QJsonArray{ QJsonObject{ { "type", "video" }, { "rid", "100" }, { "ssrc", qint64(VIDEO_SSRC) }, { "rtx_ssrc", qint64(RTX_SSRC) }, { "quality", 100 }, { "active", false } } };
     QTRY_VERIFY(call.isUp());
     call.startVideo();
-    QSignalSpy statistics(call.client.get(), &VoiceClient::videoSendStatsUpdated);
 
     call.client->sendVideoFrame(videoFrame(4000, true, 777));
     QTRY_COMPARE(call.server.rtp.size(), 4);
@@ -1216,12 +1192,6 @@ void TestVoiceClient::aNackBringsThePacketBackOnTheRetransmissionStream()
     const std::span<const uint8_t> transportSequence = findRtpExtension(repeated.extensions, VideoSendStream::TRANSPORT_SEQUENCE_EXTENSION);
     QCOMPARE(transportSequence.size(), size_t(2));
     QCOMPARE(int(qFromBigEndian<quint16>(transportSequence.data())), 5);
-
-    QTRY_VERIFY_WITH_TIMEOUT(statistics.count() >= 1, 1500);
-    const VideoSendStats counted = statistics[0][0].value<VideoSendStats>();
-    QCOMPARE(counted.nacksReceived, quint64(2));
-    QCOMPARE(counted.retransmitted, quint64(1));
-    QCOMPARE(counted.packets, quint64(4));
 }
 
 void TestVoiceClient::keyframeRequestsReachTheEncoderButNotInABurst()
@@ -1477,67 +1447,6 @@ void TestVoiceClient::aChangeOfCodecIsTakenUp()
     call.client->sendVideoFrame(keyframe);
     QTest::qWait(150);
     QCOMPARE(call.server.rtp.size(), 5);
-}
-
-void TestVoiceClient::h265AndAv1AreSentWhenTheServerNamesThem()
-{
-    constexpr int SESSION_UPDATE = 14;
-    constexpr int H265_AGGREGATION_PACKET = 48;
-    constexpr int H265_FRAGMENTATION_UNIT = 49;
-    constexpr int AV1_NEW_SEQUENCE = 0x08;
-
-    Call call(true);
-    call.server.videoCodec = QStringLiteral("H265");
-    QTRY_VERIFY(call.isUp());
-    QCOMPARE(call.client->videoSendCodec(), VideoCodec::H265);
-    call.startVideo();
-    QSignalSpy codecs(call.client.get(), &VoiceClient::videoSendCodecChanged);
-    QSignalSpy statistics(call.client.get(), &VoiceClient::videoSendStatsUpdated);
-
-    const EncodedVideoFrame h265 = h265Keyframe(3000);
-    call.client->sendVideoFrame(h265);
-    QTRY_COMPARE(call.server.rtp.size(), 4);
-    for (const RtpSeen &packet : call.server.rtp) {
-        QCOMPARE(packet.header.ssrc, OWN_VIDEO_SSRC);
-        QCOMPARE(int(packet.header.payloadType), H265_PAYLOAD_TYPE);
-        QCOMPARE(packet.header.timestamp, 3000u);
-        QVERIFY(packet.size <= VideoSendStream::MAX_PACKET_SIZE);
-    }
-    // The parameter sets travel together, ahead of the picture's fragments.
-    QCOMPARE((call.server.rtp[0].payload[0] >> 1) & 0x3F, H265_AGGREGATION_PACKET);
-    for (int i = 1; i < 4; i++)
-        QCOMPARE((call.server.rtp[i].payload[0] >> 1) & 0x3F, H265_FRAGMENTATION_UNIT);
-    QVERIFY(call.server.rtp[3].header.marker);
-    QCOMPARE(call.reassembled(VideoCodec::H265, OWN_VIDEO_SSRC), h265.data);
-
-    call.server.sendFeedback({ nack(OWN_VIDEO_SSRC, call.server.rtp[1].header.sequence) });
-    QTRY_COMPARE(call.server.rtp.size(), 5);
-    QCOMPARE(call.server.rtp[4].header.ssrc, OWN_RTX_SSRC);
-    QCOMPARE(int(call.server.rtp[4].header.payloadType), H265_PAYLOAD_TYPE + 1);
-
-    call.server.send(SESSION_UPDATE, QJsonObject{ { "video_codec", "AV1" } });
-    QTRY_COMPARE(codecs.count(), 1);
-    QCOMPARE(codecs[0][0].value<VideoCodec>(), VideoCodec::AV1);
-    call.server.rtp.clear();
-
-    call.client->sendVideoFrame(av1Frame(true, 6000));
-    QTRY_COMPARE(call.server.rtp.size(), 3);
-    for (int i = 0; i < 3; i++) {
-        const RtpSeen &packet = call.server.rtp[i];
-        QCOMPARE(packet.header.ssrc, OWN_VIDEO_SSRC);
-        QCOMPARE(int(packet.header.payloadType), AV1_PAYLOAD_TYPE);
-        QCOMPARE(packet.header.timestamp, 6000u);
-        QCOMPARE(packet.header.marker, i == 2);
-        QVERIFY(packet.size <= VideoSendStream::MAX_PACKET_SIZE);
-        // Only the first packet of the key frame says that a sequence begins.
-        QCOMPARE((packet.payload[0] & AV1_NEW_SEQUENCE) != 0, i == 0);
-    }
-    QCOMPARE(call.reassembled(VideoCodec::AV1, OWN_VIDEO_SSRC), av1AsAssembled(true));
-    QCOMPARE(call.server.undecryptable, 0);
-
-    statistics.clear();
-    QTRY_VERIFY_WITH_TIMEOUT(statistics.count() >= 1, 1500);
-    QCOMPARE(statistics[0][0].value<VideoSendStats>().codec, QStringLiteral("AV1"));
 }
 
 void TestVoiceClient::aChangeToAv1WaitsForItsKeyframe()

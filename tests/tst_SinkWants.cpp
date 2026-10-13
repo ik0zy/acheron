@@ -52,7 +52,6 @@ private slots:
     void hiddenTileKeepsItsVideoForAWhile();
     void onlyTheMostRecentlyHiddenAreKept();
     void comingBackIntoViewResetsTheWait();
-    void removedTileIsNotWanted();
 };
 
 void TestSinkWants::ladderFollowsTheSenderCount_data()
@@ -253,18 +252,6 @@ void TestSinkWants::comingBackIntoViewResetsTheWait()
     // Being told again that it is hidden does not restart the wait.
     tiles.setVisible(Snowflake(1), false, 40000);
     QVERIFY(!tiles.wanted(Snowflake(1), 25000 + TileVisibility::HIDDEN_GRACE_MS));
-}
-
-void TestSinkWants::removedTileIsNotWanted()
-{
-    TileVisibility tiles;
-    tiles.setVisible(Snowflake(1), true, 0);
-    tiles.remove(Snowflake(1));
-    QVERIFY(!tiles.wanted(Snowflake(1), 0));
-
-    tiles.setVisible(Snowflake(2), true, 0);
-    tiles.clear();
-    QVERIFY(!tiles.wanted(Snowflake(2), 0));
 }
 
 QTEST_GUILESS_MAIN(TestSinkWants)

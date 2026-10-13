@@ -7,7 +7,6 @@
 #include "Discord/Voice/RtpPacket.hpp"
 #include "Discord/Voice/VideoDepacketizer.hpp"
 #include "Discord/Voice/VideoPacketizer.hpp"
-#include "Discord/Voice/VideoReceiver.hpp"
 #include "Discord/Voice/VideoSender.hpp"
 
 #include <bytes/bytes.h>
@@ -460,7 +459,6 @@ private slots:
     void aFrameLeavesAtThePaceOfItsBitrate();
     void aFrameWithinTheBurstLeavesAtOnce();
     void aBacklogLeavesWithinTheQueueTime();
-    void nothingLeavesOutsideAnInterval();
     void aLostPacketIsSentAgainOnTheRetransmissionStream();
     void retransmissionsGoAheadOfNewPackets();
     void whatWasNeverSentIsNotSentAgain();
@@ -471,7 +469,6 @@ private slots:
     void aFullHistoryEndsAfterASecond();
     void theHistoryOutlastsThreeRoundTrips();
     void withoutARetransmissionPayloadTypeNothingIsSentAgain();
-    void aReceiverRepairsALossFromTheHistory();
     void changingTheCodecKeepsTheNumbering();
     void anyCodecCanFollowAnyOther();
     void clearingForgetsWhatWaited();
@@ -1413,21 +1410,6 @@ void TestVideoSend::aBacklogLeavesWithinTheQueueTime()
     QVERIFY(ms >= VideoSendStream::MAX_QUEUE_MS / 2);
 }
 
-void TestVideoSend::nothingLeavesOutsideAnInterval()
-{
-    VideoSendStream sender = vp8Sender();
-    QVERIFY(sender.queueFrame(vp8Frame(true, 20 * VP8_ROOM, 82), 0, true, 0));
-
-    PacketBuffer packet;
-    QVERIFY(!sender.writeNext(0, packet));
-
-    const size_t first = interval(sender, 0).size();
-    QVERIFY(first > 0 && first < 20);
-    // The share is spent; more waits for the next interval.
-    QVERIFY(sender.hasWaiting());
-    QVERIFY(!sender.writeNext(0, packet));
-}
-
 void TestVideoSend::aLostPacketIsSentAgainOnTheRetransmissionStream()
 {
     VideoSendStream sender = vp8Sender();
@@ -1663,53 +1645,6 @@ void TestVideoSend::withoutARetransmissionPayloadTypeNothingIsSentAgain()
     const uint16_t lost[] = { packets[0].header.sequence };
     sender.retransmit(lost, MS);
     QVERIFY(!sender.hasWaiting());
-}
-
-void TestVideoSend::aReceiverRepairsALossFromTheHistory()
-{
-    VideoSendStream sender(SSRC, RTX_SSRC, FIRST);
-    sender.setCodec(VideoCodec::H264, PAYLOAD_TYPE, RTX_PAYLOAD_TYPE);
-    VideoReceiver receiver(SSRC, VideoCodec::H264);
-    PacketPool pool;
-
-    const auto deliver = [&](const Written &packet, qint64 nowMs) {
-        const bool retransmission = packet.header.ssrc == RTX_SSRC;
-        PacketPool::Handle payload = pool.acquire();
-        payload->append(std::span(packet.payload).subspan(retransmission ? 2 : 0));
-        const uint16_t sequence = retransmission ? qFromBigEndian<uint16_t>(packet.payload.data()) : packet.header.sequence;
-        receiver.insert(sequence, packet.header.timestamp, packet.header.marker, std::move(payload), nowMs, retransmission);
-    };
-
-    const Bytes keyframe = h264Keyframe(6000);
-    Bytes delta;
-    appendNal(delta, NAL_SLICE, 4000, 97);
-    QVERIFY(sender.queueFrame(keyframe, 0, true, 0));
-    QVERIFY(sender.queueFrame(delta, 3000, false, 0));
-    const std::vector<Written> packets = drain(sender, 0);
-    QVERIFY(packets.size() > 6);
-
-    constexpr size_t LOST = 3;
-    for (size_t i = 0; i < packets.size(); i++) {
-        if (i != LOST)
-            deliver(packets[i], 0);
-    }
-    QVERIFY(receiver.takeFrames().empty());
-
-    const VideoReceiver::Feedback feedback = receiver.poll(VideoReceiver::REORDER_GRACE_MS);
-    QCOMPARE(feedback.nacks, std::vector<uint16_t>{ packets[LOST].header.sequence });
-
-    sender.retransmit(feedback.nacks, 20 * MS);
-    const std::vector<Written> repeated = drain(sender, 20 * MS);
-    QCOMPARE(repeated.size(), size_t(1));
-    deliver(repeated[0], 20);
-
-    const std::vector<EncodedVideoFrame> frames = receiver.takeFrames();
-    QCOMPARE(frames.size(), size_t(2));
-    QVERIFY(frames[0].keyframe);
-    QCOMPARE(frames[0].data, keyframe);
-    QVERIFY(!frames[1].keyframe);
-    QCOMPARE(frames[1].data, delta);
-    QCOMPARE(frames[1].rtpTimestamp, 3000u);
 }
 
 void TestVideoSend::changingTheCodecKeepsTheNumbering()

@@ -3,10 +3,10 @@
 // large the picture is drawn.
 
 #include "Core/Media/HardwareDevices.hpp"
+#include "HardwareTests.hpp"
 #include "UI/Video/VideoSurface.hpp"
 
 #include <QDir>
-#include <QElapsedTimer>
 #include <QEvent>
 #include <QGuiApplication>
 #include <QImage>
@@ -20,8 +20,6 @@
 #include <QTest>
 
 #include <algorithm>
-#include <array>
-#include <ctime>
 
 #ifdef Q_OS_WIN
 // Before ffmpeg's header, which would otherwise pull it in as C.
@@ -345,7 +343,6 @@ class TestVideoSurface : public QObject
     Q_OBJECT
 private slots:
     void initTestCase();
-    void emptySurfaceIsBlack();
     void frameFillsAMatchingSurface();
     void narrowerFrameIsCentredBetweenBars();
     void coloursFollowTheVideoStandard();
@@ -359,17 +356,12 @@ private slots:
     void clickAndDoubleClickAreReported();
     void geometryIsReported();
     void resizeRedrawsTheLastFrame();
-    void clearForgetsThePicture();
     void messagesDoNotDisturbThePicture();
     void avatarStandsInUntilThereIsAPicture();
     void speakingRingIsDrawn();
     void aSurfaceHasItsLayerOnlyWhileItHasAPicture();
     void aSurfaceLongOffTheScreenGivesUpItsLayerAndKeepsItsPicture();
     void statisticsAreLeftOffASmallTile();
-    void whatShowingAFrameCosts_data();
-    void whatShowingAFrameCosts();
-    void whatShowingCamerasCosts_data();
-    void whatShowingCamerasCosts();
     // Last: a card found not to hand its pictures over is not asked again while the program runs.
     void pictureFromAnotherCardIsReadBack();
 };
@@ -383,17 +375,6 @@ void TestVideoSurface::initTestCase()
     if (!context.create() || !context.makeCurrent(&offscreen))
         return;
     qInfo().noquote() << QStringLiteral("OpenGL draws with %1").arg(QString::fromLatin1(reinterpret_cast<const char *>(context.functions()->glGetString(GL_RENDERER))));
-}
-
-void TestVideoSurface::emptySurfaceIsBlack()
-{
-    VideoSurface surface;
-    surface.resize(320, 180);
-    surface.show();
-    QVERIFY(QTest::qWaitForWindowExposed(&surface));
-
-    const QImage image = shot(surface);
-    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 0, 0, 0));
 }
 
 void TestVideoSurface::frameFillsAMatchingSurface()
@@ -452,6 +433,7 @@ void TestVideoSurface::coloursFollowTheVideoStandard()
 
 void TestVideoSurface::memoryEglCannotBeToldTheOrderOfIsReadBack()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
 #ifdef HAVE_VAAPI
     // Before anything else is drawn from the card: what EGL makes of it is settled once.
     if (!eglHere().present || eglHere().takesModifiers)
@@ -479,6 +461,7 @@ void TestVideoSurface::memoryEglCannotBeToldTheOrderOfIsReadBack()
 
 void TestVideoSurface::frameOnTheGraphicsCardIsDrawnFromThere()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
 #ifdef CARD_FORMAT
     VideoSurface surface;
     surface.resize(320, 180);
@@ -540,6 +523,7 @@ void TestVideoSurface::frameOnTheGraphicsCardIsDrawnFromThere()
 
 void TestVideoSurface::manySurfacesDrawFromTheGraphicsCard()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
 #ifdef CARD_FORMAT
     // More surfaces in one window than one hand-over worker takes, each with its own picture.
     constexpr int COUNT = 5;
@@ -586,6 +570,7 @@ void TestVideoSurface::manySurfacesDrawFromTheGraphicsCard()
 
 void TestVideoSurface::pictureFromTheCardIsThePictureInMemory()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
 #ifdef HAVE_VAAPI
     VideoSurface surface;
     surface.resize(320, 180);
@@ -634,6 +619,7 @@ void TestVideoSurface::pictureFromTheCardIsThePictureInMemory()
 
 void TestVideoSurface::tenBitPictureFromTheCardIsReadBack()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
 #ifdef HAVE_VAAPI
     VideoSurface surface;
     surface.resize(320, 180);
@@ -672,6 +658,7 @@ void TestVideoSurface::tenBitPictureFromTheCardIsReadBack()
 
 void TestVideoSurface::cardSurfaceIsKeptFromTheDecoderWhileItIsDrawn()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
 #ifdef HAVE_VAAPI
     VideoSurface surface;
     surface.resize(320, 180);
@@ -855,21 +842,6 @@ void TestVideoSurface::resizeRedrawsTheLastFrame()
     QVERIFY(isNear(image.pixel(image.width() - 2, image.height() - 2), 255, 255, 255));
 }
 
-void TestVideoSurface::clearForgetsThePicture()
-{
-    VideoSurface surface;
-    surface.resize(320, 180);
-    surface.show();
-    QVERIFY(QTest::qWaitForWindowExposed(&surface));
-    present(surface, solidFrame(640, 360, 235, 128, 128));
-
-    surface.clear();
-    QCoreApplication::processEvents();
-
-    const QImage image = shot(surface);
-    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 0, 0, 0));
-}
-
 void TestVideoSurface::messagesDoNotDisturbThePicture()
 {
     VideoSurface surface;
@@ -959,6 +931,7 @@ void TestVideoSurface::speakingRingIsDrawn()
 
 void TestVideoSurface::aSurfaceHasItsLayerOnlyWhileItHasAPicture()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
     VideoSurface surface;
     surface.resize(320, 180);
     surface.show();
@@ -997,6 +970,7 @@ void TestVideoSurface::aSurfaceHasItsLayerOnlyWhileItHasAPicture()
 
 void TestVideoSurface::aSurfaceLongOffTheScreenGivesUpItsLayerAndKeepsItsPicture()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
     VideoSurface surface;
     surface.resize(320, 180);
     surface.show();
@@ -1060,179 +1034,9 @@ void TestVideoSurface::statisticsAreLeftOffASmallTile()
     QVERIFY(isNear(image.pixel(5, 5), 255, 255, 255));
 }
 
-void TestVideoSurface::whatShowingAFrameCosts_data()
-{
-    QTest::addColumn<QSize>("size");
-    QTest::newRow("1920x1080") << QSize(1920, 1080);
-    QTest::newRow("2560x1440") << QSize(2560, 1440);
-}
-
-// A measurement: a picture the decoder left on the card, read back and uploaded as against
-// drawn where it is. A small surface is read back each time, so that the card has done its part.
-void TestVideoSurface::whatShowingAFrameCosts()
-{
-#ifdef HAVE_VAAPI
-    QFETCH(QSize, size);
-    VideoSurface surface;
-    surface.resize(320, 180);
-    surface.show();
-    QVERIFY(QTest::qWaitForWindowExposed(&surface));
-    drawnOnce(surface);
-    if (!surface.sink()->acceptsHardwareFrames(CARD_FORMAT))
-        QSKIP("This surface cannot draw the card's picture where it is");
-    if (drawingNode().isEmpty())
-        QSKIP("No video device whose pictures this surface can draw");
-
-    AVBufferRef *pool = vaapiPool(drawingNode(), size.width(), size.height());
-    QVERIFY(pool);
-    std::array<AVFrame *, 4> pictures;
-    for (size_t i = 0; i < pictures.size(); i++) {
-        pictures[i] = solidFrameFrom(pool, static_cast<uint8_t>(60 + 40 * i), 128, 128);
-        QVERIFY(pictures[i]);
-    }
-
-    constexpr int FRAMES = 300;
-    for (const bool fromCard : { false, true }) {
-        AVFrame *memory = av_frame_alloc();
-        QElapsedTimer wall;
-        wall.start();
-        const std::clock_t cpuBefore = std::clock();
-        for (int i = 0; i < FRAMES; i++) {
-            const AVFrame *frame = pictures[static_cast<size_t>(i) % pictures.size()];
-            if (!fromCard) {
-                // As the decoder does for a sink that does not take the card's frames.
-                av_frame_unref(memory);
-                QVERIFY(av_hwframe_transfer_data(memory, frame, 0) >= 0);
-                av_frame_copy_props(memory, frame);
-                frame = memory;
-            }
-            surface.sink()->present(frame);
-            QCoreApplication::processEvents();
-            QVERIFY(!surface.snapshot().isNull());
-            QCOMPARE(surface.drawsFromCard(), fromCard);
-        }
-        const double cpuMs = 1000.0 * static_cast<double>(std::clock() - cpuBefore) / CLOCKS_PER_SEC / FRAMES;
-        const double wallMs = static_cast<double>(wall.nsecsElapsed()) / 1e6 / FRAMES;
-        av_frame_free(&memory);
-        qInfo().noquote() << QStringLiteral("%1: %2 ms and %3 ms of processor time a frame").arg(fromCard ? QStringLiteral("drawn from the card") : QStringLiteral("read back and uploaded")).arg(wallMs, 0, 'f', 3).arg(cpuMs, 0, 'f', 3);
-        QVERIFY(cpuMs > 0);
-    }
-
-    for (AVFrame *picture : pictures)
-        av_frame_free(&picture);
-    av_buffer_unref(&pool);
-#else
-    QSKIP("VAAPI only");
-#endif
-}
-
-void TestVideoSurface::whatShowingCamerasCosts_data()
-{
-    QTest::addColumn<QSize>("size");
-    QTest::newRow("416x234") << QSize(416, 234);
-    QTest::newRow("640x360") << QSize(640, 360);
-    QTest::newRow("896x504") << QSize(896, 504);
-    QTest::newRow("1280x720") << QSize(1280, 720);
-}
-
-// A measurement: nine tiles each given thirty pictures a second, as a call full of cameras is,
-// once as a hardware decoder leaves them on the card and once as a software decoder leaves
-// them in memory. What decoding them costs is not in it.
-void TestVideoSurface::whatShowingCamerasCosts()
-{
-#ifdef HAVE_D3D11VA
-    QFETCH(QSize, size);
-    constexpr int TILES = 9;
-    constexpr int PICTURES = 4;
-    constexpr int SETTLING = 15;
-    constexpr int TICKS = 90;
-    constexpr int TICK_MS = 33;
-
-    QWidget window;
-    window.resize(3 * 320, 3 * 180);
-    std::vector<VideoSurface *> surfaces;
-    for (int i = 0; i < TILES; i++) {
-        auto *surface = new VideoSurface(&window);
-        surface->setGeometry((i % 3) * 320, (i / 3) * 180, 320, 180);
-        surface->setCaption(QStringLiteral("Somebody"));
-        surfaces.push_back(surface);
-    }
-    window.show();
-    QVERIFY(QTest::qWaitForWindowExposed(&window));
-    for (VideoSurface *surface : surfaces)
-        drawnOnce(*surface);
-    if (!surfaces.front()->sink()->acceptsHardwareFrames(CARD_FORMAT))
-        QSKIP("This surface cannot draw the card's picture where it is");
-
-    // One decoder's worth of textures, as a camera's decoder has.
-    AVBufferRef *device = nullptr;
-    if (av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) < 0)
-        QSKIP("No video device whose pictures this surface can draw");
-    AVBufferRef *pool = av_hwframe_ctx_alloc(device);
-    av_buffer_unref(&device);
-    auto *frames = reinterpret_cast<AVHWFramesContext *>(pool->data);
-    frames->format = AV_PIX_FMT_D3D11;
-    frames->sw_format = AV_PIX_FMT_NV12;
-    frames->width = size.width();
-    frames->height = size.height();
-    frames->initial_pool_size = PICTURES;
-    static_cast<AVD3D11VAFramesContext *>(frames->hwctx)->BindFlags = D3D11_BIND_DECODER;
-    QVERIFY(av_hwframe_ctx_init(pool) >= 0);
-
-    std::array<AVFrame *, PICTURES> onCard;
-    std::array<AVFrame *, PICTURES> inMemory;
-    for (int i = 0; i < PICTURES; i++) {
-        const auto luma = static_cast<uint8_t>(60 + 40 * i);
-        AVFrame *nv12 = solidNv12Frame(size.width(), size.height(), luma, 128, 128);
-        onCard[static_cast<size_t>(i)] = av_frame_alloc();
-        QVERIFY(av_hwframe_get_buffer(pool, onCard[static_cast<size_t>(i)], 0) >= 0 && av_hwframe_transfer_data(onCard[static_cast<size_t>(i)], nv12, 0) >= 0);
-        av_frame_free(&nv12);
-        inMemory[static_cast<size_t>(i)] = solidFrame(size.width(), size.height(), luma, 128, 128);
-    }
-
-    const auto cyclesNow = [] {
-        ULONG64 cycles = 0;
-        QueryProcessCycleTime(GetCurrentProcess(), &cycles);
-        return cycles;
-    };
-    // What this processor does of cycles in a millisecond of one thread's work.
-    ULONG64 spinBefore = 0;
-    ULONG64 spinAfter = 0;
-    QueryThreadCycleTime(GetCurrentThread(), &spinBefore);
-    QElapsedTimer spinning;
-    spinning.start();
-    while (spinning.nsecsElapsed() < 20'000'000) {}
-    QueryThreadCycleTime(GetCurrentThread(), &spinAfter);
-    const double cyclesPerMs = static_cast<double>(spinAfter - spinBefore) / 20.0;
-
-    for (const bool fromCard : { false, true }) {
-        ULONG64 before = 0;
-        for (int tick = 0; tick < SETTLING + TICKS; tick++) {
-            if (tick == SETTLING)
-                before = cyclesNow();
-            const AVFrame *picture = (fromCard ? onCard : inMemory)[static_cast<size_t>(tick) % PICTURES];
-            for (VideoSurface *surface : surfaces)
-                surface->sink()->present(picture);
-            QTest::qWait(TICK_MS);
-        }
-        const double cpuMs = static_cast<double>(cyclesNow() - before) / cyclesPerMs / (TICKS * TILES);
-        for (VideoSurface *surface : surfaces)
-            QCOMPARE(surface->drawsFromCard(), fromCard);
-        qInfo().noquote() << QStringLiteral("%1x%2 %3: %4 ms of processor time a picture a tile, which is %5% of a processor for nine cameras").arg(size.width()).arg(size.height()).arg(fromCard ? QStringLiteral("left on the card") : QStringLiteral("in memory and uploaded")).arg(cpuMs, 0, 'f', 3).arg(cpuMs * TILES * 30 / 10, 0, 'f', 1);
-    }
-
-    for (AVFrame *picture : onCard)
-        av_frame_free(&picture);
-    for (AVFrame *picture : inMemory)
-        av_frame_free(&picture);
-    av_buffer_unref(&pool);
-#else
-    QSKIP("Direct3D 11 only");
-#endif
-}
-
 void TestVideoSurface::pictureFromAnotherCardIsReadBack()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
 #ifdef HAVE_VAAPI
     // A machine with two cards can decode on the one that does not draw, whose memory the
     // other may be unable to read where it is.

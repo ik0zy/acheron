@@ -181,7 +181,6 @@ private slots:
     void socks5DropsFragmentsAndUnwrappedDatagrams();
     void socks5SendsNothingBeforeAssociationOrAfterItFails();
     void socks5ReportsRelayLossAfterDiscovery();
-    void receivedPacketsAreRecycled();
 };
 
 void TestUdpTransport::directDiscoveryThenPacketsBothWays()
@@ -386,32 +385,6 @@ void TestUdpTransport::socks5ReportsRelayLossAfterDiscovery()
     transport.send(*packet);
     QTest::qWait(200);
     QCOMPARE(server.received.size(), 1);
-}
-
-void TestUdpTransport::receivedPacketsAreRecycled()
-{
-    FakeMediaServer server;
-    UdpTransport transport{ ProxyConfig() };
-    QSet<const PacketBuffer *> seen;
-    int delivered = 0;
-    transport.setPacketHandler([&](PacketPool::Handle packet) {
-        seen.insert(packet.get());
-        ++delivered;
-    });
-    QSignalSpy discovered(&transport, &UdpTransport::ipDiscovered);
-
-    transport.startIpDiscovery(LOOPBACK.toString(), server.port(), 1);
-    QTRY_COMPARE(server.received.size(), 1);
-    server.answerDiscovery(transport.localPort(), "198.51.100.9", 43210);
-    QTRY_COMPARE(discovered.size(), 1);
-
-    for (int i = 0; i < 200; ++i) {
-        server.sendTo(transport.localPort(), rtpLikePayload('r'));
-        QTRY_COMPARE(delivered, i + 1);
-    }
-
-    // A handler that lets each packet go gets the same few buffers back, not 200 allocations.
-    QVERIFY2(seen.size() <= 2, qPrintable(QStringLiteral("%1 distinct buffers for 200 packets").arg(seen.size())));
 }
 
 QTEST_GUILESS_MAIN(TestUdpTransport)

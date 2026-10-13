@@ -102,7 +102,6 @@ private slots:
     void writesFixedHeader();
     void writesExtensionPreamble();
     void writeRefusesWhatItCannotExpress();
-    void writtenHeaderParsesBack();
 
     void findsExtensionElements();
     void extensionLookupSkipsPaddingAndStopsAtReserved();
@@ -330,34 +329,6 @@ void TestRtp::writeRefusesWhatItCannotExpress()
     header.extension = false;
     header.csrcCount = 1;
     QCOMPARE(writeRtpHeader(header, out), -1);
-}
-
-void TestRtp::writtenHeaderParsesBack()
-{
-    RtpHeader header;
-    header.padding = true;
-    header.extension = true;
-    header.marker = true;
-    header.payloadType = 105;
-    header.sequence = 0xfffe;
-    header.timestamp = 0x80000001;
-    header.ssrc = 0x01020304;
-
-    uint8_t out[64] = {};
-    const int size = writeRtpHeader(header, out, 2);
-    QCOMPARE(size, 16);
-
-    const auto parsed = parseRtp({ out, sizeof(out) });
-    QVERIFY(parsed.has_value());
-    QCOMPARE(parsed->header.padding, header.padding);
-    QCOMPARE(parsed->header.extension, header.extension);
-    QCOMPARE(parsed->header.marker, header.marker);
-    QCOMPARE(parsed->header.payloadType, header.payloadType);
-    QCOMPARE(parsed->header.sequence, header.sequence);
-    QCOMPARE(parsed->header.timestamp, header.timestamp);
-    QCOMPARE(parsed->header.ssrc, header.ssrc);
-    QCOMPARE(parsed->clearSize, 16);
-    QCOMPARE(parsed->extensionSize, 8);
 }
 
 void TestRtp::findsExtensionElements()

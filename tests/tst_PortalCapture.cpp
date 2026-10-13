@@ -460,7 +460,6 @@ class TestPortalCapture : public QObject
 private slots:
     void initTestCase();
 
-    void whatThePortalOffers();
     void aPictureArrivesWithEveryPixelAsItWasSent_data();
     void aPictureArrivesWithEveryPixelAsItWasSent();
     void theNewestPictureWinsAndIsHandedOverOnce();
@@ -497,18 +496,6 @@ void TestPortalCapture::initTestCase()
     Capture capture(SMALL);
     if (!capture.running)
         QSKIP("PipeWire does not carry a picture from one stream of this process to another here, so there is nothing to capture.");
-}
-
-void TestPortalCapture::whatThePortalOffers()
-{
-    QProcess asked;
-    asked.start(QStringLiteral("busctl"), { QStringLiteral("--user"), QStringLiteral("introspect"), QStringLiteral("org.freedesktop.portal.Desktop"), QStringLiteral("/org/freedesktop/portal/desktop"), QStringLiteral("org.freedesktop.portal.ScreenCast") });
-    asked.waitForFinished(5000);
-    for (const QByteArray &line : asked.readAllStandardOutput().split('\n')) {
-        if (line.contains(" property "))
-            qInfo().noquote() << line.simplified();
-    }
-    qInfo() << "PortalCapture::usable():" << PortalCapture::usable();
 }
 
 void TestPortalCapture::aPictureArrivesWithEveryPixelAsItWasSent_data()

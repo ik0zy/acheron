@@ -174,7 +174,6 @@ private slots:
     void aGrabWaitsNoLongerThanItWasAskedTo();
     void theFrameRateAskedForIsKept_data();
     void theFrameRateAskedForIsKept();
-    void what30FramesASecondCost();
 
 private:
     [[nodiscard]] TestWindow::Look look(const QSize &size, quint32 colour, const QPoint &offset = QPoint(80, 80)) const;
@@ -993,23 +992,6 @@ void TestX11Capture::theFrameRateAskedForIsKept()
     const double fps = pace.pictures / pace.seconds;
     qInfo() << fps << "pictures a second";
     QVERIFY(fps > framerate * 0.95 && fps < framerate * 1.05);
-}
-
-void TestX11Capture::what30FramesASecondCost()
-{
-    if (!connection)
-        QSKIP(NO_DISPLAY);
-
-    const TestWindow window(look(QSize(1920, 1080), BLUE, QPoint(0, 0)));
-    const std::unique_ptr<LinuxGrabber> ofTheWindow = X11Capture::open(window.source().id, 30);
-    const Pace windowPace = paceOf(*ofTheWindow, 3000);
-    QVERIFY(windowPace.pictures > 0);
-    qInfo().noquote() << QStringLiteral("a window of %1x%2: %3 pictures a second, %4 ms of this process's processor time a picture").arg(windowPace.size.width()).arg(windowPace.size.height()).arg(windowPace.pictures / windowPace.seconds, 0, 'f', 2).arg(windowPace.cpuMs / windowPace.pictures, 0, 'f', 3);
-
-    const std::unique_ptr<LinuxGrabber> ofTheScreen = X11Capture::open(quietScreen.id, 30);
-    const Pace screenPace = paceOf(*ofTheScreen, 3000);
-    QVERIFY(screenPace.pictures > 0);
-    qInfo().noquote() << QStringLiteral("a screen of %1x%2: %3 pictures a second, %4 ms of this process's processor time a picture").arg(screenPace.size.width()).arg(screenPace.size.height()).arg(screenPace.pictures / screenPace.seconds, 0, 'f', 2).arg(screenPace.cpuMs / screenPace.pictures, 0, 'f', 3);
 }
 
 #else

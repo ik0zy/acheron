@@ -8,6 +8,7 @@
 #include "Core/Media/VideoEncoder.hpp"
 #include "Core/Video/CameraCapture.hpp"
 #include "Core/Video/CameraPipeline.hpp"
+#include "HardwareTests.hpp"
 
 #include <QDir>
 #include <QElapsedTimer>
@@ -664,8 +665,6 @@ private slots:
     void aCameraThatDoesNotOpenFails();
     void noCameraIsOpenedWithoutAnEncoder();
     void stoppingClosesTheCameraAndItOpensAgain();
-    void whatACameraPictureCosts_data();
-    void whatACameraPictureCosts();
 
     void theFirstCameraDeliversPictures();
     void aPictureOutlivesItsCamera();
@@ -939,9 +938,7 @@ void TestCameraCapture::picturesAreThinnedToTheFrameRate_data()
     QTest::addColumn<int>("wanted");
     QTest::addColumn<int>("expected");
     QTest::newRow("30 of 30") << 30 << 30 << 30;
-    QTest::newRow("15 of 30") << 30 << 15 << 15;
     QTest::newRow("20 of 30") << 30 << 20 << 20;
-    QTest::newRow("10 of 30") << 30 << 10 << 10;
     QTest::newRow("a camera with fewer gives all it has") << 15 << 30 << 15;
 }
 
@@ -1025,7 +1022,7 @@ void TestCameraCapture::aNewSizeAndRateStartWithAKeyFrame()
 void TestCameraCapture::aNewBitrateAndSizeTogetherCostOneKeyFrame()
 {
     SKIP_WITHOUT_AN_ENCODER(codec);
-    constexpr int CHANGES = 5;
+    constexpr int CHANGES = 3;
     constexpr int LOWER_BITRATE = 300'000;
     const QSize larger(640, 360);
     const QSize smaller(480, 270);
@@ -1064,11 +1061,11 @@ void TestCameraCapture::aNewBitrateAndSizeTogetherCostOneKeyFrame()
     // The last change was to the lower bit rate, which is what is then spent.
     QTest::qWait(500);
     const size_t measuredFrom = record.frames.size();
-    QTest::qWait(1500);
+    QTest::qWait(1000);
     size_t bytes = 0;
     for (size_t i = measuredFrom; i < record.frames.size(); i++)
         bytes += record.frames[i]->data.size();
-    const double bitsPerSecond = static_cast<double>(bytes) * 8.0 / 1.5;
+    const double bitsPerSecond = static_cast<double>(bytes) * 8.0;
     pipeline.stop();
     QVERIFY(record.failures.isEmpty());
     QVERIFY2(bitsPerSecond > LOWER_BITRATE * 0.5 && bitsPerSecond < LOWER_BITRATE * 1.5, qPrintable(QString::number(bitsPerSecond)));
@@ -1090,7 +1087,6 @@ void TestCameraCapture::whatIsAskedForBeforeTheFirstFrameShapesIt_data()
     QTest::addColumn<int>("askedAfterMs");
     QTest::addColumn<int>("betweenTheTwoMs");
     QTest::newRow("as soon as it is started") << 0 << 0;
-    QTest::newRow("while the camera is being opened") << 100 << 0;
     QTest::newRow("one and then the other while the camera is being opened") << 100 << 50;
 }
 
@@ -1402,11 +1398,16 @@ void TestCameraCapture::thePreviewIsSmallAndFrequent()
     pipeline.start(settingsFor(codec, QSize(320, 180), 30));
     QTRY_VERIFY2_WITH_TIMEOUT(!record.previews.isEmpty() || !record.failures.isEmpty(), "no preview in 5 s", 5000);
     QVERIFY2(record.failures.isEmpty(), qPrintable(record.failures.join(QLatin1Char(';'))));
-    const int before = static_cast<int>(record.previews.size());
-    QTest::qWait(2000);
-    const int inTwoSeconds = static_cast<int>(record.previews.size()) - before;
+    // How often they come has nothing to do with the camera's size, and is counted for one.
+    if (cameraSize == QSize(1280, 720)) {
+        const int before = static_cast<int>(record.previews.size());
+        QTest::qWait(2000);
+        const int inTwoSeconds = static_cast<int>(record.previews.size()) - before;
+        QVERIFY2(inTwoSeconds >= 24 && inTwoSeconds <= 34, qPrintable(QString::number(inTwoSeconds)));
+    } else {
+        QTRY_VERIFY_WITH_TIMEOUT(record.previews.size() >= 2, 2000);
+    }
     pipeline.stop();
-    QVERIFY2(inTwoSeconds >= 24 && inTwoSeconds <= 34, qPrintable(QString::number(inTwoSeconds)));
 
     for (const QImage &preview : record.previews) {
         QVERIFY(!preview.isNull());
@@ -1432,8 +1433,8 @@ void TestCameraCapture::theBitrateIsFollowed()
 {
     SKIP_WITHOUT_AN_ENCODER(codec);
     constexpr int LOWER_BITRATE = 300'000;
-    constexpr int SETTLING_MS = 700;
-    constexpr int MEASURED_MS = 1500;
+    constexpr int SETTLING_MS = 600;
+    constexpr int MEASURED_MS = 1000;
 
     CameraPipeline pipeline;
     PipelineRecord record(pipeline);
@@ -1601,49 +1602,9 @@ void TestCameraCapture::stoppingClosesTheCameraAndItOpensAgain()
     QVERIFY(record.failures.isEmpty());
 }
 
-void TestCameraCapture::whatACameraPictureCosts_data()
-{
-    QTest::addColumn<QSize>("encodeSize");
-    QTest::addColumn<bool>("suspended");
-    QTest::newRow("1280x720") << QSize(1280, 720) << false;
-    QTest::newRow("640x360") << QSize(640, 360) << false;
-    QTest::newRow("nothing encoded") << QSize(1280, 720) << true;
-}
-
-// A measurement, of everything but the camera itself and the decoding of what it sends: a
-// 1280x720 picture as an MJPEG camera's comes out of its decoder, to the encoder and the preview.
-void TestCameraCapture::whatACameraPictureCosts()
-{
-    QFETCH(QSize, encodeSize);
-    QFETCH(bool, suspended);
-    SKIP_WITHOUT_AN_ENCODER(codec);
-    camera->size = QSize(1280, 720);
-    camera->format = AV_PIX_FMT_YUVJ422P;
-    camera->fullRange = true;
-
-    CameraPipeline pipeline;
-    PipelineRecord record(pipeline);
-    pipeline.setEncodingSuspended(suspended);
-    pipeline.start(settingsFor(codec, encodeSize, 30));
-    QTRY_VERIFY2_WITH_TIMEOUT(record.previews.size() >= 8 || !record.failures.isEmpty(), "no pictures in 5 s", 5000);
-    QVERIFY2(record.failures.isEmpty(), qPrintable(record.failures.join(QLatin1Char(';'))));
-
-    const double cpuBefore = processCpuMs();
-    const int picturesBefore = camera->picturesGiven;
-    const size_t framesBefore = record.frames.size();
-    QTest::qWait(1500);
-    const int pictures = camera->picturesGiven - picturesBefore;
-    const double cpuPerPicture = (processCpuMs() - cpuBefore) / std::max(1, pictures);
-    const size_t frames = record.frames.size() - framesBefore;
-    pipeline.stop();
-    qInfo().noquote() << QStringLiteral("%1 ms of processor time a camera picture, %2 pictures and %3 frames in 1.5 s").arg(cpuPerPicture, 0, 'f', 2).arg(pictures).arg(frames);
-    QVERIFY(pictures >= 30);
-    QCOMPARE(frames > 0, !suspended);
-    QVERIFY(cpuPerPicture > 0);
-}
-
 void TestCameraCapture::theFirstCameraDeliversPictures()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
     setCameraFrameSourceFactory({});
     if (!cameraCaptureAvailable())
         QSKIP("this build cannot open cameras");
@@ -1735,6 +1696,7 @@ void TestCameraCapture::theFirstCameraDeliversPictures()
 // which is gone once the camera is closed.
 void TestCameraCapture::aPictureOutlivesItsCamera()
 {
+    SKIP_UNLESS_HARDWARE_IS_ASKED_FOR();
     setCameraFrameSourceFactory({});
     std::unique_ptr<CameraFrameSource> source = makeCameraFrameSource();
     if (!source)

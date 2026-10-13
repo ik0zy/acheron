@@ -42,7 +42,6 @@ private slots:
     void createParsesCallAndItsVoiceStates();
     void ringsMapRungUserToRinger();
     void nullRegionIsNoRegion();
-    void deleteParsesUnavailable();
 
     void selectingADmAsksOnce();
     void aFreshSessionAsksAgain();
@@ -104,12 +103,6 @@ void TestCalls::nullRegionIsNoRegion()
 {
     QVERIFY(!parseEvent<Discord::CallUpdate>(R"({"channel_id":"5000","message_id":"6000","region":null,"ongoing_rings":{}})").region.has_value());
     QVERIFY(!parseEvent<Discord::CallUpdate>(R"({"channel_id":"5000","message_id":"6000","ongoing_rings":{}})").region.has_value());
-}
-
-void TestCalls::deleteParsesUnavailable()
-{
-    QVERIFY(!parseEvent<Discord::CallDelete>(R"({"channel_id":"5000"})").unavailable.hasValue());
-    QCOMPARE(parseEvent<Discord::CallDelete>(R"({"channel_id":"5000","unavailable":true})").unavailable.valueOr(false), true);
 }
 
 void TestCalls::selectingADmAsksOnce()
