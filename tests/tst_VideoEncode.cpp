@@ -2875,8 +2875,9 @@ void TestVideoEncode::screensAreListedWithThumbnails()
     {
         using namespace Core::Video;
         if (captureMethodUsable(CaptureMethod::Portal)) {
+            // With one more for what was shared last time, once something has been.
             const QList<CaptureSource> offered = captureSources(CaptureMethod::Portal);
-            QCOMPARE(offered.size(), 1);
+            QVERIFY(offered.size() == 1 || offered.size() == 2);
             QCOMPARE(offered.first().kind, CaptureSource::Kind::Screen);
             QVERIFY(isChosenByTheDesktop(offered.first()));
             QVERIFY(!isHandedOverByTheDesktop(offered.first()));
@@ -3873,7 +3874,7 @@ void TestVideoEncode::windowsAreListedWithoutThisProgramsOwn()
     }
     if (captureMethodUsable(CaptureMethod::Portal)) {
         const QList<CaptureSource> offered = captureWindows(CaptureMethod::Portal);
-        QCOMPARE(offered.size(), 1);
+        QVERIFY(offered.size() == 1 || offered.size() == 2);
         QCOMPARE(offered.first().kind, CaptureSource::Kind::Window);
         QVERIFY(isChosenByTheDesktop(offered.first()));
         QVERIFY(!isHandedOverByTheDesktop(offered.first()));

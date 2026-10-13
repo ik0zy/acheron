@@ -9,6 +9,7 @@
 #include "Core/Video/PictureConverter.hpp"
 
 #include <QCoreApplication>
+#include <QSettings>
 
 #include <algorithm>
 #include <cstring>
@@ -30,6 +31,10 @@ using Clock = std::chrono::steady_clock;
 
 const QLatin1String PORTAL_SCREEN_ID("portal:screen");
 const QLatin1String PORTAL_WINDOW_ID("portal:window");
+const QLatin1String PORTAL_SCREEN_AGAIN_ID("portal:screen:again");
+const QLatin1String PORTAL_WINDOW_AGAIN_ID("portal:window:again");
+const char *const PORTAL_SCREEN_TOKEN_KEY = "video/portal_screen_token";
+const char *const PORTAL_WINDOW_TOKEN_KEY = "video/portal_window_token";
 const QLatin1String PIPEWIRE_ID_PREFIX("pipewire:");
 const QLatin1String WINDOW_ID_PREFIX("window:");
 constexpr int HD_HEIGHT = 720;
@@ -82,6 +87,31 @@ CaptureSource chosenInTheDesktopsDialog(CaptureSource::Kind kind)
     choice.id = kind == CaptureSource::Kind::Window ? PORTAL_WINDOW_ID : PORTAL_SCREEN_ID;
     choice.name = kind == CaptureSource::Kind::Window ? inContext("Window") : inContext("Screen");
     return choice;
+}
+
+const char *tokenKeyOf(CaptureSource::Kind kind)
+{
+    return kind == CaptureSource::Kind::Window ? PORTAL_WINDOW_TOKEN_KEY : PORTAL_SCREEN_TOKEN_KEY;
+}
+
+bool standsForTheLastChoice(const CaptureSource &source)
+{
+    return source.id == PORTAL_SCREEN_AGAIN_ID || source.id == PORTAL_WINDOW_AGAIN_ID;
+}
+
+// A new choice in the desktop's dialog and, once the desktop has handed out a token to remember
+// one by, the same again without the dialog.
+QList<CaptureSource> offeredByTheDesktop(CaptureSource::Kind kind)
+{
+    QList<CaptureSource> offered = { chosenInTheDesktopsDialog(kind) };
+    if (QSettings().value(tokenKeyOf(kind)).toString().isEmpty())
+        return offered;
+
+    CaptureSource again = offered.first();
+    again.id = kind == CaptureSource::Kind::Window ? PORTAL_WINDOW_AGAIN_ID : PORTAL_SCREEN_AGAIN_ID;
+    again.name = kind == CaptureSource::Kind::Window ? inContext("Window shared last time") : inContext("Screen shared last time");
+    offered.append(again);
+    return offered;
 }
 
 bool waitedForRetry(Clock::time_point retryAt)
@@ -227,20 +257,20 @@ bool captureMethodUsable(CaptureMethod method)
 QList<CaptureSource> captureSources(CaptureMethod method)
 {
     if (usesPortal(method))
-        return { chosenInTheDesktopsDialog(CaptureSource::Kind::Screen) };
+        return offeredByTheDesktop(CaptureSource::Kind::Screen);
     return X11Capture::screens();
 }
 
 QList<CaptureSource> captureWindows(CaptureMethod method)
 {
     if (usesPortal(method))
-        return { chosenInTheDesktopsDialog(CaptureSource::Kind::Window) };
+        return offeredByTheDesktop(CaptureSource::Kind::Window);
     return X11Capture::windows();
 }
 
 bool isChosenByTheDesktop(const CaptureSource &source)
 {
-    return source.id == PORTAL_SCREEN_ID || source.id == PORTAL_WINDOW_ID;
+    return source.id == PORTAL_SCREEN_ID || source.id == PORTAL_WINDOW_ID || standsForTheLastChoice(source);
 }
 
 bool isHandedOverByTheDesktop(const CaptureSource &source)
@@ -250,10 +280,23 @@ bool isHandedOverByTheDesktop(const CaptureSource &source)
 
 void chooseSource(const CaptureSource &source, QObject *receiver, std::function<void(const CaptureSource &, const QString &)> chosen)
 {
-    if (isChosenByTheDesktop(source))
-        PortalCapture::choose(source.kind, receiver, std::move(chosen));
-    else
+    if (!isChosenByTheDesktop(source)) {
         chosen(source, QString());
+        return;
+    }
+
+    // A token is good for one use: the desktop hands out the next with what it hands over, and
+    // PortalCapture has put that in the old one's place by the time it reports. A desktop that
+    // no longer knows a token shows its dialog after all.
+    static QString tokens[2];
+    QString *token = &tokens[source.kind == CaptureSource::Kind::Window ? 1 : 0];
+    const char *key = tokenKeyOf(source.kind);
+    *token = standsForTheLastChoice(source) ? QSettings().value(key).toString() : QString();
+    PortalCapture::chooseAgain(source.kind, token, receiver, [token, key, chosen = std::move(chosen)](const CaptureSource &handedOver, const QString &failure) {
+        if (!handedOver.id.isEmpty())
+            QSettings().setValue(key, *token);
+        chosen(handedOver, failure);
+    });
 }
 
 void releaseSource(const CaptureSource &source)

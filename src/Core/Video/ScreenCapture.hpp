@@ -50,7 +50,8 @@ void setCaptureMethod(CaptureMethod method);
 [[nodiscard]] bool captureMethodUsable(CaptureMethod method);
 
 // What a method has to offer. The portal lists nothing: it offers one screen and one window,
-// each standing for whatever the user goes on to choose in the desktop's dialog.
+// each standing for whatever the user goes on to choose in the desktop's dialog, and beside
+// each, once the desktop remembers a choice, one that stands for the same again.
 [[nodiscard]] QList<CaptureSource> captureSources(CaptureMethod method);
 [[nodiscard]] QList<CaptureSource> captureWindows(CaptureMethod method);
 [[nodiscard]] bool isChosenByTheDesktop(const CaptureSource &source);
