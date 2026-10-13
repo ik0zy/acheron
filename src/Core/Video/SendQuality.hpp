@@ -140,6 +140,8 @@ public:
     void setSharingScreen(bool sharing);
     // One of the server's reports, as SendRateController::report takes it.
     void reportLoss(double lossFraction, qint64 nowMs);
+    // The receiving side's estimate, as SendRateController::setReceiverLimit takes it.
+    void setReceiverLimit(qint64 bitsPerSecond);
 
     // Takes up what has become due by `nowMs` and returns what the encoder is to be doing.
     CameraEncoding advance(qint64 nowMs);

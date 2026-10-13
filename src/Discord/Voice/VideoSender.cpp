@@ -12,6 +12,9 @@ namespace {
 
 constexpr int VIDEO_CLOCK_KHZ = 90;
 constexpr qint64 HISTORY_US = qint64(VideoSendStream::HISTORY_MS) * 1000;
+constexpr qint64 BURST_US = qint64(VideoSendStream::BURST_MS) * 1000;
+constexpr qint64 MAX_QUEUE_US = qint64(VideoSendStream::MAX_QUEUE_MS) * 1000;
+constexpr qint64 RETRANSMISSION_WINDOW_US = qint64(VideoSendStream::RETRANSMISSION_WINDOW_MS) * 1000;
 // A reception report answers one of the last few sender reports; older ones are of no use.
 constexpr size_t REMEMBERED_REPORTS = 8;
 
@@ -35,6 +38,12 @@ void VideoSendStream::setCodec(VideoCodec codec, uint8_t mediaPayloadType, std::
         packetizer.emplace(codec, firstPictureId);
 }
 
+void VideoSendStream::setBitrate(int bitsPerSecond)
+{
+    if (bitsPerSecond > 0)
+        targetBitrate = bitsPerSecond;
+}
+
 int VideoSendStream::maxPayloadSize() const
 {
     // As WebRTC does, room is left in every packet for it to be sent again whole.
@@ -55,6 +64,8 @@ bool VideoSendStream::queueFrame(std::span<const uint8_t> frame, uint32_t rtpTim
         packet.payload = std::move(payloads[i]);
         packet.timestamp = rtpTimestamp;
         packet.marker = i + 1 == payloads.size();
+        packet.queuedUs = nowUs;
+        queuedBytes += static_cast<qint64>(packet.payload.size());
     }
 
     framesQueued = true;
@@ -74,9 +85,31 @@ void VideoSendStream::retransmit(std::span<const uint16_t> sequences, qint64 now
 
     forgetOld(nowUs);
     for (uint16_t sequence : sequences) {
-        if (findSent(sequence) && std::find(resends.begin(), resends.end(), sequence) == resends.end())
-            resends.push_back(sequence);
+        Packet *sent = findSent(sequence);
+        if (!sent || sent->resendWaiting)
+            continue;
+        if (sent->resentUs >= 0 && nowUs - sent->resentUs < roundTripUs())
+            continue;
+        if (!takeResendShare(static_cast<qint64>(sent->payload.size()), nowUs))
+            break;
+        sent->resendWaiting = true;
+        resends.push_back(sequence);
     }
+}
+
+bool VideoSendStream::takeResendShare(qint64 bytes, qint64 nowUs)
+{
+    while (!resentLately.empty() && nowUs - resentLately.front().atUs >= RETRANSMISSION_WINDOW_US) {
+        resentLatelyBytes -= resentLately.front().bytes;
+        resentLately.pop_front();
+    }
+
+    const qint64 share = static_cast<qint64>(targetBitrate) * RETRANSMISSION_WINDOW_MS / 8000;
+    if (resentLatelyBytes + bytes > share)
+        return false;
+    resentLately.push_back({ nowUs, bytes });
+    resentLatelyBytes += bytes;
+    return true;
 }
 
 void VideoSendStream::clear()
@@ -84,18 +117,33 @@ void VideoSendStream::clear()
     queued.clear();
     resends.clear();
     history.clear();
-    intervalAllowance = 0;
+    queuedBytes = 0;
+    budget = 0;
+    budgetedUs = -1;
 }
 
-void VideoSendStream::startInterval()
+qint64 VideoSendStream::pacingRate(qint64 nowUs) const
 {
-    const size_t waiting = queued.size() + resends.size();
-    intervalAllowance = static_cast<int>(std::max<size_t>(PACKETS_PER_INTERVAL, (waiting + DRAIN_INTERVALS - 1) / DRAIN_INTERVALS));
+    const qint64 rate = static_cast<qint64>(targetBitrate * PACING_FACTOR);
+    if (queued.empty())
+        return rate;
+    const qint64 leftUs = std::max<qint64>(1000, MAX_QUEUE_US - (nowUs - queued.front().queuedUs));
+    return std::max(rate, queuedBytes * 8 * 1000000 / leftUs);
+}
+
+void VideoSendStream::startInterval(qint64 nowUs)
+{
+    const qint64 rate = pacingRate(nowUs);
+    const qint64 burst = std::min<qint64>(rate * BURST_MS / 8000, MAX_BURST_BYTES);
+    // After a pause a whole burst may leave at once, as after the first frame.
+    const qint64 earnedUs = budgetedUs < 0 ? BURST_US : std::clamp<qint64>(nowUs - budgetedUs, 0, BURST_US);
+    budgetedUs = nowUs;
+    budget = std::min(burst, budget + rate * earnedUs / 8000000);
 }
 
 bool VideoSendStream::writeNext(qint64 nowUs, PacketBuffer &out)
 {
-    if (intervalAllowance <= 0)
+    if (budget <= 0)
         return false;
     forgetOld(nowUs);
 
@@ -103,10 +151,14 @@ bool VideoSendStream::writeNext(qint64 nowUs, PacketBuffer &out)
         const uint16_t sequence = resends.front();
         resends.pop_front();
 
-        const Packet *original = findSent(sequence);
-        if (!original || !write(out, *original, true, nowUs))
+        Packet *original = findSent(sequence);
+        if (!original)
             continue;
-        intervalAllowance--;
+        original->resendWaiting = false;
+        if (!write(out, *original, true, nowUs))
+            continue;
+        original->resentUs = nowUs;
+        budget -= out.size();
         counters.retransmitted++;
         return true;
     }
@@ -114,13 +166,14 @@ bool VideoSendStream::writeNext(qint64 nowUs, PacketBuffer &out)
     while (!queued.empty()) {
         Packet packet = std::move(queued.front());
         queued.pop_front();
+        queuedBytes -= static_cast<qint64>(packet.payload.size());
         packet.sequence = nextSequence;
         packet.sentUs = nowUs;
         if (!write(out, packet, false, nowUs))
             continue;
 
         nextSequence++;
-        intervalAllowance--;
+        budget -= out.size();
         counters.packets++;
         counters.bytes += packet.payload.size();
         history.push_back(std::move(packet));
@@ -172,7 +225,7 @@ bool VideoSendStream::write(PacketBuffer &out, const Packet &packet, bool retran
     return true;
 }
 
-const VideoSendStream::Packet *VideoSendStream::findSent(uint16_t sequence) const
+VideoSendStream::Packet *VideoSendStream::findSent(uint16_t sequence)
 {
     if (history.empty())
         return nullptr;
@@ -180,10 +233,25 @@ const VideoSendStream::Packet *VideoSendStream::findSent(uint16_t sequence) cons
     return index < history.size() ? &history[index] : nullptr;
 }
 
+qint64 VideoSendStream::roundTripUs() const
+{
+    return counters.roundTripMs < 0 ? 0 : qint64(counters.roundTripMs + ROUND_TRIP_MARGIN_MS) * 1000;
+}
+
 void VideoSendStream::forgetOld(qint64 nowUs)
 {
-    while (!history.empty() && nowUs - history.front().sentUs > HISTORY_US)
+    const qint64 keptUs = std::max(HISTORY_US, HISTORY_ROUND_TRIPS * roundTripUs());
+    while (!history.empty()) {
+        const Packet &oldest = history.front();
+        if (history.size() < size_t(MAX_HISTORY_PACKETS)) {
+            const qint64 age = nowUs - oldest.sentUs;
+            if (oldest.resendWaiting || age <= keptUs)
+                return;
+            if (history.size() < size_t(HISTORY_PACKETS) && age <= keptUs * SPARSE_HISTORY_FACTOR)
+                return;
+        }
         history.pop_front();
+    }
 }
 
 int VideoSendStream::writeSenderReport(std::span<uint8_t> out, qint64 nowUs, uint64_t ntpTime)

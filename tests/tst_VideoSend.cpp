@@ -322,7 +322,7 @@ std::vector<Written> interval(VideoSendStream &sender, qint64 nowUs)
 {
     std::vector<Written> out;
     PacketBuffer packet;
-    sender.startInterval();
+    sender.startInterval(nowUs);
     while (sender.writeNext(nowUs, packet)) {
         if (const std::optional<Written> written = takeApart(packet))
             out.push_back(*written);
@@ -330,17 +330,54 @@ std::vector<Written> interval(VideoSendStream &sender, qint64 nowUs)
     return out;
 }
 
-// Everything that is waiting, over as many intervals as it takes.
+// Everything that is waiting, written as of `nowUs`. Only the pace is told that time goes by,
+// which is what makes it let everything out.
 std::vector<Written> drain(VideoSendStream &sender, qint64 nowUs)
 {
     std::vector<Written> out;
-    while (sender.hasWaiting()) {
-        const std::vector<Written> some = interval(sender, nowUs);
-        if (some.empty())
-            break;
-        out.insert(out.end(), some.begin(), some.end());
+    PacketBuffer packet;
+    qint64 paceUs = nowUs;
+    for (int intervals = 0; sender.hasWaiting() && intervals < 10000; intervals++) {
+        sender.startInterval(paceUs);
+        while (sender.writeNext(nowUs, packet)) {
+            if (const std::optional<Written> written = takeApart(packet))
+                out.push_back(*written);
+        }
+        paceUs += VideoSendStream::BURST_MS * MS;
     }
     return out;
+}
+
+qint64 bytesIn(const std::vector<Written> &packets)
+{
+    qint64 bytes = 0;
+    for (const Written &packet : packets)
+        bytes += packet.size;
+    return bytes;
+}
+
+// What the pace lets out in a millisecond at this bitrate: 1.1 times the bitrate, as the
+// official client has it, and a burst of 40 ms of that.
+double paceOf(int bitrate)
+{
+    return bitrate * 1.1 / 8000.0;
+}
+
+double burstOf(int bitrate)
+{
+    return paceOf(bitrate) * 40;
+}
+
+void tellRoundTrip(VideoSendStream &sender, int milliseconds)
+{
+    constexpr uint64_t NTP = uint64_t(3976214400) << 32;
+    uint8_t buffer[64];
+    QVERIFY(sender.writeSenderReport(buffer, 0, NTP) > 0);
+    ReceptionReport report;
+    report.ssrc = SSRC;
+    report.lastSenderReport = compactNtp(NTP);
+    sender.onReceptionReport(report, milliseconds * MS);
+    QCOMPARE(sender.stats().roundTripMs, milliseconds);
 }
 
 Payloads payloadsOf(const std::vector<Written> &packets)
@@ -420,13 +457,20 @@ private slots:
     void theSendTimeIsSecondsInFixedPoint();
     void noPacketIsLargerThanTheLimit_data();
     void noPacketIsLargerThanTheLimit();
-    void aFrameLeavesInSharesAndInOrder();
-    void aBacklogLeavesFaster();
+    void aFrameLeavesAtThePaceOfItsBitrate_data();
+    void aFrameLeavesAtThePaceOfItsBitrate();
+    void aFrameWithinTheBurstLeavesAtOnce();
+    void aBacklogLeavesWithinTheQueueTime();
     void nothingLeavesOutsideAnInterval();
     void aLostPacketIsSentAgainOnTheRetransmissionStream();
     void retransmissionsGoAheadOfNewPackets();
     void whatWasNeverSentIsNotSentAgain();
-    void theHistoryEndsAfterASecond();
+    void aPacketWaitingToGoAgainIsNotQueuedTwice();
+    void aPacketIsNotSentAgainWithinARoundTrip();
+    void repairsTakeNoMoreThanTheBitrate();
+    void aSparseHistoryLastsThreeSeconds();
+    void aFullHistoryEndsAfterASecond();
+    void theHistoryOutlastsThreeRoundTrips();
     void withoutARetransmissionPayloadTypeNothingIsSentAgain();
     void aReceiverRepairsALossFromTheHistory();
     void changingTheCodecKeepsTheNumbering();
@@ -438,6 +482,8 @@ private slots:
     void aReceptionReportGivesLossAndRoundTrip();
     void feedbackForTheSenderIsRead();
     void theReceiverCountIsRead();
+    void theReceiverEstimateIsRead();
+    void aVideoResetRequestIsRead();
 };
 
 void TestVideoSend::vp8FramesComeBackWhole_data()
@@ -1246,6 +1292,8 @@ void TestVideoSend::noPacketIsLargerThanTheLimit()
 
     VideoSendStream sender(SSRC, RTX_SSRC, FIRST);
     sender.setCodec(static_cast<VideoCodec>(codec), PAYLOAD_TYPE, RTX_PAYLOAD_TYPE);
+    // Enough that every packet may be sent again at once.
+    sender.setBitrate(100000000);
     QVERIFY(sender.queueFrame(frame, 0, true, 0));
     const std::vector<Written> packets = drain(sender, 0);
     QVERIFY(!packets.empty());
@@ -1278,45 +1326,82 @@ void TestVideoSend::noPacketIsLargerThanTheLimit()
     QCOMPARE(reassembled, frame);
 }
 
-void TestVideoSend::aFrameLeavesInSharesAndInOrder()
+void TestVideoSend::aFrameLeavesAtThePaceOfItsBitrate_data()
 {
-    VideoSendStream sender = vp8Sender();
-    QVERIFY(sender.queueFrame(vp8Frame(true, 30 * VP8_ROOM, 80), 0, true, 0));
+    QTest::addColumn<int>("bitrate");
 
-    std::vector<size_t> shares;
+    QTest::newRow("1 Mbps") << 1000000;
+    QTest::newRow("2 Mbps") << 2000000;
+    QTest::newRow("3.5 Mbps") << 3500000;
+}
+
+void TestVideoSend::aFrameLeavesAtThePaceOfItsBitrate()
+{
+    QFETCH(int, bitrate);
+    constexpr int PACKETS = 20;
+
+    VideoSendStream sender = vp8Sender();
+    sender.setBitrate(bitrate);
+    QVERIFY(sender.queueFrame(vp8Frame(true, PACKETS * VP8_ROOM, 80), 0, true, 0));
+
+    const double burst = burstOf(bitrate);
+    qint64 left = 0;
+    qint64 doneAtMs = -1;
     std::vector<Written> packets;
-    for (qint64 now = 0; sender.hasWaiting(); now += VideoSendStream::PACE_INTERVAL_MS * MS) {
-        const std::vector<Written> share = interval(sender, now);
-        shares.push_back(share.size());
+    for (qint64 ms = 0; sender.hasWaiting(); ms += VideoSendStream::PACE_INTERVAL_MS) {
+        QVERIFY(ms < 1000);
+        const std::vector<Written> share = interval(sender, ms * MS);
         packets.insert(packets.end(), share.begin(), share.end());
-        QVERIFY(shares.size() <= 30);
+        left += bytesIn(share);
+        // Never more than a burst ahead of the pace, give or take the packet that crossed the line.
+        QVERIFY2(left <= burst + paceOf(bitrate) * ms + VideoSendStream::MAX_PACKET_SIZE, qPrintable(QStringLiteral("%1 bytes out after %2 ms").arg(left).arg(ms)));
+        doneAtMs = ms;
     }
 
-    QCOMPARE(shares, (std::vector<size_t>{ 8, 8, 8, 6 }));
+    QCOMPARE(packets.size(), size_t(PACKETS));
+    // And not behind it either: the frame is out when the pace has earned it, to the interval.
+    const double earnedAtMs = std::max(0.0, (left - burst) / paceOf(bitrate));
+    QVERIFY2(doneAtMs <= earnedAtMs + VideoSendStream::PACE_INTERVAL_MS, qPrintable(QStringLiteral("out after %1 ms, earned after %2").arg(doneAtMs).arg(earnedAtMs)));
+    QVERIFY(doneAtMs < VideoSendStream::MAX_QUEUE_MS);
+
     for (size_t i = 0; i < packets.size(); i++)
         QCOMPARE(packets[i].header.sequence, static_cast<uint16_t>(FIRST.sequence + i));
     QVERIFY(packets.back().header.marker);
-    // Each share is stamped with the time it left at.
-    QVERIFY(packets[0].sendTime() != packets[8].sendTime());
-    QCOMPARE(packets[8].sendTime(), packets[15].sendTime());
+    if (doneAtMs > 0)
+        QVERIFY(packets.front().sendTime() != packets.back().sendTime());
 }
 
-void TestVideoSend::aBacklogLeavesFaster()
+void TestVideoSend::aFrameWithinTheBurstLeavesAtOnce()
 {
     VideoSendStream sender = vp8Sender();
+    sender.setBitrate(3500000);
+    // 40 ms of 3.85 Mbps is 19 kB: a frame and a half at 30 a second.
+    QVERIFY(sender.queueFrame(vp8Frame(false, 12 * VP8_ROOM, 81), 0, false, 0));
+    QCOMPARE(interval(sender, 0).size(), size_t(12));
+    QVERIFY(!sender.hasWaiting());
+
+    // The burst is spent: of the next frame, too soon after, only a part leaves.
+    QVERIFY(sender.queueFrame(vp8Frame(false, 12 * VP8_ROOM, 82), 3000, false, 5 * MS));
+    QVERIFY(interval(sender, 5 * MS).size() < size_t(12));
+    QVERIFY(sender.hasWaiting());
+}
+
+void TestVideoSend::aBacklogLeavesWithinTheQueueTime()
+{
+    VideoSendStream sender = vp8Sender();
+    sender.setBitrate(2000000);
+    // Nearly half a megabyte, which at the bitrate's own pace would take close to two seconds.
     QVERIFY(sender.queueFrame(vp8Frame(true, 400 * VP8_ROOM, 81), 0, true, 0));
 
-    // A twentieth of what waits, as long as that is more than the usual share.
-    QCOMPARE(interval(sender, 0).size(), size_t(20));
-    QCOMPARE(interval(sender, 0).size(), size_t(19));
-
-    int intervals = 2;
-    while (sender.hasWaiting()) {
-        QVERIFY(interval(sender, 0).size() >= size_t(VideoSendStream::PACKETS_PER_INTERVAL) || !sender.hasWaiting());
-        intervals++;
+    qint64 ms = 0;
+    size_t packets = 0;
+    for (; sender.hasWaiting(); ms += VideoSendStream::PACE_INTERVAL_MS) {
+        QVERIFY(ms <= VideoSendStream::MAX_QUEUE_MS);
+        packets += interval(sender, ms * MS).size();
     }
-    // A key frame of nearly half a megabyte is out within a quarter of a second.
-    QVERIFY(intervals * VideoSendStream::PACE_INTERVAL_MS <= 250);
+    QCOMPARE(packets, size_t(400));
+    // It is spread over that time, not let out in one go.
+    QVERIFY(ms >= VideoSendStream::MAX_QUEUE_MS / 2);
 }
 
 void TestVideoSend::nothingLeavesOutsideAnInterval()
@@ -1327,7 +1412,8 @@ void TestVideoSend::nothingLeavesOutsideAnInterval()
     PacketBuffer packet;
     QVERIFY(!sender.writeNext(0, packet));
 
-    QCOMPARE(interval(sender, 0).size(), size_t(8));
+    const size_t first = interval(sender, 0).size();
+    QVERIFY(first > 0 && first < 20);
     // The share is spent; more waits for the next interval.
     QVERIFY(sender.hasWaiting());
     QVERIFY(!sender.writeNext(0, packet));
@@ -1385,7 +1471,7 @@ void TestVideoSend::retransmissionsGoAheadOfNewPackets()
 
     // The repeat takes the first place in the share, and counts against it.
     const std::vector<Written> share = interval(sender, 10 * MS);
-    QCOMPARE(share.size(), size_t(VideoSendStream::PACKETS_PER_INTERVAL));
+    QVERIFY(share.size() >= 2 && share.size() < 13);
     QCOMPARE(share[0].header.ssrc, RTX_SSRC);
     for (size_t i = 1; i < share.size(); i++) {
         QCOMPARE(share[i].header.ssrc, SSRC);
@@ -1406,8 +1492,89 @@ void TestVideoSend::whatWasNeverSentIsNotSentAgain()
     QVERIFY(drain(sender, MS).empty());
 }
 
-void TestVideoSend::theHistoryEndsAfterASecond()
+void TestVideoSend::aPacketWaitingToGoAgainIsNotQueuedTwice()
 {
+    VideoSendStream sender = vp8Sender();
+    QVERIFY(sender.queueFrame(vp8Frame(true, 3 * VP8_ROOM, 94), 0, true, 0));
+    const std::vector<Written> sent = drain(sender, 0);
+
+    const uint16_t lost[] = { sent[1].header.sequence };
+    sender.retransmit(lost, 100 * MS);
+    sender.retransmit(lost, 101 * MS);
+    QCOMPARE(drain(sender, 102 * MS).size(), size_t(1));
+    QCOMPARE(sender.stats().nacksReceived, quint64(2));
+    QCOMPARE(sender.stats().retransmitted, quint64(1));
+}
+
+void TestVideoSend::aPacketIsNotSentAgainWithinARoundTrip()
+{
+    VideoSendStream sender = vp8Sender();
+    QVERIFY(sender.queueFrame(vp8Frame(true, 2 * VP8_ROOM, 94), 0, true, 0));
+    const std::vector<Written> sent = drain(sender, 0);
+    tellRoundTrip(sender, 100);
+    const qint64 held = (100 + VideoSendStream::ROUND_TRIP_MARGIN_MS) * MS;
+
+    // The first repeat is not held back, however soon after the packet first left.
+    const uint16_t lost[] = { sent[0].header.sequence };
+    sender.retransmit(lost, 110 * MS);
+    QCOMPARE(drain(sender, 110 * MS).size(), size_t(1));
+
+    // A second request before the first repeat can have arrived is the same loss asked about again.
+    sender.retransmit(lost, 110 * MS + held - 1);
+    QVERIFY(!sender.hasWaiting());
+    sender.retransmit(lost, 110 * MS + held);
+    QCOMPARE(drain(sender, 110 * MS + held).size(), size_t(1));
+
+    // Another packet is not held by this one's repeat.
+    const uint16_t other[] = { sent[1].header.sequence };
+    sender.retransmit(other, 110 * MS + held + 1);
+    QCOMPARE(drain(sender, 110 * MS + held + 1).size(), size_t(1));
+}
+
+void TestVideoSend::repairsTakeNoMoreThanTheBitrate()
+{
+    constexpr int BITRATE = 1000000;
+    constexpr int PACKETS = 200;
+    VideoSendStream sender = vp8Sender();
+    sender.setBitrate(BITRATE);
+    QVERIFY(sender.queueFrame(vp8Frame(true, PACKETS * VP8_ROOM, 97), 0, true, 0));
+    const std::vector<Written> sent = drain(sender, 0);
+    QCOMPARE(sent.size(), size_t(PACKETS));
+
+    std::vector<uint16_t> everything;
+    for (const Written &packet : sent)
+        everything.push_back(packet.header.sequence);
+
+    // Half a second of the bitrate, in payload bytes.
+    const size_t share = static_cast<size_t>(BITRATE / 8 * VideoSendStream::RETRANSMISSION_WINDOW_MS / 1000 / sent[0].payload.size());
+    QVERIFY(share > 10 && share < PACKETS / 2);
+
+    sender.retransmit(everything, 100 * MS);
+    const std::vector<Written> first = drain(sender, 100 * MS);
+    QCOMPARE(first.size(), share);
+    // The front of the list is what got through; the rest of it went unanswered.
+    for (size_t i = 0; i < first.size(); i++)
+        QCOMPARE(qFromBigEndian<uint16_t>(first[i].payload.data()), everything[i]);
+
+    // Within the same half second there is no room for more.
+    const std::span<const uint16_t> rest = std::span<const uint16_t>(everything).subspan(share);
+    sender.retransmit(rest, 400 * MS);
+    QVERIFY(!sender.hasWaiting());
+
+    // Once it has passed there is.
+    sender.retransmit(rest, 100 * MS + VideoSendStream::RETRANSMISSION_WINDOW_MS * MS);
+    QCOMPARE(drain(sender, 100 * MS + VideoSendStream::RETRANSMISSION_WINDOW_MS * MS).size(), share);
+
+    // A higher bitrate leaves repairs more room at once.
+    sender.setBitrate(2 * BITRATE);
+    sender.retransmit(std::span<const uint16_t>(everything).subspan(2 * share), 100 * MS + VideoSendStream::RETRANSMISSION_WINDOW_MS * MS + 1);
+    const size_t more = drain(sender, 100 * MS + VideoSendStream::RETRANSMISSION_WINDOW_MS * MS + 1).size();
+    QVERIFY(more == share || more == share + 1);
+}
+
+void TestVideoSend::aSparseHistoryLastsThreeSeconds()
+{
+    constexpr qint64 KEPT = VideoSendStream::HISTORY_MS * VideoSendStream::SPARSE_HISTORY_FACTOR * MS;
     VideoSendStream sender = vp8Sender();
     QVERIFY(sender.queueFrame(vp8Frame(true, 2 * VP8_ROOM, 94), 0, true, 0));
     const std::vector<Written> early = drain(sender, 0);
@@ -1419,23 +1586,57 @@ void TestVideoSend::theHistoryEndsAfterASecond()
     const uint16_t second[] = { early[1].header.sequence };
     const uint16_t third[] = { late[0].header.sequence };
 
-    // A second old: still there.
-    sender.retransmit(first, 1000 * MS);
-    QCOMPARE(drain(sender, 1000 * MS).size(), size_t(1));
+    sender.retransmit(first, KEPT);
+    QCOMPARE(drain(sender, KEPT).size(), size_t(1));
 
-    // Asked for in time but not out before the second is over.
-    sender.retransmit(second, 1000 * MS);
-    QVERIFY(drain(sender, 1000 * MS + 1).empty());
-
-    sender.retransmit(first, 1001 * MS);
+    sender.retransmit(second, KEPT + 1);
     QVERIFY(!sender.hasWaiting());
 
-    // What was sent later is kept its own second.
-    sender.retransmit(third, 1600 * MS);
-    const std::vector<Written> repeated = drain(sender, 1600 * MS);
+    // What was sent later is kept its own three seconds.
+    sender.retransmit(third, 600 * MS + KEPT);
+    const std::vector<Written> repeated = drain(sender, 600 * MS + KEPT);
     QCOMPARE(repeated.size(), size_t(1));
     QCOMPARE(qFromBigEndian<uint16_t>(repeated[0].payload.data()), late[0].header.sequence);
-    sender.retransmit(third, 1600 * MS + 1);
+}
+
+void TestVideoSend::aFullHistoryEndsAfterASecond()
+{
+    constexpr int EXTRA = 10;
+    VideoSendStream sender = vp8Sender();
+    QVERIFY(sender.queueFrame(vp8Frame(true, (VideoSendStream::HISTORY_PACKETS + EXTRA) * VP8_ROOM, 94), 0, true, 0));
+    const std::vector<Written> sent = drain(sender, 0);
+    QCOMPARE(sent.size(), size_t(VideoSendStream::HISTORY_PACKETS + EXTRA));
+
+    const uint16_t first[] = { sent[0].header.sequence };
+    sender.retransmit(first, VideoSendStream::HISTORY_MS * MS);
+    QCOMPARE(drain(sender, VideoSendStream::HISTORY_MS * MS).size(), size_t(1));
+
+    // Past the second the oldest go, until fewer than a full history's worth are left: those
+    // stay on as a sparse history does.
+    const uint16_t lastGone[] = { sent[EXTRA].header.sequence };
+    const uint16_t firstKept[] = { sent[EXTRA + 1].header.sequence };
+    sender.retransmit(lastGone, VideoSendStream::HISTORY_MS * MS + 1);
+    QVERIFY(!sender.hasWaiting());
+    sender.retransmit(firstKept, VideoSendStream::HISTORY_MS * MS + 1);
+    QCOMPARE(drain(sender, VideoSendStream::HISTORY_MS * MS + 1).size(), size_t(1));
+}
+
+void TestVideoSend::theHistoryOutlastsThreeRoundTrips()
+{
+    constexpr int ROUND_TRIP_MS = 600;
+    constexpr qint64 KEPT = VideoSendStream::HISTORY_ROUND_TRIPS * (ROUND_TRIP_MS + VideoSendStream::ROUND_TRIP_MARGIN_MS) * MS;
+    VideoSendStream sender = vp8Sender();
+    QVERIFY(sender.queueFrame(vp8Frame(true, (VideoSendStream::HISTORY_PACKETS + 10) * VP8_ROOM, 94), 0, true, 0));
+    const std::vector<Written> sent = drain(sender, 0);
+    tellRoundTrip(sender, ROUND_TRIP_MS);
+    QVERIFY(KEPT > VideoSendStream::HISTORY_MS * MS);
+
+    // Well past the plain second, and to the end of three round trips.
+    const uint16_t first[] = { sent[0].header.sequence };
+    const uint16_t second[] = { sent[1].header.sequence };
+    sender.retransmit(first, KEPT);
+    QCOMPARE(drain(sender, KEPT).size(), size_t(1));
+    sender.retransmit(second, KEPT + 1);
     QVERIFY(!sender.hasWaiting());
 }
 
@@ -1590,7 +1791,7 @@ void TestVideoSend::clearingForgetsWhatWaited()
     VideoSendStream sender = vp8Sender();
     QVERIFY(sender.queueFrame(vp8Frame(true, 20 * VP8_ROOM, 102), 0, true, 0));
     const std::vector<Written> sent = interval(sender, 0);
-    QCOMPARE(sent.size(), size_t(8));
+    QVERIFY(!sent.empty() && sent.size() < 20);
 
     sender.clear();
     QVERIFY(!sender.hasWaiting());
@@ -1603,7 +1804,7 @@ void TestVideoSend::clearingForgetsWhatWaited()
     QVERIFY(sender.queueFrame(vp8Frame(true, 10, 103), 3000, true, 0));
     const std::vector<Written> next = drain(sender, 0);
     QCOMPARE(next.size(), size_t(1));
-    QCOMPARE(next[0].header.sequence, static_cast<uint16_t>(sent[7].header.sequence + 1));
+    QCOMPARE(next[0].header.sequence, static_cast<uint16_t>(sent.back().header.sequence + 1));
 }
 
 void TestVideoSend::framesAreRefusedWithoutACodec()
@@ -1832,6 +2033,81 @@ void TestVideoSend::theReceiverCountIsRead()
     append32(other, SSRC);
     other.insert(other.end(), { 'D', 'I', 'S', '0' });
     QVERIFY(parseRtcp(rtcpPacket(5, 204, other)).receiverCounts.empty());
+}
+
+void TestVideoSend::theReceiverEstimateIsRead()
+{
+    constexpr uint32_t SERVER = 0xAABBCCDD;
+    const auto estimate = [](uint8_t exponent, uint32_t mantissa, std::initializer_list<uint32_t> ssrcs, int listed = -1) {
+        Bytes body;
+        append32(body, SERVER);
+        append32(body, 0);
+        body.insert(body.end(), { 'R', 'E', 'M', 'B' });
+        body.push_back(static_cast<uint8_t>(listed < 0 ? static_cast<int>(ssrcs.size()) : listed));
+        body.push_back(static_cast<uint8_t>((exponent << 2) | (mantissa >> 16)));
+        body.push_back(static_cast<uint8_t>(mantissa >> 8));
+        body.push_back(static_cast<uint8_t>(mantissa));
+        for (uint32_t ssrc : ssrcs)
+            append32(body, ssrc);
+        return rtcpPacket(15, 206, body);
+    };
+    const auto read = [](std::initializer_list<Bytes> packets) {
+        Bytes compound = rtcpPacket(0, 201, { 0xAA, 0xBB, 0xCC, 0xDD });
+        for (const Bytes &packet : packets)
+            compound.insert(compound.end(), packet.begin(), packet.end());
+        return parseRtcp(compound);
+    };
+
+    QVERIFY(!read({}).hasReceiverEstimate);
+
+    // 2,500,000 as WebRTC writes it: the mantissa shifted down until it fits 18 bits.
+    ReceivedRtcp received = read({ estimate(4, 156250, { SSRC }) });
+    QVERIFY(received.hasReceiverEstimate);
+    QCOMPARE(received.receiverEstimateBitsPerSecond, uint64_t(2500000));
+
+    QCOMPARE(read({ estimate(0, 0x3FFFF, {}) }).receiverEstimateBitsPerSecond, uint64_t(0x3FFFF));
+    QCOMPARE(read({ estimate(0, 0, { SSRC, 0x4321 }) }).receiverEstimateBitsPerSecond, uint64_t(0));
+
+    // Of several, the largest, as the official client takes them.
+    QCOMPARE(read({ estimate(1, 1000, { SSRC }), estimate(3, 1000, { SSRC }), estimate(2, 1000, { SSRC }) }).receiverEstimateBitsPerSecond, uint64_t(8000));
+
+    // One that lists more SSRCs than it brings, or says more than 64 bits hold, says nothing.
+    QVERIFY(!read({ estimate(4, 156250, { SSRC }, 2) }).hasReceiverEstimate);
+    QVERIFY(!read({ estimate(63, 0x3FFFF, { SSRC }) }).hasReceiverEstimate);
+    QVERIFY(read({ estimate(46, 0x3FFFF, { SSRC }) }).hasReceiverEstimate);
+
+    // Another application-layer message is not taken for one.
+    Bytes other = estimate(4, 156250, { SSRC });
+    other[12] = 'X';
+    QVERIFY(!read({ other }).hasReceiverEstimate);
+    // A picture loss indication shares the packet type.
+    QVERIFY(!read({ rtcpPacket(1, 206, { 0xAA, 0xBB, 0xCC, 0xDD, 0, 0, 0x12, 0x34 }) }).hasReceiverEstimate);
+}
+
+void TestVideoSend::aVideoResetRequestIsRead()
+{
+    const auto reset = [](uint32_t ssrc, std::initializer_list<uint8_t> more = {}) {
+        Bytes body;
+        append32(body, ssrc);
+        body.insert(body.end(), { 0x58, 0x53, 0x49, 0x44 });
+        body.insert(body.end(), more);
+        return rtcpPacket(0, 204, body);
+    };
+
+    Bytes compound = rtcpPacket(0, 201, { 0xAA, 0xBB, 0xCC, 0xDD });
+    for (const Bytes &packet : { reset(0x1111), reset(0x2222, { 1, 2, 3, 4 }) })
+        compound.insert(compound.end(), packet.begin(), packet.end());
+    const ReceivedRtcp received = parseRtcp(compound);
+
+    QCOMPARE(received.videoResets, (std::vector<uint32_t>{ 0x1111, 0x2222 }));
+    QVERIFY(received.receiverCounts.empty());
+    QVERIFY(!received.hasInboundEstimate);
+
+    // The receiver count is told apart by its name alone.
+    Bytes count;
+    append32(count, 0x1111);
+    count.insert(count.end(), { 0x30, 0x53, 0x49, 0x44 });
+    QVERIFY(parseRtcp(rtcpPacket(0, 204, count)).videoResets.empty());
 }
 
 QTEST_GUILESS_MAIN(TestVideoSend)

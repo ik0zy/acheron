@@ -92,6 +92,8 @@ QStringList sendStatsLines(const Core::Video::BroadcastStats &encoder, const Dis
     lines << CallView::tr("Bitrate: %1 kbps sent, %2 kbps asked of the encoder").arg(network.bitrateBps / 1000).arg(targetBitrate / 1000);
     lines << (receivers < 0 ? CallView::tr("Viewers: not reported yet") : CallView::tr("Viewers: %1").arg(receivers));
     lines << (network.lossFraction < 0 ? CallView::tr("Loss: not reported yet") : CallView::tr("Loss: %1%").arg(network.lossFraction * 100.0, 0, 'f', 1));
+    if (network.receiverEstimateBps > 0)
+        lines << CallView::tr("Receiver's estimate: %1 kbps").arg(network.receiverEstimateBps / 1000);
     return lines;
 }
 

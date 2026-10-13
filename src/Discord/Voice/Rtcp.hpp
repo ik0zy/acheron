@@ -89,6 +89,17 @@ struct ReceivedRtcp
     };
     std::vector<ReceiverCount> receiverCounts;
 
+    // The most the receiving side says the way from this client carries, in bits per second
+    // (REMB). WebRTC, and with it the official client, never aims its sending above it. Of
+    // several in one compound packet the largest counts, as the official client has it.
+    bool hasReceiverEstimate = false;
+    uint64_t receiverEstimateBitsPerSecond = 0;
+
+    // Senders whose video the server asks this client to receive afresh, each named by one of
+    // that sender's SSRCs. Discord asks in an application-defined packet, and the official
+    // client then tears down and rebuilds every video receiver it has for that sender.
+    std::vector<uint32_t> videoResets;
+
     // The server's own estimate of what the way to this client carries, in bits per second,
     // and the share of packets it sees lost on it, 0 to 1. Discord sends this in an
     // application-defined packet; the official client only keeps the number for its statistics.

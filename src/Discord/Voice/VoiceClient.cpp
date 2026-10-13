@@ -235,6 +235,8 @@ void VoiceClient::cleanupTransport()
     localKeyframeTimer = nullptr;
     videoSender.reset();
     localVideo.reset();
+    videoBitrate = 0;
+    videoReceiverEstimateBps = 0;
     announcedVideoStreams.clear();
     localKeyframeAskedMs = -1;
     localKeyframeRequests = 0;
@@ -524,6 +526,8 @@ void VoiceClient::receiveRtcp(PacketPool::Handle packet)
 
     const ReceivedRtcp received = parseRtcp(packet->bytes());
     receiveVideoFeedback(received);
+    for (uint32_t ssrc : received.videoResets)
+        receiveVideoAfresh(ssrc);
     if (videoClock.isValid()) {
         const qint64 now = videoClock.nsecsElapsed() / 1000;
         for (const ReceivedRtcp::SenderReport &report : received.senderReports)
@@ -898,8 +902,21 @@ bool VoiceClient::prepareVideoSender()
     if (offered->rtxPayloadType.hasValue())
         rtxPayloadType = static_cast<uint8_t>(offered->rtxPayloadType.get());
     videoSender->setCodec(sendCodec, static_cast<uint8_t>(offered->payloadType.get()), rtxPayloadType);
+    paceVideoByBitrate();
     registerLocalVideoWithDave();
     return true;
+}
+
+void VoiceClient::setVideoBitrate(int bitsPerSecond)
+{
+    videoBitrate = bitsPerSecond;
+    paceVideoByBitrate();
+}
+
+void VoiceClient::paceVideoByBitrate()
+{
+    if (videoSender && localVideo)
+        videoSender->setBitrate(videoBitrate > 0 ? videoBitrate : localVideo->maxBitrate);
 }
 
 void VoiceClient::registerLocalVideoWithDave()
@@ -946,6 +963,7 @@ void VoiceClient::startVideo(const LocalVideoDescription &description)
         }
         videoSendReportTimer->start(VIDEO_SEND_REPORT_INTERVAL_MS);
     }
+    paceVideoByBitrate();
     announceLocalVideo(true);
 }
 
@@ -954,6 +972,7 @@ void VoiceClient::describeVideo(const LocalVideoDescription &description)
     if (!localVideo)
         return;
     localVideo = description;
+    paceVideoByBitrate();
     announceLocalVideo(true);
 }
 
@@ -964,6 +983,7 @@ void VoiceClient::stopVideo()
     if (!localVideo)
         return;
     localVideo.reset();
+    videoBitrate = 0;
     videoSendAwaitsKeyframe = false;
 
     if (videoSender)
@@ -1087,7 +1107,7 @@ void VoiceClient::onVideoPaceTick()
         return;
     }
 
-    videoSender->startInterval();
+    videoSender->startInterval(videoClock.nsecsElapsed() / 1000);
     PacketPool::Handle packet = udpTransport->acquirePacket();
     while (videoSender->writeNext(videoClock.nsecsElapsed() / 1000, *packet)) {
         if (encryption->seal(*packet, VideoSendStream::CLEAR_SIZE))
@@ -1105,6 +1125,7 @@ void VoiceClient::onVideoSendReportTick()
     stats.codec = videoCodecName(sendCodec);
     stats.keyframeRequests = localKeyframeRequests;
     stats.receivers = videoReceivers;
+    stats.receiverEstimateBps = videoReceiverEstimateBps;
 
     if (videoSender) {
         if (videoSender->canReport() && currentState == State::Connected && encryption && udpTransport) {
@@ -1144,6 +1165,12 @@ void VoiceClient::receiveVideoFeedback(const ReceivedRtcp &received)
             noteVideoReceivers(count.receivers);
     }
 
+    if (received.hasReceiverEstimate) {
+        if (received.receiverEstimateBitsPerSecond != videoReceiverEstimateBps)
+            qCDebug(LogVoice) << "Receiving side's estimate of the way from here:" << received.receiverEstimateBitsPerSecond << "bps";
+        videoReceiverEstimateBps = received.receiverEstimateBitsPerSecond;
+    }
+
     if (!localVideo || !videoSender)
         return;
 
@@ -1164,6 +1191,27 @@ void VoiceClient::receiveVideoFeedback(const ReceivedRtcp &received)
     if (keyframeRequests > 0) {
         localKeyframeRequests += static_cast<quint64>(keyframeRequests);
         askForLocalKeyframe();
+    }
+}
+
+// The official client tears down and rebuilds every video receiver it has for the sender, which
+// leaves each waiting for a key frame and asking for one. Starting each over does the same.
+void VoiceClient::receiveVideoAfresh(quint32 ssrc)
+{
+    Core::Snowflake sender;
+    if (const auto known = ssrcToUserIdMap.constFind(ssrc); known != ssrcToUserIdMap.constEnd())
+        sender = Core::Snowflake(known.value());
+    for (const auto &[videoSsrc, video] : remoteVideos) {
+        if (videoSsrc == ssrc || video.rtxSsrc == ssrc)
+            sender = video.userId;
+    }
+    qCDebug(LogVoice) << "Server asks for the video of SSRC" << ssrc << "to be received afresh";
+    if (!sender.isValid())
+        return;
+
+    for (auto &[videoSsrc, video] : remoteVideos) {
+        if (video.receiver && video.userId == sender)
+            video.receiver->requestKeyframe();
     }
 }
 

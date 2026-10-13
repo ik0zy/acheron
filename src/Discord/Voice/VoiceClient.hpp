@@ -85,6 +85,9 @@ struct VideoSendStats
     int roundTripMs = -1;
     // How many are receiving the video, as the server counts them. Negative until it has said.
     int receivers = -1;
+    // The most the receiving side says the way from here carries (REMB). Zero until it has
+    // said.
+    quint64 receiverEstimateBps = 0;
 };
 
 // What a voice connection's IDENTIFY declares for the account's camera. The official client
@@ -171,6 +174,9 @@ public:
     void startVideo(const LocalVideoDescription &description);
     // The limits changed while sending: announces them again.
     void describeVideo(const LocalVideoDescription &description);
+    // What the video is being encoded at just now, in bits per second. Its packets are paced
+    // by it; until it is given, by the most that was announced.
+    void setVideoBitrate(int bitsPerSecond);
     // Announces that the video is off and forgets what was queued.
     void stopVideo();
     // One whole encoded frame in videoSendCodec(): Annex B for H264 and H265, with the parameter
@@ -283,6 +289,8 @@ private:
     void onVideoSendReportTick();
     void receiveVideoFeedback(const ReceivedRtcp &received);
     void noteVideoReceivers(int receivers);
+    void paceVideoByBitrate();
+    void receiveVideoAfresh(quint32 ssrc);
     void askForLocalKeyframe();
 
 private:
@@ -386,6 +394,10 @@ private:
     bool videoSendAwaitsKeyframe = false;
     // Negative until the server has said.
     int videoReceivers = -1;
+    quint64 videoReceiverEstimateBps = 0;
+    // What the video is being encoded at, once its sender has said. Zero until then, when the
+    // most that was announced stands in.
+    int videoBitrate = 0;
     quint64 videoBytesAtSendReport = 0;
     qint64 videoSendReportedUs = 0;
 

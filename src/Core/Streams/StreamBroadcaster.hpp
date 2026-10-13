@@ -189,6 +189,7 @@ private:
     void refreshLimits();
     void applyBitrateOnceSettled();
     void applyBitrate();
+    void tellBitrate();
     void applySuspension();
 
     Discord::Client *client;

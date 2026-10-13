@@ -310,6 +310,7 @@ void CameraSender::onSendStats(const VideoSendStats &sent)
     networkStats = sent;
     if (!pipelineStarted)
         return;
+    plan.setReceiverLimit(static_cast<qint64>(sent.receiverEstimateBps));
     plan.reportLoss(sent.lossFraction, clock.elapsed());
     applyPlan();
 }
@@ -453,7 +454,10 @@ void CameraSender::announceVideo()
     description.maxBitrate = Video::CAMERA_MAX_BITRATE;
 
     videoAnnounced = true;
-    QMetaObject::invokeMethod(rtc, [connection = rtc, description] { connection->startVideo(description); });
+    QMetaObject::invokeMethod(rtc, [connection = rtc, description, bitrate = asked.bitrate] {
+        connection->startVideo(description);
+        connection->setVideoBitrate(bitrate);
+    });
     applySuspension();
     // What was encoded before the client took the announcement was dropped by it, and that
     // included the frame every viewer needs first.
@@ -473,8 +477,11 @@ void CameraSender::applyPlan()
     const Video::CameraEncoding wanted = plan.advance(now);
     // The bitrate first, so that an encoder reopened for a new size opens at the rate that
     // goes with it.
-    if (wanted.bitrate != asked.bitrate)
+    if (wanted.bitrate != asked.bitrate) {
         pipeline->setBitrate(wanted.bitrate);
+        if (rtc)
+            QMetaObject::invokeMethod(rtc, [connection = rtc, bitrate = wanted.bitrate] { connection->setVideoBitrate(bitrate); });
+    }
     if (wanted.size != asked.size || wanted.framerate != asked.framerate)
         pipeline->setEncoding(wanted.size, wanted.framerate);
     asked = wanted;

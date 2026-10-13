@@ -10,6 +10,7 @@
 #include "Discord/Voice/VoiceEncryption.hpp"
 
 #include <QCryptographicHash>
+#include <QElapsedTimer>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -84,6 +85,27 @@ Bytes fullIntraRequest(quint32 mediaSsrc)
 {
     Bytes packet = { 0x84, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0 };
     qToBigEndian(mediaSsrc, packet.data() + 12);
+    return packet;
+}
+
+// REMB, with the rate as an 18-bit mantissa under a 6-bit exponent.
+Bytes receiverEstimate(quint64 bitsPerSecond)
+{
+    int exponent = 0;
+    while (bitsPerSecond >> exponent > 0x3FFFF)
+        exponent++;
+    const quint32 mantissa = static_cast<quint32>(bitsPerSecond >> exponent);
+    Bytes packet = { 0x8F, 206, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 'R', 'E', 'M', 'B', 1, static_cast<uint8_t>((exponent << 2) | (mantissa >> 16)), static_cast<uint8_t>(mantissa >> 8), static_cast<uint8_t>(mantissa), 0, 0, 0, 0 };
+    qToBigEndian(SERVER_SSRC, packet.data() + 4);
+    return packet;
+}
+
+// Discord's request to receive a sender's video afresh: an application packet named
+// 58 53 49 44, with one of that sender's SSRCs where the packet's own sender would be.
+Bytes videoReset(quint32 ssrc)
+{
+    Bytes packet = { 0x80, 204, 0, 2, 0, 0, 0, 0, 0x58, 0x53, 0x49, 0x44 };
+    qToBigEndian(ssrc, packet.data() + 4);
     return packet;
 }
 
@@ -632,6 +654,7 @@ private slots:
     void framesReachTheHandlerUnderTheirSender();
     void aLostPacketIsAskedForAndTakenFromTheRetransmission();
     void aKeyframeRequestGoesToThatSenderAlone();
+    void aVideoResetRequestStartsThatSendersVideoOver();
     void aStrayPacketLeavesTheStreamRunning();
     void everyPacketTheServerNumberedIsReportedBack();
 
@@ -640,6 +663,7 @@ private slots:
     void startingVideoAnnouncesTheLayerItIsSentOn();
     void withoutStreamsFromTheServerTheSsrcsFollowTheAudioOne();
     void aFrameArrivesAsPacketsThatReassemble();
+    void aFrameLeavesAtThePaceOfTheBitrateItWasEncodedAt();
     void stoppingVideoSaysSoAndSendsNothingMore();
     void aNackBringsThePacketBackOnTheRetransmissionStream();
     void keyframeRequestsReachTheEncoderButNotInABurst();
@@ -782,6 +806,41 @@ void TestVoiceClient::aKeyframeRequestGoesToThatSenderAlone()
     QTRY_COMPARE(call.framesFrom(ALICE), 2);
 }
 
+void TestVoiceClient::aVideoResetRequestStartsThatSendersVideoOver()
+{
+    Call call;
+    QTRY_VERIFY(call.isUp());
+    call.receiveAliceAndBob();
+
+    call.server.sendFrame(ALICE_SSRC, 0, 100, true);
+    call.server.sendFrame(BOB_SSRC, 0, 40000, true);
+    QTRY_COMPARE(call.frames.size(), 2);
+    QTest::qWait(100);
+    call.server.keyframeRequests.clear();
+
+    // Named by the SSRC of her retransmissions: any of a sender's SSRCs stands for the sender.
+    call.server.sendFeedback({ videoReset(ALICE_RTX_SSRC) });
+    QTRY_VERIFY(call.server.keyframeRequests.contains(ALICE_SSRC));
+
+    // What builds on pictures from before is of no use to a receiver made anew.
+    call.server.sendFrame(ALICE_SSRC, 1, 100, false);
+    call.server.sendFrame(BOB_SSRC, 1, 40000, false);
+    QTRY_COMPARE(call.framesFrom(BOB), 2);
+    QTest::qWait(200);
+    QCOMPARE(call.framesFrom(ALICE), 1);
+    QVERIFY(!call.server.keyframeRequests.contains(BOB_SSRC));
+
+    call.server.sendFrame(ALICE_SSRC, 2, 100, true);
+    QTRY_COMPARE(call.framesFrom(ALICE), 2);
+
+    // One that names nobody known changes nothing.
+    call.server.keyframeRequests.clear();
+    call.server.sendFeedback({ videoReset(0x7777) });
+    call.server.sendFrame(ALICE_SSRC, 3, 100, false);
+    QTRY_COMPARE(call.framesFrom(ALICE), 3);
+    QVERIFY(call.server.keyframeRequests.isEmpty());
+}
+
 void TestVoiceClient::aStrayPacketLeavesTheStreamRunning()
 {
     Call call;
@@ -907,6 +966,37 @@ void TestVoiceClient::withoutStreamsFromTheServerTheSsrcsFollowTheAudioOne()
     call.startVideo();
     QTRY_COMPARE(call.server.receivedText(12).size(), 1);
     QCOMPARE(call.server.receivedText(12)[0], QByteArray(R"({"op":12,"d":{"audio_ssrc":777,"video_ssrc":778,"rtx_ssrc":779,"streams":[{"type":"video","rid":"100","ssrc":778,"active":true,"quality":100,"rtx_ssrc":779,"max_bitrate":3500000,"max_framerate":30,"max_resolution":{"type":"fixed","width":1280,"height":720}}]}})"));
+}
+
+void TestVoiceClient::aFrameLeavesAtThePaceOfTheBitrateItWasEncodedAt()
+{
+    Call call(true);
+    QTRY_VERIFY(call.isUp());
+    call.startVideo();
+
+    // Twelve kilobytes at half a megabit: a burst of 40 ms' worth at once, the rest over more
+    // than a tenth of a second.
+    constexpr int PACKETS = 11;
+    const auto timeToArrive = [&](quint32 timestamp) {
+        call.server.rtp.clear();
+        QElapsedTimer timer;
+        timer.start();
+        call.client->sendVideoFrame(videoFrame(12000, true, timestamp));
+        [&] { QTRY_COMPARE(call.server.rtp.size(), PACKETS); }();
+        return call.server.rtp.size() == PACKETS ? timer.elapsed() : qint64(-1);
+    };
+
+    call.client->setVideoBitrate(500000);
+    const qint64 slow = timeToArrive(1000);
+    QVERIFY2(slow >= 90 && slow < 1000, qPrintable(QString::number(slow)));
+
+    // Until it is told otherwise the pace is that of the most that was announced, which
+    // stopping and starting the video brings back.
+    call.client->stopVideo();
+    call.startVideo();
+    QTest::qWait(300);
+    const qint64 fast = timeToArrive(200000);
+    QVERIFY2(fast >= 0 && fast < slow / 2, qPrintable(QStringLiteral("%1 against %2").arg(fast).arg(slow)));
 }
 
 void TestVoiceClient::aFrameArrivesAsPacketsThatReassemble()
@@ -1141,6 +1231,7 @@ void TestVoiceClient::aSenderReportAndStatisticsFollowEverySecond()
     QVERIFY(first.lossFraction < 0);
     QCOMPARE(first.roundTripMs, -1);
     QCOMPARE(first.receivers, -1);
+    QCOMPARE(first.receiverEstimateBps, quint64(0));
 
     // The server answers the report, and says half of what was sent since did not arrive.
     ReceptionReport answer;
@@ -1152,7 +1243,7 @@ void TestVoiceClient::aSenderReportAndStatisticsFollowEverySecond()
     aboutAudio.ssrc = OWN_AUDIO_SSRC;
     aboutAudio.fractionLost = 255;
     const ReceptionReport answers[] = { answer, aboutAudio };
-    call.server.sendFeedback({ receiverCount(OWN_VIDEO_SSRC, 2), pictureLoss(OWN_VIDEO_SSRC) }, answers);
+    call.server.sendFeedback({ receiverCount(OWN_VIDEO_SSRC, 2), pictureLoss(OWN_VIDEO_SSRC), receiverEstimate(2500000) }, answers);
 
     statistics.clear();
     QTRY_VERIFY_WITH_TIMEOUT(statistics.count() >= 1, 1500);
@@ -1160,6 +1251,7 @@ void TestVoiceClient::aSenderReportAndStatisticsFollowEverySecond()
     QCOMPARE(second.lossFraction, 0.5);
     QVERIFY(second.roundTripMs >= 0 && second.roundTripMs < 1500);
     QCOMPARE(second.receivers, 2);
+    QCOMPARE(second.receiverEstimateBps, quint64(2500000));
     QCOMPARE(second.keyframeRequests, quint64(1));
     QCOMPARE(second.packets, quint64(3));
     QTRY_VERIFY(call.server.senderReports.size() >= 2);

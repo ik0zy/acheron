@@ -584,7 +584,10 @@ void StreamBroadcaster::withdrawCodecsUnfitFor(const QSize &size)
 void StreamBroadcaster::onSendStats(const VideoSendStats &sent)
 {
     networkStats = sent;
-    if (pipelineStarted && rate.report(sent.lossFraction, rateClock.elapsed()))
+    if (!pipelineStarted)
+        return;
+    const bool limited = rate.setReceiverLimit(static_cast<qint64>(sent.receiverEstimateBps));
+    if (rate.report(sent.lossFraction, rateClock.elapsed()) || limited)
         applyBitrateOnceSettled();
 }
 
@@ -653,6 +656,7 @@ void StreamBroadcaster::startPipeline()
     pipeline->start(settings);
     appliedBitrate = settings.bitrate;
     sinceBitrateApplied.start();
+    tellBitrate();
 }
 
 void StreamBroadcaster::stopPipeline()
@@ -751,6 +755,7 @@ void StreamBroadcaster::announceVideo()
     announced = videoDescription();
     videoAnnounced = true;
     QMetaObject::invokeMethod(rtc, [rtc, description = announced] { rtc->startVideo(description); });
+    tellBitrate();
     applySuspension();
     // What was encoded before the client took the announcement was dropped by it, and that
     // included the frame every viewer needs first.
@@ -805,6 +810,15 @@ void StreamBroadcaster::applyBitrate()
     appliedBitrate = rate.bitrate();
     sinceBitrateApplied.start();
     pipeline->setBitrate(appliedBitrate);
+    tellBitrate();
+}
+
+void StreamBroadcaster::tellBitrate()
+{
+    if (!connection || appliedBitrate <= 0)
+        return;
+    VoiceClient *rtc = connection->client();
+    QMetaObject::invokeMethod(rtc, [rtc, bitrate = appliedBitrate] { rtc->setVideoBitrate(bitrate); });
 }
 
 // Nothing is encoded while nobody is there to receive it, as in the official client. Only once

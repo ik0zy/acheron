@@ -183,6 +183,11 @@ void CameraSendPlan::reportLoss(double lossFraction, qint64 nowMs)
     rate.report(lossFraction, nowMs);
 }
 
+void CameraSendPlan::setReceiverLimit(qint64 bitsPerSecond)
+{
+    rate.setReceiverLimit(bitsPerSecond);
+}
+
 bool CameraSendPlan::countsAsMuted(qint64 nowMs) const
 {
     if (sharingScreen)

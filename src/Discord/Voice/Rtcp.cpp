@@ -19,6 +19,10 @@ constexpr uint8_t TYPE_PAYLOAD_FEEDBACK = 206;
 constexpr uint8_t FORMAT_NACK = 1;
 constexpr uint8_t FORMAT_PLI = 1;
 constexpr uint8_t FORMAT_FIR = 4;
+constexpr uint8_t FORMAT_APPLICATION_LAYER = 15;
+constexpr uint8_t RECEIVER_ESTIMATE_NAME[4] = { 'R', 'E', 'M', 'B' };
+// Header, sender, an unused media source, the name, then a count of SSRCs (1) and the rate (3).
+constexpr int RECEIVER_ESTIMATE_SIZE = 20;
 constexpr int REPORT_BLOCK_SIZE = 24;
 constexpr int MAX_REPORT_BLOCKS = 31;
 constexpr int HEADER_SIZE = 4;
@@ -37,6 +41,9 @@ constexpr int INBOUND_ESTIMATE_SIZE = 24;
 // is where a sender's would be, the number of receivers is in the header's five count bits, and
 // for each of them follows an entry of a user id (8), a rate (3) and one more byte.
 constexpr uint8_t RECEIVER_COUNT_NAME[4] = { 0x30, 0x53, 0x49, 0x44 };
+// And "DISX": the SSRC where a sender's would be is one of the remote sender's, and nothing
+// after the name is read.
+constexpr uint8_t VIDEO_RESET_NAME[4] = { 0x58, 0x53, 0x49, 0x44 };
 constexpr int APPLICATION_HEADER_SIZE = 12;
 
 // The length field counts 32-bit words, not including the first.
@@ -137,6 +144,21 @@ static void readReportBlocks(const uint8_t *packet, size_t size, size_t blocksAt
     }
 }
 
+static void readReceiverEstimate(const uint8_t *p, size_t size, ReceivedRtcp &received)
+{
+    if (size < RECEIVER_ESTIMATE_SIZE || size < RECEIVER_ESTIMATE_SIZE + size_t(4) * p[16] || !std::equal(p + 12, p + 16, RECEIVER_ESTIMATE_NAME))
+        return;
+
+    // An 18-bit mantissa under a 6-bit exponent, which can say more than 64 bits hold.
+    const uint64_t mantissa = (static_cast<uint64_t>(p[17] & 0x03) << 16) | (static_cast<uint64_t>(p[18]) << 8) | p[19];
+    const int exponent = p[17] >> 2;
+    const uint64_t rate = mantissa << exponent;
+    if (rate >> exponent != mantissa)
+        return;
+    received.hasReceiverEstimate = true;
+    received.receiverEstimateBitsPerSecond = std::max(received.receiverEstimateBitsPerSecond, rate);
+}
+
 ReceivedRtcp parseRtcp(std::span<const uint8_t> compound)
 {
     constexpr size_t SENDER_REPORT_BLOCKS_AT = 28;
@@ -172,6 +194,10 @@ ReceivedRtcp parseRtcp(std::span<const uint8_t> compound)
             received.inboundLoss = p[23] / 256.0;
         } else if (p[1] == TYPE_APPLICATION && size >= APPLICATION_HEADER_SIZE && std::equal(p + 8, p + 12, RECEIVER_COUNT_NAME)) {
             received.receiverCounts.push_back({ qFromBigEndian<uint32_t>(p + 4), p[0] & 0x1F });
+        } else if (p[1] == TYPE_APPLICATION && size >= APPLICATION_HEADER_SIZE && std::equal(p + 8, p + 12, VIDEO_RESET_NAME)) {
+            received.videoResets.push_back(qFromBigEndian<uint32_t>(p + 4));
+        } else if (p[1] == TYPE_PAYLOAD_FEEDBACK && (p[0] & 0x1F) == FORMAT_APPLICATION_LAYER) {
+            readReceiverEstimate(p, size, received);
         } else if (p[1] == TYPE_TRANSPORT_FEEDBACK && (p[0] & 0x1F) == FORMAT_NACK && size >= FEEDBACK_HEADER_SIZE) {
             readNack(p, size, received.nacks);
         } else if (p[1] == TYPE_PAYLOAD_FEEDBACK && (p[0] & 0x1F) == FORMAT_PLI && size >= FEEDBACK_HEADER_SIZE) {

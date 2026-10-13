@@ -94,6 +94,10 @@ private slots:
     void eachRaiseNeedsAnotherTenCleanSeconds();
     void raisesStopAtTheMaximum();
     void lossInterruptsTheCleanStretch();
+    void theReceiversEstimateIsACeiling();
+    void theReceiversEstimateIsFollowedDownAtOnceAndUpByWholeSteps();
+    void liftingTheReceiversEstimateLeavesNoMark();
+    void lossLowersFromWhatTheReceiversEstimateAllows();
     void newLimitsKeepTheShareOfTheMaximum();
     void aMaximumUnderTheMinimumIsStillAMaximum();
     void restartGoesBackToTheMaximum();
@@ -891,6 +895,85 @@ void TestSendQuality::thePlanSaysWhenItNextChangesByItself()
     // A change that is overdue is due now.
     plan.setWant(100);
     QCOMPARE(plan.nextChangeIn(30'000), std::optional<qint64>(0));
+}
+
+void TestSendQuality::theReceiversEstimateIsACeiling()
+{
+    SendRateController rate;
+    rate.restart(500'000, 9'000'000);
+
+    // One above what is in use changes nothing.
+    QVERIFY(!rate.setReceiverLimit(20'000'000));
+    QCOMPARE(rate.bitrate(), 9'000'000);
+
+    QVERIFY(rate.setReceiverLimit(3'000'000));
+    QCOMPARE(rate.bitrate(), 3'000'000);
+
+    // Never under the minimum, whatever it says.
+    QVERIFY(rate.setReceiverLimit(100'000));
+    QCOMPARE(rate.bitrate(), 500'000);
+
+    // New limits for the video are bounded by it as well.
+    rate.setReceiverLimit(0);
+    QVERIFY(rate.setReceiverLimit(3'000'000));
+    QVERIFY(!rate.setLimits(500'000, 6'000'000));
+    QCOMPARE(rate.bitrate(), 3'000'000);
+    QVERIFY(rate.setLimits(500'000, 2'000'000));
+    QCOMPARE(rate.bitrate(), 2'000'000);
+
+    // Starting over forgets it.
+    rate.restart(500'000, 9'000'000);
+    QCOMPARE(rate.bitrate(), 9'000'000);
+}
+
+void TestSendQuality::theReceiversEstimateIsFollowedDownAtOnceAndUpByWholeSteps()
+{
+    SendRateController rate;
+    rate.restart(500'000, 9'000'000);
+    QVERIFY(rate.setReceiverLimit(4'000'000));
+
+    QVERIFY(rate.setReceiverLimit(3'990'000));
+    QCOMPARE(rate.bitrate(), 3'990'000);
+
+    // An estimate that wanders about the same place does not have the encoder restarted for it.
+    for (int estimate : { 4'000'000, 4'300'000, 3'995'000, 4'580'000 })
+        QVERIFY(!rate.setReceiverLimit(estimate));
+    QCOMPARE(rate.bitrate(), 3'990'000);
+
+    QVERIFY(rate.setReceiverLimit(4'600'000));
+    QCOMPARE(rate.bitrate(), 4'600'000);
+}
+
+void TestSendQuality::liftingTheReceiversEstimateLeavesNoMark()
+{
+    SendRateController rate;
+    rate.restart(500'000, 9'000'000);
+    QVERIFY(rate.setReceiverLimit(1'000'000));
+
+    QVERIFY(rate.setReceiverLimit(0));
+    QCOMPARE(rate.bitrate(), 9'000'000);
+    QVERIFY(!rate.setReceiverLimit(0));
+}
+
+void TestSendQuality::lossLowersFromWhatTheReceiversEstimateAllows()
+{
+    SendRateController rate;
+    rate.restart(500'000, 9'000'000);
+    QVERIFY(rate.setReceiverLimit(2'000'000));
+
+    // Not from the nine megabits that losses alone had allowed, which would change nothing.
+    QVERIFY(rate.report(0.5, 0));
+    QCOMPARE(rate.bitrate(), 1'400'000);
+
+    // A clean stretch then raises it as ever, and the estimate still bounds that.
+    for (qint64 now = 1000; now < 11'000; now += 1000)
+        QVERIFY(!rate.report(0.0, now));
+    QVERIFY(rate.report(0.0, 11'000));
+    QCOMPARE(rate.bitrate(), 1'610'000);
+    QVERIFY(rate.report(0.0, 21'000));
+    QVERIFY(rate.report(0.0, 31'000));
+    QCOMPARE(rate.bitrate(), 2'000'000);
+    QVERIFY(!rate.report(0.0, 41'000));
 }
 
 QTEST_GUILESS_MAIN(TestSendQuality)
