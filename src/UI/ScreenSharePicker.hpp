@@ -44,6 +44,7 @@ private slots:
     void onHeightChosen(int index);
     void onFramerateChosen(int index);
     void onMethodChosen(int index);
+    void onAudioToggled(bool checked);
     void onShareClicked();
     void onEncodersKnown(const QList<Acheron::Discord::Voice::VideoCodec> &codecs);
 
@@ -53,6 +54,9 @@ private:
     void loadThumbnailsFromTheFirst();
     void loadNextThumbnail();
     [[nodiscard]] QListWidgetItem *chosenItem() const;
+    [[nodiscard]] QList<Core::Video::CaptureSource> offeredSources() const;
+    void listPrograms();
+    void onSourceChosen(const Core::Video::CaptureSource &chosen, const QString &failure, quint32 program, bool withAudio);
     void showQuality();
     void refreshShareButton();
 
@@ -65,6 +69,9 @@ private:
     bool thumbnailQueued = false;
     bool encodersKnown = false;
     bool canEncode = false;
+    // The desktop's own dialog is up, or what it last had to say for itself.
+    bool choosing = false;
+    QString choosingFailure;
 
     QListWidget *screenList;
     QListWidget *windowList;
@@ -72,6 +79,8 @@ private:
     QComboBox *framerateCombo;
     QComboBox *methodCombo;
     QCheckBox *audioCheck;
+    // Whose sound goes with a window the desktop hands over without saying whose it is.
+    QComboBox *programCombo;
     QLabel *noteLabel;
     QPushButton *shareButton;
 };

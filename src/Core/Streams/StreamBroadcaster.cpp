@@ -176,16 +176,21 @@ StreamBroadcaster::Stats StreamBroadcaster::stats() const
 
 void StreamBroadcaster::start(const Video::CaptureSource &chosen, const Video::SendQuality &quality, bool withAudio)
 {
-    if (isSharing())
+    if (isSharing()) {
+        if (chosen.id != source.id)
+            Video::releaseSource(chosen);
         return;
+    }
     failureText.clear();
 
     const ShareTerms here = terms();
     if (!canShare()) {
+        Video::releaseSource(chosen);
         fail(tr("You cannot share your screen here."));
         return;
     }
     if (!proxy.canRelayUdp()) {
+        Video::releaseSource(chosen);
         fail(tr("This account's proxy cannot carry video, so the screen was not shared."));
         return;
     }
@@ -250,6 +255,7 @@ void StreamBroadcaster::end(bool tellGateway)
     if (tellGateway && createSent)
         client->sendStreamDelete(streamKey.toString());
     stopPipeline();
+    Video::releaseSource(source);
 
     createSent = false;
     rtcServerId = Snowflake::Invalid;
@@ -479,12 +485,13 @@ void StreamBroadcaster::startSoundCapture()
 
     const auto self = static_cast<quint32>(QCoreApplication::applicationPid());
     const bool ofWindow = source.kind == Video::CaptureSource::Kind::Window;
-    if (ofWindow && source.processId == 0) {
+    const bool ofProgram = ofWindow && !(source.processId == 0 && Video::isHandedOverByTheDesktop(source));
+    if (ofProgram && source.processId == 0) {
         onSoundCaptureFailed(tr("The program the shared window belongs to is not known."));
         return;
     }
     // All this client plays is the call, and the people in it would get themselves back.
-    if (ofWindow && source.processId == self)
+    if (ofProgram && source.processId == self)
         return;
 
     soundCapture = std::make_unique<Audio::LoopbackCapture>();
@@ -493,7 +500,7 @@ void StreamBroadcaster::startSoundCapture()
         if (serial == connectionSerial)
             onSoundCaptureFailed(reason);
     });
-    if (ofWindow)
+    if (ofProgram)
         soundCapture->start(source.processId, Audio::LoopbackCapture::Scope::ProcessTree);
     else
         soundCapture->start(self, Audio::LoopbackCapture::Scope::AllButProcessTree);

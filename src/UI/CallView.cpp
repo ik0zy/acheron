@@ -718,8 +718,10 @@ void CallView::onShareClicked()
     auto *picker = new ScreenSharePicker(broadcaster->tier(), this);
     picker->setAttribute(Qt::WA_DeleteOnClose);
     connect(picker, &ScreenSharePicker::shareRequested, this, [this](const Core::Video::CaptureSource &source, const SendQuality &quality, bool withAudio) {
-        if (!broadcaster)
+        if (!broadcaster) {
+            Core::Video::releaseSource(source);
             return;
+        }
         sharingWindow = source.kind == Core::Video::CaptureSource::Kind::Window;
         Core::Video::restoreIfMinimised(source);
         broadcaster->start(source, quality, withAudio);

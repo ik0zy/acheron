@@ -6,11 +6,13 @@
 #include <QString>
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 
 #include "Core/Video/BroadcastPipeline.hpp"
 
+class QObject;
 struct AVFilterContext;
 struct AVFilterGraph;
 struct AVFrame;
@@ -36,12 +38,30 @@ enum class CaptureMethod {
     // No border. A window is cut out of its screen while no window above overlaps it, and is
     // asked to draw itself otherwise, as the official client does on Windows 10.
     DesktopDuplication,
+    // Linux: what the user chooses in the desktop portal's own dialog, handed over by PipeWire.
+    Portal,
+    // Linux: an X11 display's screens and windows, grabbed from the X server.
+    X11,
 };
 [[nodiscard]] CaptureMethod captureMethod();
 void setCaptureMethod(CaptureMethod method);
 // False for a method this build or this Windows cannot use. A share asked to use one is
 // captured by a method that can be used.
 [[nodiscard]] bool captureMethodUsable(CaptureMethod method);
+
+// What a method has to offer. The portal lists nothing: it offers one screen and one window,
+// each standing for whatever the user goes on to choose in the desktop's dialog.
+[[nodiscard]] QList<CaptureSource> captureSources(CaptureMethod method);
+[[nodiscard]] QList<CaptureSource> captureWindows(CaptureMethod method);
+[[nodiscard]] bool isChosenByTheDesktop(const CaptureSource &source);
+// Whether `source` is what the user chose there. The desktop does not say which program a
+// window it hands over belongs to.
+[[nodiscard]] bool isHandedOverByTheDesktop(const CaptureSource &source);
+// Has the user choose in the desktop's dialog where `source` stands for that. `chosen` gets the
+// source to share, or an empty id and what went wrong: nothing when the user called it off.
+void chooseSource(const CaptureSource &source, QObject *receiver, std::function<void(const CaptureSource &, const QString &)> chosen);
+// Ends the desktop's sharing of a source it handed over. Any other source is left alone.
+void releaseSource(const CaptureSource &source);
 
 // A minimised window shows nothing to capture until it is brought back.
 void restoreIfMinimised(const CaptureSource &window);

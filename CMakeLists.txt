@@ -431,6 +431,9 @@ if(ACHERON_VIDEO)
     if(WIN32)
         list(APPEND PROJECT_SOURCES src/UI/Video/D3D11GlBridge.cpp)
     endif()
+    if(UNIX AND NOT APPLE)
+        list(APPEND PROJECT_SOURCES src/Core/Video/ScreenCaptureLinux.cpp src/Core/Video/X11Capture.cpp src/Core/Video/PortalCapture.cpp)
+    endif()
 endif()
 
 if(ENABLE_VOICE OR TARGET ffmpeg)
@@ -615,6 +618,8 @@ if(BUILD_TESTS)
             add_test(NAME VideoEncodeTests COMMAND TestVideoEncode)
 
             if(UNIX AND NOT APPLE)
+                target_sources(TestVideoEncode PRIVATE src/Core/Video/ScreenCaptureLinux.cpp src/Core/Video/X11Capture.cpp src/Core/Video/PortalCapture.cpp)
+
                 qt_add_executable(TestX11Capture tests/tst_X11Capture.cpp src/Core/Video/X11Capture.cpp
                     src/Core/Media/RgbScaler.cpp src/Core/Logging.cpp)
                 target_link_libraries(TestX11Capture PRIVATE Qt::Core Qt::Gui Qt::Test ffmpeg linuxcapture)

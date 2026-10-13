@@ -42,6 +42,12 @@ extern "C" {
 extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
 }
+
+#include "Core/Video/PictureConverter.hpp"
+#endif
+
+#if defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN) && defined(ACHERON_HAVE_AVFILTER)
+#define ACHERON_LINUX_SCREEN_CAPTURE
 #endif
 
 namespace Acheron {
@@ -54,6 +60,8 @@ const char *const CAPTURE_METHOD_KEY = "video/capture_method";
 const QLatin1String AUTO_METHOD("auto");
 const QLatin1String GRAPHICS_CAPTURE_METHOD("graphics_capture");
 const QLatin1String DESKTOP_DUPLICATION_METHOD("desktop_duplication");
+const QLatin1String PORTAL_METHOD("portal");
+const QLatin1String X11_METHOD("x11");
 
 } // namespace
 
@@ -73,6 +81,10 @@ CaptureMethod captureMethod()
         return CaptureMethod::GraphicsCapture;
     if (stored == DESKTOP_DUPLICATION_METHOD)
         return CaptureMethod::DesktopDuplication;
+    if (stored == PORTAL_METHOD)
+        return CaptureMethod::Portal;
+    if (stored == X11_METHOD)
+        return CaptureMethod::X11;
     return CaptureMethod::Auto;
 }
 
@@ -83,8 +95,43 @@ void setCaptureMethod(CaptureMethod method)
         stored = GRAPHICS_CAPTURE_METHOD;
     else if (method == CaptureMethod::DesktopDuplication)
         stored = DESKTOP_DUPLICATION_METHOD;
+    else if (method == CaptureMethod::Portal)
+        stored = PORTAL_METHOD;
+    else if (method == CaptureMethod::X11)
+        stored = X11_METHOD;
     QSettings().setValue(CAPTURE_METHOD_KEY, QString(stored));
 }
+
+QList<CaptureSource> captureSources()
+{
+    return captureSources(captureMethod());
+}
+
+QList<CaptureSource> captureWindows()
+{
+    return captureWindows(captureMethod());
+}
+
+#ifndef ACHERON_LINUX_SCREEN_CAPTURE
+bool isChosenByTheDesktop(const CaptureSource &)
+{
+    return false;
+}
+
+bool isHandedOverByTheDesktop(const CaptureSource &)
+{
+    return false;
+}
+
+void chooseSource(const CaptureSource &source, QObject *, std::function<void(const CaptureSource &, const QString &)> chosen)
+{
+    chosen(source, QString());
+}
+
+void releaseSource(const CaptureSource &)
+{
+}
+#endif
 
 bool stillPictureIsDue(qint64 msSinceLastPicture, bool keyFrameWaitedFor, int framerate)
 {
@@ -711,89 +758,6 @@ void copyTopLeft(const Bitmap &from, AVFrame *bgra)
     }
 }
 
-QByteArray softwareScaling(const QSize &size, bool bt601, int format)
-{
-    QByteArray scaling = "scale=w=" + QByteArray::number(size.width()) + ":h=" + QByteArray::number(size.height()) + ":flags=bilinear";
-    if (format != AV_PIX_FMT_BGRA)
-        scaling += QByteArray(":out_range=tv:out_color_matrix=") + (bt601 ? "bt601" : "bt709");
-    return scaling + ",format=" + av_get_pix_fmt_name(static_cast<AVPixelFormat>(format));
-}
-
-// A graph of `chain` ending in a sink to read from. Its filters that work on a graphics card
-// are given `device`.
-int assemble(const QByteArray &chain, AVBufferRef *device, AVFilterGraph **graph, AVFilterContext **sink)
-{
-    *graph = avfilter_graph_alloc();
-    int result = avfilter_graph_create_filter(sink, avfilter_get_by_name("buffersink"), "sink", nullptr, nullptr, *graph);
-    if (result >= 0) {
-        AVFilterInOut *inputs = nullptr;
-        AVFilterInOut *outputs = nullptr;
-        result = avfilter_graph_parse2(*graph, chain.constData(), &inputs, &outputs);
-        if (result >= 0)
-            result = outputs && !outputs->next && !inputs ? avfilter_link(outputs->filter_ctx, static_cast<unsigned>(outputs->pad_idx), *sink, 0) : AVERROR(EINVAL);
-        avfilter_inout_free(&inputs);
-        avfilter_inout_free(&outputs);
-    }
-    for (unsigned i = 0; device && result >= 0 && i < (*graph)->nb_filters; i++) {
-        if ((*graph)->filters[i]->filter->flags & AVFILTER_FLAG_HWDEVICE)
-            (*graph)->filters[i]->hw_device_ctx = av_buffer_ref(device);
-    }
-    if (result >= 0)
-        result = avfilter_graph_config(*graph, nullptr);
-    if (result < 0) {
-        avfilter_graph_free(graph);
-        *sink = nullptr;
-    }
-    return result;
-}
-
-// Scales BGRA pictures in system memory and converts them to what an encoder takes.
-class PictureConverter
-{
-public:
-    PictureConverter() = default;
-    ~PictureConverter() { avfilter_graph_free(&graph); }
-
-    PictureConverter(const PictureConverter &) = delete;
-    PictureConverter &operator=(const PictureConverter &) = delete;
-
-    // Leaves `picture` with its owner. Negative, an ffmpeg error, when it could not be converted.
-    int convert(AVFrame *picture, const QSize &size, int format, bool bt601, AVFrame *into)
-    {
-        const QSize from(picture->width, picture->height);
-        if (!graph || from != builtFrom || size != builtSize || format != builtFormat || bt601 != builtBt601) {
-            avfilter_graph_free(&graph);
-            source = nullptr;
-            const QByteArray chain = "buffer=video_size=" + QByteArray::number(from.width()) + "x" + QByteArray::number(from.height()) + ":pix_fmt=bgra:time_base=1/90000:pixel_aspect=1/1," + softwareScaling(size, bt601, format);
-            const int built = assemble(chain, nullptr, &graph, &sink);
-            if (built < 0)
-                return built;
-            for (unsigned i = 0; i < graph->nb_filters && !source; i++) {
-                if (strcmp(graph->filters[i]->filter->name, "buffer") == 0)
-                    source = graph->filters[i];
-            }
-            builtFrom = from;
-            builtSize = size;
-            builtFormat = format;
-            builtBt601 = bt601;
-        }
-
-        picture->pts = converted++;
-        const int added = av_buffersrc_add_frame_flags(source, picture, AV_BUFFERSRC_FLAG_KEEP_REF);
-        return added < 0 ? added : av_buffersink_get_frame(sink, into);
-    }
-
-private:
-    AVFilterGraph *graph = nullptr;
-    AVFilterContext *source = nullptr;
-    AVFilterContext *sink = nullptr;
-    QSize builtFrom;
-    QSize builtSize;
-    int builtFormat = -1;
-    bool builtBt601 = false;
-    int64_t converted = 0;
-};
-
 // Graphics capture, read on a thread of its own. Reading it does not come back until the
 // source shows something new, which a minimised window never does, and ffmpeg has no way to
 // call a read off. So a capture that is no longer wanted is only abandoned: its thread frees
@@ -1095,13 +1059,16 @@ bool captureMethodUsable(CaptureMethod method)
         return graphicsCaptureUsable();
     case CaptureMethod::DesktopDuplication:
         return screenCaptureAvailable();
+    case CaptureMethod::Portal:
+    case CaptureMethod::X11:
+        return false;
     case CaptureMethod::Auto:
         break;
     }
     return screenCaptureAvailable() || graphicsCaptureUsable();
 }
 
-QList<CaptureSource> captureSources()
+QList<CaptureSource> captureSources(CaptureMethod)
 {
     QList<CaptureSource> sources;
     if (!screenCaptureAvailable() && !graphicsCaptureUsable())
@@ -1118,7 +1085,7 @@ QList<CaptureSource> captureSources()
     return sources;
 }
 
-QList<CaptureSource> captureWindows()
+QList<CaptureSource> captureWindows(CaptureMethod)
 {
     QList<CaptureSource> windows;
     if (!windowCaptureAvailable())
@@ -1727,7 +1694,7 @@ void ScreenCapture::tearDown()
     backends->drawer.reset();
 }
 
-#else // ACHERON_SCREEN_CAPTURE
+#elif !defined(ACHERON_LINUX_SCREEN_CAPTURE)
 
 struct ScreenCapture::Backends
 {
@@ -1748,12 +1715,12 @@ bool captureMethodUsable(CaptureMethod)
     return false;
 }
 
-QList<CaptureSource> captureSources()
+QList<CaptureSource> captureSources(CaptureMethod)
 {
     return {};
 }
 
-QList<CaptureSource> captureWindows()
+QList<CaptureSource> captureWindows(CaptureMethod)
 {
     return {};
 }
