@@ -132,9 +132,10 @@ constexpr QSize SMALLEST_WINDOW_PICTURE(160, 120);
 // How far a window may reach past the edge of its screen and still be cut out of it, as the
 // official client has it.
 constexpr int REACH_PAST_SCREEN = 15;
-// How long after a window was last seen hidden its pictures are read back and looked at. The
-// empty ones came within a few hundredths of a second of the window showing again.
-constexpr int EMPTY_PICTURES_FOR_MS = 500;
+// How long after a window was last seen hidden, or its capture begun, its pictures are read
+// back and looked at, unless one with something in it comes sooner. Only a window that has
+// nothing to show wherever it is looked at is held up for all of it.
+constexpr int EMPTY_PICTURES_FOR_MS = 3000;
 constexpr int THUMBNAIL_DRAWING_LIMIT_MS = 500;
 
 // DwmGetWindowAttribute's DWMWA_EXTENDED_FRAME_BOUNDS and DWMWA_CLOAKED, and PrintWindow's
@@ -1047,7 +1048,8 @@ struct ScreenCapture::Backends
     std::shared_ptr<GraphicsCaptureSession> session;
     // Not before this is a capture made again that ended by itself.
     Clock::time_point remakeAt;
-    // Until then the window was hidden a moment ago, and a picture of it may have nothing in it.
+    // Until then, or until one comes that has something in it, a picture of the window may
+    // have nothing in it: the window was hidden a moment ago, or its capture has just begun.
     Clock::time_point emptyPicturesUntil;
 
     // For a window by duplication: the screen it is on, the card that screen is on, and the
@@ -1368,8 +1370,16 @@ ScreenCapture::Status ScreenCapture::readGraphicsCapture(AVFrame *into)
     state.pictureDue = std::max(state.pictureDue + interval, Clock::now() + interval / 2);
     // Graphics capture hands over a picture with nothing in it, transparent all over, as a
     // window is hidden or closed, and another as it is shown, before the window has drawn
-    // itself. Sent on, it is black for as long as the window stays away.
-    if (state.window && (!showsItself(state.window) || (Clock::now() < state.emptyPicturesUntil && isEmptyPicture(state.captured.get(), state.bgra.get())))) {
+    // itself. Sent on, it is black for as long as the window stays away. Those of before it
+    // was hidden wait in the capture until it shows again, so how long after is no measure:
+    // they are looked for until the first picture that has something in it.
+    bool undrawn = state.window && !showsItself(state.window);
+    if (state.window && !undrawn && Clock::now() < state.emptyPicturesUntil) {
+        undrawn = isEmptyPicture(state.captured.get(), state.bgra.get());
+        if (!undrawn)
+            state.emptyPicturesUntil = {};
+    }
+    if (undrawn) {
         av_frame_unref(state.captured.get());
         return Status::NoFrame;
     }
@@ -1680,6 +1690,8 @@ int ScreenCapture::buildGraphicsCapture()
         chain += ":resize_mode=scale";
     int result = 0;
     state.session = GraphicsCaptureSession::start(chain, adapter, &result);
+    if (state.window)
+        state.emptyPicturesUntil = Clock::now() + std::chrono::milliseconds(EMPTY_PICTURES_FOR_MS);
     if (result >= 0) {
         qCInfo(LogVideo) << "Capturing" << request.sourceId << "by graphics capture as" << size.width() << "x" << size.height() << (asCaptured ? "kept on the graphics card as it is" : scalesByItself ? "scaled by graphics capture and kept on the graphics card"
                                                                                                                                                                                 : scalesOnCard()       ? "scaled on the graphics card and kept there"

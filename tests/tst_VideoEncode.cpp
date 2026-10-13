@@ -10,6 +10,7 @@
 #include "Core/Video/ScreenCapture.hpp"
 
 #include <QElapsedTimer>
+#include <QMutex>
 #include <QRegularExpression>
 #include <QScopeGuard>
 #include <QSettings>
@@ -2991,6 +2992,12 @@ void TestVideoEncode::thePipelineSharesAWindow()
     const double ticksPerFrame = static_cast<double>(record.frames[19]->rtpTimestamp - record.frames[4]->rtpTimestamp) / 15.0;
     QVERIFY2(ticksPerFrame > TICKS_PER_FRAME * 0.8, qPrintable(QString::number(ticksPerFrame)));
 
+    // Where in the frames each part of what follows begins, to say of a picture that should
+    // not have been sent what the window was doing when it was.
+    QList<std::pair<size_t, QString>> parts;
+    const auto partBegins = [&parts, &record](const QString &name) { parts.append({ record.frames.size(), name }); };
+    partBegins(QStringLiteral("started"));
+
     QTRY_VERIFY_WITH_TIMEOUT(!record.stats.isEmpty(), 2500);
     qInfo().noquote() << "captured as" << record.stats.last().encoderName;
     if (duplicated)
@@ -3001,6 +3008,7 @@ void TestVideoEncode::thePipelineSharesAWindow()
     QCOMPARE(record.stats.last().encoderName.contains(QStringLiteral("(d3d11va)")), onCard);
 
     // A window that has gone still is sent on, a couple of pictures a second at the least.
+    partBegins(QStringLiteral("still"));
     window.setAnimated(false);
     QTest::qWait(300);
     size_t before = record.frames.size();
@@ -3011,14 +3019,17 @@ void TestVideoEncode::thePipelineSharesAWindow()
     // So is one that is off the screen, and one that Windows has stopped drawing, of which
     // graphics capture has nothing new at all. A key frame asked for then comes of the last
     // picture, and does not wait for the next.
+    partBegins(QStringLiteral("off the screen"));
     window.moveTo(QPoint(-6000, -6000));
     QTest::qWait(500);
     before = record.frames.size();
     QTest::qWait(2000);
     const size_t whileAway = record.frames.size() - before;
     QVERIFY2(whileAway >= 3 && whileAway <= FRAMERATE * 2 * 1.25, qPrintable(QString::number(whileAway)));
+    partBegins(QStringLiteral("back on the screen"));
     window.moveTo(home);
 
+    partBegins(QStringLiteral("cloaked"));
     window.setCloaked(true);
     QTest::qWait(700);
     before = record.frames.size();
@@ -3037,12 +3048,14 @@ void TestVideoEncode::thePipelineSharesAWindow()
     // Sent again, and not a second time before the next is due.
     QTest::qWait(200);
     QCOMPARE(record.keyFrameFrom(record.keyFrameFrom(atRequest) + 1), record.frames.size());
+    partBegins(QStringLiteral("uncloaked"));
     window.setCloaked(false);
     QTest::qWait(500);
     QCOMPARE(record.starts.size(), 1);
     QVERIFY(record.stalls.isEmpty());
 
     // The picture follows the window's size, and starts over with a key frame when it does.
+    partBegins(QStringLiteral("resized"));
     const size_t atResize = record.frames.size();
     // Of another shape where the picture is scaled down, which would bring both sizes to the same.
     window.resizeInside(maxHeight ? QSize(800, 400) : QSize(800, 600));
@@ -3057,6 +3070,7 @@ void TestVideoEncode::thePipelineSharesAWindow()
     // itself, at the same size and without a key frame.
     const QRect inside = window.insideOnScreen();
     QTest::qWait(300);
+    partBegins(QStringLiteral("covered"));
     const size_t atCover = record.frames.size();
     size_t coveredUntil = 0;
     {
@@ -3072,6 +3086,7 @@ void TestVideoEncode::thePipelineSharesAWindow()
             QCOMPARE(later.cutOut, earlier.cutOut);
         }
         coveredUntil = record.frames.size();
+        partBegins(QStringLiteral("uncovered"));
     }
     QVERIFY(coveredUntil >= atCover + 20);
     QVERIFY(record.keyFrameFrom(atCover) >= coveredUntil);
@@ -3121,6 +3136,7 @@ void TestVideoEncode::thePipelineSharesAWindow()
     QList<bool> stalls;
     QVERIFY(record.stalls.isEmpty());
     for (int pause = 0; pause < (duplicated ? 2 : 1); pause++) {
+        partBegins(pause == 0 ? QStringLiteral("hidden") : QStringLiteral("kept out of captures"));
         if (pause == 0)
             window.hide();
         else if (!window.keepOutOfCaptures(true))
@@ -3132,6 +3148,7 @@ void TestVideoEncode::thePipelineSharesAWindow()
         QTest::qWait(700);
         QCOMPARE(record.frames.size(), whilePaused);
 
+        partBegins(pause == 0 ? QStringLiteral("shown again") : QStringLiteral("let into captures again"));
         if (pause == 0)
             window.show();
         else
@@ -3143,6 +3160,7 @@ void TestVideoEncode::thePipelineSharesAWindow()
     }
 
     // Closed, the share is over, and nothing went wrong.
+    partBegins(QStringLiteral("closed"));
     window.close();
     QTRY_COMPARE_WITH_TIMEOUT(record.closes, 1, 3000);
     QTest::qWait(300);
@@ -3157,15 +3175,23 @@ void TestVideoEncode::thePipelineSharesAWindow()
         QVERIFY(isWellFormed(codec, *frame));
     // Graphics capture has a picture with nothing in it for a window as it is hidden, as it is
     // shown again and as it is closed. Sent on, a viewer sees black where the window was.
-    std::atomic<int> blackPictures{ 0 };
-    const Decoded decoded = decodeAll(codec, record.frames, [&blackPictures](const AVFrame *picture, int) {
-        if (picture->data[0][(picture->height / 2) * picture->linesize[0] + picture->width / 2] < BLACK_AT_MOST)
-            blackPictures++;
+    QMutex blackMutex;
+    QStringList blackPictures;
+    const Decoded decoded = decodeAll(codec, record.frames, [&blackMutex, &blackPictures, &parts](const AVFrame *picture, int index) {
+        if (picture->data[0][(picture->height / 2) * picture->linesize[0] + picture->width / 2] >= BLACK_AT_MOST)
+            return;
+        QString part;
+        for (const auto &[from, name] : parts) {
+            if (from <= static_cast<size_t>(index))
+                part = QStringLiteral("%1 after it was %2").arg(static_cast<size_t>(index) - from).arg(name);
+        }
+        const QMutexLocker locker(&blackMutex);
+        blackPictures.append(QStringLiteral("picture %1 (%2)").arg(index).arg(part));
     });
     // A duplicated window is not held to this. Its screen shows it black from the moment it
     // asks to be kept out of captures, and for a picture as Windows starts drawing it again.
     if (!duplicated)
-        QCOMPARE(blackPictures.load(), 0);
+        QVERIFY2(blackPictures.isEmpty(), qPrintable(QStringLiteral("black: ") + blackPictures.join(QStringLiteral(", "))));
     QCOMPARE(decoded.errors, quint64(0));
     QCOMPARE(decoded.pictures, static_cast<int>(record.frames.size()));
     QCOMPARE(QSize(decoded.width, decoded.height), secondSize);
