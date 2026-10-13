@@ -7,12 +7,14 @@
 
 #include <QDir>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QGuiApplication>
 #include <QImage>
 #include <QLibrary>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
+#include <QScreen>
 #include <QSignalSpy>
 #include <QWindow>
 #include <QTest>
@@ -117,6 +119,27 @@ void present(VideoSurface &surface, AVFrame *frame)
     surface.sink()->present(frame);
     av_frame_free(&frame);
     QCoreApplication::processEvents();
+}
+
+QImage shot(VideoSurface &surface);
+
+// The windows a surface has put inside its own. The layer for the graphics card is the only
+// one it ever puts there.
+int layersOf(const VideoSurface &surface)
+{
+    int layers = 0;
+    const QWindowList windows = QGuiApplication::allWindows();
+    for (const QWindow *window : windows)
+        layers += surface.windowHandle() && window->parent() == surface.windowHandle() ? 1 : 0;
+    return layers;
+}
+
+// A surface has its layer for the graphics card, and knows what that layer can draw, once it
+// has had a picture to draw there.
+QImage drawnOnce(VideoSurface &surface)
+{
+    present(surface, solidFrame(64, 36, 16, 128, 128));
+    return shot(surface);
 }
 
 QImage shot(VideoSurface &surface)
@@ -340,6 +363,8 @@ private slots:
     void messagesDoNotDisturbThePicture();
     void avatarStandsInUntilThereIsAPicture();
     void speakingRingIsDrawn();
+    void aSurfaceHasItsLayerOnlyWhileItHasAPicture();
+    void aSurfaceLongOffTheScreenGivesUpItsLayerAndKeepsItsPicture();
     void statisticsAreLeftOffASmallTile();
     void whatShowingAFrameCosts_data();
     void whatShowingAFrameCosts();
@@ -438,7 +463,7 @@ void TestVideoSurface::memoryEglCannotBeToldTheOrderOfIsReadBack()
     surface.resize(320, 180);
     surface.show();
     QVERIFY(QTest::qWaitForWindowExposed(&surface));
-    shot(surface);
+    drawnOnce(surface);
     const bool offered = surface.sink()->acceptsHardwareFrames(CARD_FORMAT);
     present(surface, frame);
     const QImage image = shot(surface);
@@ -459,7 +484,7 @@ void TestVideoSurface::frameOnTheGraphicsCardIsDrawnFromThere()
     QVERIFY(QTest::qWaitForWindowExposed(&surface));
 
     // The surface knows whether it can once it has drawn.
-    shot(surface);
+    drawnOnce(surface);
     if (!surface.sink()->acceptsHardwareFrames(CARD_FORMAT))
         QSKIP("This surface cannot draw the card's picture where it is");
     QVERIFY(!surface.sink()->acceptsHardwareFrames(AV_PIX_FMT_DXVA2_VLD));
@@ -527,7 +552,7 @@ void TestVideoSurface::manySurfacesDrawFromTheGraphicsCard()
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     for (VideoSurface *surface : surfaces)
-        shot(*surface);
+        drawnOnce(*surface);
     if (!surfaces.first()->sink()->acceptsHardwareFrames(CARD_FORMAT))
         QSKIP("This surface cannot draw the card's picture where it is");
 
@@ -564,7 +589,7 @@ void TestVideoSurface::pictureFromTheCardIsThePictureInMemory()
     surface.resize(320, 180);
     surface.show();
     QVERIFY(QTest::qWaitForWindowExposed(&surface));
-    shot(surface);
+    drawnOnce(surface);
     if (!surface.sink()->acceptsHardwareFrames(CARD_FORMAT))
         QSKIP("This surface cannot draw the card's picture where it is");
     if (drawingNode().isEmpty())
@@ -612,7 +637,7 @@ void TestVideoSurface::tenBitPictureFromTheCardIsReadBack()
     surface.resize(320, 180);
     surface.show();
     QVERIFY(QTest::qWaitForWindowExposed(&surface));
-    shot(surface);
+    drawnOnce(surface);
     if (!surface.sink()->acceptsHardwareFrames(CARD_FORMAT))
         QSKIP("This surface cannot draw the card's picture where it is");
     if (drawingNode().isEmpty())
@@ -636,7 +661,7 @@ void TestVideoSurface::tenBitPictureFromTheCardIsReadBack()
     other.resize(320, 180);
     other.show();
     QVERIFY(QTest::qWaitForWindowExposed(&other));
-    shot(other);
+    drawnOnce(other);
     QVERIFY(other.sink()->acceptsHardwareFrames(CARD_FORMAT));
 #else
     QSKIP("VAAPI only");
@@ -650,7 +675,7 @@ void TestVideoSurface::cardSurfaceIsKeptFromTheDecoderWhileItIsDrawn()
     surface.resize(320, 180);
     surface.show();
     QVERIFY(QTest::qWaitForWindowExposed(&surface));
-    shot(surface);
+    drawnOnce(surface);
     if (!surface.sink()->acceptsHardwareFrames(CARD_FORMAT))
         QSKIP("This surface cannot draw the card's picture where it is");
     if (drawingNode().isEmpty())
@@ -758,7 +783,7 @@ void TestVideoSurface::clickAndDoubleClickAreReported()
 
     // With the graphics card the picture is a window over the surface, which gets the mouse
     // first and has to hand it on.
-    shot(surface);
+    drawnOnce(surface);
     QWindow *layer = nullptr;
     const QWindowList windows = QGuiApplication::allWindows();
     for (QWindow *window : windows) {
@@ -911,6 +936,101 @@ void TestVideoSurface::speakingRingIsDrawn()
     surface.setSpeaking(false);
     image = shot(surface);
     QVERIFY(isNear(image.pixel(1, image.height() / 2), 0, 0, 0));
+
+    // Around a picture as around none, along every edge and nowhere else. The corners are
+    // left out: the painter cuts them off and the graphics card does not.
+    present(surface, solidFrame(640, 360, 235, 128, 128));
+    surface.setSpeaking(true);
+    image = shot(surface);
+    const int right = image.width() - 1;
+    const int bottom = image.height() - 1;
+    for (const QPoint &onTheRing : { QPoint(0, bottom / 2), QPoint(right, bottom / 2), QPoint(right / 2, 0), QPoint(right / 2, bottom) })
+        QVERIFY2(isNear(image.pixel(onTheRing), 0x23, 0xA5, 0x5A), qPrintable(QStringLiteral("%1,%2").arg(onTheRing.x()).arg(onTheRing.y())));
+    const int inside = qRound(4 * image.devicePixelRatio());
+    for (const QPoint &offIt : { QPoint(inside, bottom / 2), QPoint(right - inside, bottom / 2), QPoint(right / 2, inside), QPoint(right / 2, bottom - inside), QPoint(right / 2, bottom / 2) })
+        QVERIFY2(isNear(image.pixel(offIt), 255, 255, 255), qPrintable(QStringLiteral("%1,%2").arg(offIt.x()).arg(offIt.y())));
+
+    surface.setSpeaking(false);
+    image = shot(surface);
+    QVERIFY(isNear(image.pixel(0, bottom / 2), 255, 255, 255));
+}
+
+void TestVideoSurface::aSurfaceHasItsLayerOnlyWhileItHasAPicture()
+{
+    VideoSurface surface;
+    surface.resize(320, 180);
+    surface.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&surface));
+    if (!surface.drawsWithGpu())
+        QSKIP("This surface draws without the graphics card");
+
+    // All that a tile without video shows is drawn without one.
+    QPixmap avatar(64, 64);
+    avatar.fill(QColor(0, 200, 0));
+    surface.setPlaceholder(avatar);
+    surface.setCaption(QStringLiteral("Somebody"));
+    surface.setSpeaking(true);
+    QImage image = shot(surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 0, 200, 0));
+    QVERIFY(isNear(image.pixel(1, image.height() / 2), 0x23, 0xA5, 0x5A));
+    QCOMPARE(layersOf(surface), 0);
+
+    present(surface, solidFrame(640, 360, 235, 128, 128));
+    image = shot(surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 255, 255, 255));
+    QVERIFY(isNear(image.pixel(1, image.height() / 2), 0x23, 0xA5, 0x5A));
+    QCOMPARE(layersOf(surface), 1);
+
+    surface.clear();
+    QCOMPARE(layersOf(surface), 0);
+    image = shot(surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 0, 200, 0));
+
+    // And has one again for the next picture.
+    present(surface, solidFrame(1280, 720, 63, 102, 240));
+    image = shot(surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 255, 0, 0));
+    QCOMPARE(layersOf(surface), 1);
+}
+
+void TestVideoSurface::aSurfaceLongOffTheScreenGivesUpItsLayerAndKeepsItsPicture()
+{
+    VideoSurface surface;
+    surface.resize(320, 180);
+    surface.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&surface));
+    if (!surface.drawsWithGpu())
+        QSKIP("This surface draws without the graphics card");
+
+    // Red, from the card where the surface draws from there.
+    drawnOnce(surface);
+    AVFrame *onCard = nullptr;
+#ifdef CARD_FORMAT
+    if (surface.sink()->acceptsHardwareFrames(CARD_FORMAT))
+        onCard = solidFrameOnCard(1280, 720, 63, 102, 240);
+#endif
+    const bool fromCard = onCard != nullptr;
+    present(surface, fromCard ? onCard : solidFrame(1280, 720, 63, 102, 240));
+    if (fromCard)
+        QTRY_VERIFY(surface.drawsFromCard());
+    QImage image = shot(surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 255, 0, 0));
+    QCOMPARE(layersOf(surface), 1);
+
+    // Not at once: a surface that is back in a moment has lost nothing.
+    surface.hide();
+    QTest::qWait(500);
+    QCOMPARE(layersOf(surface), 1);
+    QTest::qWait(VideoSurface::NOT_SHOWN_BEFORE_RELEASED_MS);
+    QCOMPARE(layersOf(surface), 0);
+
+    // The picture is still there to come back to, out of memory now.
+    surface.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&surface));
+    image = shot(surface);
+    QVERIFY(isNear(image.pixel(image.width() / 2, image.height() / 2), 255, 0, 0));
+    QCOMPARE(layersOf(surface), 1);
+    QVERIFY(!surface.drawsFromCard());
 }
 
 void TestVideoSurface::statisticsAreLeftOffASmallTile()
@@ -955,7 +1075,7 @@ void TestVideoSurface::whatShowingAFrameCosts()
     surface.resize(320, 180);
     surface.show();
     QVERIFY(QTest::qWaitForWindowExposed(&surface));
-    shot(surface);
+    drawnOnce(surface);
     if (!surface.sink()->acceptsHardwareFrames(CARD_FORMAT))
         QSKIP("This surface cannot draw the card's picture where it is");
     if (drawingNode().isEmpty())
@@ -1017,7 +1137,7 @@ void TestVideoSurface::pictureFromAnotherCardIsReadBack()
         surface.resize(320, 180);
         surface.show();
         QVERIFY(QTest::qWaitForWindowExposed(&surface));
-        shot(surface);
+        drawnOnce(surface);
         if (!surface.sink()->acceptsHardwareFrames(CARD_FORMAT))
             QSKIP("This surface cannot draw the card's picture where it is");
         AVFrame *frame = solidFrameOnNode(node, 1280, 720, 63, 102, 240);
@@ -1042,7 +1162,7 @@ void TestVideoSurface::pictureFromAnotherCardIsReadBack()
         later.resize(320, 180);
         later.show();
         QVERIFY(QTest::qWaitForWindowExposed(&later));
-        shot(later);
+        drawnOnce(later);
         QVERIFY(!later.sink()->acceptsHardwareFrames(CARD_FORMAT));
         return;
     }
@@ -1052,12 +1172,34 @@ void TestVideoSurface::pictureFromAnotherCardIsReadBack()
 #endif
 }
 
+// On a real screen the windows of the tests are for nobody to look at: they open on a screen
+// that is not the first one, where there is one, and take the keyboard from nobody.
+class OutOfTheWay : public QObject
+{
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        auto *window = qobject_cast<QWidget *>(watched);
+        if (event->type() != QEvent::Polish || !window || !window->isWindow())
+            return false;
+
+        window->setAttribute(Qt::WA_ShowWithoutActivating);
+        const QList<QScreen *> screens = QGuiApplication::screens();
+        const auto another = std::find_if(screens.begin(), screens.end(), [](const QScreen *screen) { return screen != QGuiApplication::primaryScreen(); });
+        if (another != screens.end())
+            window->move((*another)->availableGeometry().topLeft() + QPoint(48, 48));
+        return false;
+    }
+};
+
 int main(int argc, char **argv)
 {
     if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM"))
         qputenv("QT_QPA_PLATFORM", "offscreen");
 
     QApplication app(argc, argv);
+    OutOfTheWay outOfTheWay;
+    app.installEventFilter(&outOfTheWay);
     TestVideoSurface test;
     return QTest::qExec(&test, argc, argv);
 }

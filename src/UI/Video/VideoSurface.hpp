@@ -30,8 +30,8 @@ public:
     static void setGpuDrawingEnabled(bool enabled);
 
     [[nodiscard]] std::shared_ptr<Core::Media::VideoFrameSink> sink() const;
-    // Whether this surface draws through the graphics card.
-    [[nodiscard]] bool drawsWithGpu() const { return glLayer != nullptr; }
+    // Whether this surface draws its pictures through the graphics card.
+    [[nodiscard]] bool drawsWithGpu() const { return usesGpu; }
     // Whether the picture now showing went from the decoder to the screen without leaving the
     // graphics card.
     [[nodiscard]] bool drawsFromCard() const;
@@ -58,6 +58,11 @@ public:
     // the picture is in a window of its own, which grab() does not see. Null until shown.
     [[nodiscard]] QImage snapshot();
 
+    // A surface that has been off the screen, and had no new picture, for this long gives up
+    // what it holds on the graphics card. Shorter, and switching away and back would cost a
+    // moment without its picture every time.
+    static constexpr int NOT_SHOWN_BEFORE_RELEASED_MS = 10'000;
+
 signals:
     // The area the picture covers, in device pixels, and whether any of it is on screen.
     void geometryChanged(int pixelCount, bool visible);
@@ -80,13 +85,22 @@ private:
     void reportGeometry(bool evenIfUnchanged = false);
     void refresh();
     void refreshOverlays();
+    void makeLayerForAPicture();
+    void dropLayer();
+    void releaseWhatIsNotShown();
     // Everything drawn on top of the picture, the same whichever way the picture is drawn.
-    void paintOverlays(QPainter &painter, bool hasPicture);
+    // The layer for the graphics card draws the speaking ring by itself.
+    void paintOverlays(QPainter &painter, bool hasPicture, bool withSpeakingRing);
+    [[nodiscard]] bool hasOverlaysBesideTheRing(bool hasPicture) const;
 
     std::shared_ptr<Sink> frameSink;
+    bool usesGpu = false;
+    // The layer is a window with an OpenGL context of its own. A surface has one while it has
+    // a picture to draw there, which a tile showing an avatar never does.
     GlLayer *glLayer = nullptr;
     QWidget *glContainer = nullptr;
     QTimer rescaleTimer;
+    QTimer notShownTimer;
     QString messageTitle;
     QString messageDetail;
     QString statsText;

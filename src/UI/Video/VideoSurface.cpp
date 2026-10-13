@@ -359,7 +359,9 @@ public:
         store(frame);
         serial++;
 #ifdef Q_OS_WIN
-        if (last->hw_frames_ctx) {
+        // Without a card to hand it to, the surface hears of the frame as of any other: it
+        // may have no layer yet to draw it in.
+        if (last->hw_frames_ctx && card) {
             requestHandOver();
             return;
         }
@@ -432,6 +434,28 @@ public:
     {
         std::lock_guard lock(mutex);
         owner = nullptr;
+    }
+
+    [[nodiscard]] bool hasPicture()
+    {
+        std::lock_guard lock(mutex);
+        return last->width > 0;
+    }
+
+    // A picture left on the card holds its decoder's surfaces there. One that is not being
+    // shown is kept in memory instead.
+    void keepInMemory()
+    {
+        std::lock_guard lock(mutex);
+        if (!last->hw_frames_ctx)
+            return;
+        AVFrame *downloaded = av_frame_alloc();
+        if (av_hwframe_transfer_data(downloaded, last, 0) >= 0 && av_frame_copy_props(downloaded, last) >= 0) {
+            store(downloaded);
+            av_frame_free(&exported);
+            serial++;
+        }
+        av_frame_free(&downloaded);
     }
 
     void setTarget(QSize devicePixels, qreal devicePixelRatio)
@@ -849,6 +873,8 @@ protected:
 #endif
         }
         drawOverlays(shown != Shown::Nothing);
+        if (owner->speaking)
+            drawSpeakingRing();
     }
 
 private:
@@ -991,13 +1017,16 @@ private:
         if (area.isEmpty() || !plainProgram || !plainProgram->isLinked())
             return;
 
+        if (!owner->hasOverlaysBesideTheRing(hasPicture))
+            return;
+
         if (overlaysStale || hasPicture != overlaysHadPicture || area != overlaySize) {
             QImage image(area, QImage::Format_RGBA8888_Premultiplied);
             image.setDevicePixelRatio(ratio);
             image.fill(Qt::transparent);
             {
                 QPainter painter(&image);
-                owner->paintOverlays(painter, hasPicture);
+                owner->paintOverlays(painter, hasPicture, false);
             }
 
             glActiveTexture(GL_TEXTURE0);
@@ -1017,6 +1046,21 @@ private:
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         drawTexture(overlayTexture, false);
         glDisable(GL_BLEND);
+    }
+
+    // The ring goes on and off with every word, which is too often to paint everything over
+    // the picture again for. Two pixels along each edge, as the painter draws it.
+    void drawSpeakingRing()
+    {
+        const QSize area = size() * devicePixelRatio();
+        const int thickness = qMax(1, qRound(2 * devicePixelRatio()));
+        glEnable(GL_SCISSOR_TEST);
+        glClearColor(static_cast<GLfloat>(SPEAKING_RING.redF()), static_cast<GLfloat>(SPEAKING_RING.greenF()), static_cast<GLfloat>(SPEAKING_RING.blueF()), 1.0f);
+        for (const QRect &edge : { QRect(0, 0, area.width(), thickness), QRect(0, area.height() - thickness, area.width(), thickness), QRect(0, 0, thickness, area.height()), QRect(area.width() - thickness, 0, thickness, area.height()) }) {
+            glScissor(edge.x(), edge.y(), edge.width(), edge.height());
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+        glDisable(GL_SCISSOR_TEST);
     }
 
     void uploadPlane(int unit, GLenum format, int textureWidth, int textureHeight, const uint8_t *data)
@@ -1166,18 +1210,9 @@ void VideoSurface::setGpuDrawingEnabled(bool enabled)
 }
 
 VideoSurface::VideoSurface(QWidget *parent)
-    : QWidget(parent)
+    : QWidget(parent), usesGpu(gpuDrawingEnabled() && openGlWorks())
 {
-    const bool gpu = gpuDrawingEnabled() && openGlWorks();
-    frameSink = std::make_shared<Sink>(this, gpu);
-    if (gpu) {
-        glLayer = new GlLayer(this, frameSink);
-        // The container owns the layer's window and keeps it over this widget.
-        glContainer = QWidget::createWindowContainer(glLayer, this);
-        glContainer->setFocusPolicy(Qt::NoFocus);
-        glContainer->setAttribute(Qt::WA_TransparentForMouseEvents);
-        glContainer->setGeometry(rect());
-    }
+    frameSink = std::make_shared<Sink>(this, usesGpu);
 
     setAttribute(Qt::WA_OpaquePaintEvent);
     setMinimumSize(160, 90);
@@ -1188,6 +1223,40 @@ VideoSurface::VideoSurface(QWidget *parent)
         frameSink->rescale();
         refresh();
     });
+
+    notShownTimer.setSingleShot(true);
+    notShownTimer.setInterval(NOT_SHOWN_BEFORE_RELEASED_MS);
+    connect(&notShownTimer, &QTimer::timeout, this, &VideoSurface::releaseWhatIsNotShown);
+}
+
+void VideoSurface::makeLayerForAPicture()
+{
+    if (glLayer || !usesGpu || !isVisible() || !frameSink->hasPicture())
+        return;
+    glLayer = new GlLayer(this, frameSink);
+    // The container owns the layer's window and keeps it over this widget.
+    glContainer = QWidget::createWindowContainer(glLayer, this);
+    glContainer->setFocusPolicy(Qt::NoFocus);
+    glContainer->setAttribute(Qt::WA_TransparentForMouseEvents);
+    glContainer->setGeometry(rect());
+    glContainer->show();
+}
+
+void VideoSurface::dropLayer()
+{
+    if (!glContainer)
+        return;
+    delete glContainer;
+    glContainer = nullptr;
+    glLayer = nullptr;
+}
+
+void VideoSurface::releaseWhatIsNotShown()
+{
+    if (isVisible())
+        return;
+    dropLayer();
+    frameSink->keepInMemory();
 }
 
 VideoSurface::~VideoSurface()
@@ -1266,7 +1335,7 @@ void VideoSurface::setSpeaking(bool value)
     if (speaking == value)
         return;
     speaking = value;
-    refreshOverlays();
+    refresh();
 }
 
 void VideoSurface::announceGeometry()
@@ -1277,11 +1346,16 @@ void VideoSurface::announceGeometry()
 void VideoSurface::clear()
 {
     frameSink->forget();
+    dropLayer();
     refresh();
 }
 
 void VideoSurface::onFrameArrived()
 {
+    makeLayerForAPicture();
+    // Not while pictures still come for it, which they do for a while after it is hidden.
+    if (notShownTimer.isActive())
+        notShownTimer.start();
     refresh();
     reportGeometry();
 }
@@ -1314,8 +1388,10 @@ void VideoSurface::resizeEvent(QResizeEvent *event)
 void VideoSurface::showEvent(QShowEvent *event)
 {
     QWidget::showEvent(event);
+    notShownTimer.stop();
     frameSink->setShown(true);
     frameSink->setTarget(size() * devicePixelRatioF(), devicePixelRatioF());
+    makeLayerForAPicture();
     reportGeometry();
 }
 
@@ -1323,6 +1399,7 @@ void VideoSurface::hideEvent(QHideEvent *event)
 {
     QWidget::hideEvent(event);
     frameSink->setShown(false);
+    notShownTimer.start();
     reportedPixels = 0;
     reportedVisible = false;
     emit geometryChanged(0, false);
@@ -1369,10 +1446,15 @@ void VideoSurface::paintEvent(QPaintEvent *)
         painter.drawImage(where, image, QRectF(QPointF(0, 0), QSizeF(image.size())));
     });
 
-    paintOverlays(painter, hasPicture);
+    paintOverlays(painter, hasPicture, true);
 }
 
-void VideoSurface::paintOverlays(QPainter &painter, bool hasPicture)
+bool VideoSurface::hasOverlaysBesideTheRing(bool hasPicture) const
+{
+    return (!hasPicture && !placeholder.isNull()) || !messageTitle.isEmpty() || !captionText.isEmpty() || !statsText.isEmpty();
+}
+
+void VideoSurface::paintOverlays(QPainter &painter, bool hasPicture, bool withSpeakingRing)
 {
     if (!hasPicture && !placeholder.isNull()) {
         const int side = qBound(24, qMin(width(), height()) / 3, 128);
@@ -1407,7 +1489,7 @@ void VideoSurface::paintOverlays(QPainter &painter, bool hasPicture)
         painter.drawText(bounds, Qt::AlignLeft | Qt::AlignBottom, captionText);
     }
 
-    if (speaking) {
+    if (speaking && withSpeakingRing) {
         painter.setRenderHint(QPainter::Antialiasing, false);
         painter.setBrush(Qt::NoBrush);
         painter.setPen(QPen(SPEAKING_RING, 2));
