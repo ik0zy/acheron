@@ -403,8 +403,9 @@ jobs:
           -DBUILD_TESTS=ON
           -DENABLE_VIDEO=${{ matrix.video }}
 
+      # Every error in one run, not only the first: nothing else compiles this platform's code.
       - name: Build
-        run: cmake --build build --parallel $(nproc)
+        run: cmake --build build --parallel $(nproc) -- --keep-going
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
@@ -612,7 +613,7 @@ jobs:
           -DBUILD_TESTS=ON
 
       - name: Build
-        run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
+        run: cmake --build build --parallel $(sysctl -n hw.logicalcpu) -- --keep-going
 
       - name: Test
         run: ctest --test-dir build --output-on-failure

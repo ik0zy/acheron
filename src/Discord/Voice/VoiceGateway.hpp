@@ -7,6 +7,7 @@
 #include <curl/curl.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 

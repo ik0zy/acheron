@@ -38,7 +38,14 @@ struct RtpPayloads
     std::vector<bool> markers;
 };
 
-inline int collectPacket(void *opaque, const uint8_t *data, int size)
+// ffmpeg 7 made the buffer a write callback is handed const.
+#if LIBAVFORMAT_VERSION_MAJOR >= 61
+using WrittenBytes = const uint8_t *;
+#else
+using WrittenBytes = uint8_t *;
+#endif
+
+inline int collectPacket(void *opaque, WrittenBytes data, int size)
 {
     using namespace Acheron::Discord::Voice;
 
