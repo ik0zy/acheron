@@ -44,6 +44,11 @@ void VideoSendStream::setBitrate(int bitsPerSecond)
         targetBitrate = bitsPerSecond;
 }
 
+void VideoSendStream::setPacingFactor(double factor)
+{
+    pacingFactor = factor;
+}
+
 int VideoSendStream::maxPayloadSize() const
 {
     // As WebRTC does, room is left in every packet for it to be sent again whole.
@@ -124,7 +129,7 @@ void VideoSendStream::clear()
 
 qint64 VideoSendStream::pacingRate(qint64 nowUs) const
 {
-    const qint64 rate = static_cast<qint64>(targetBitrate * PACING_FACTOR);
+    const qint64 rate = static_cast<qint64>(targetBitrate * pacingFactor);
     if (queued.empty())
         return rate;
     const qint64 leftUs = std::max<qint64>(1000, MAX_QUEUE_US - (nowUs - queued.front().queuedUs));

@@ -22,6 +22,10 @@ namespace Acheron {
 namespace Discord {
 namespace Voice {
 
+// Whether a commit's changes to the roster give anyone a key: someone added, or someone whose
+// key changed. One who left is in it without a key.
+[[nodiscard]] bool bringsNewKeys(const discord::dave::RosterMap &changes);
+
 class DaveSession : public QObject
 {
     Q_OBJECT
@@ -70,6 +74,10 @@ signals:
     void sendReadyForTransition(int transitionId);
     void sendInvalidCommitWelcome(int transitionId);
     void daveStateChanged(bool enabled);
+    // A transition was carried out that gave someone a key they did not have: a commit that
+    // added or re-keyed a member, or a welcome. They can make nothing of what this client
+    // sends until its next key frame, and the official client asks its encoder for one then.
+    void newKeysNeedKeyframe();
 
 private:
     void reinit();
@@ -92,6 +100,7 @@ private:
     bool daveEnabled = false;
     bool daveDowngraded = false;
     bool pendingTransitionReady = false;
+    bool pendingTransitionBringsKeys = false;
 
     const QHash<quint32, uint64_t> &ssrcMap;
 

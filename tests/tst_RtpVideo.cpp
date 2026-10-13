@@ -215,6 +215,7 @@ private slots:
     void keyframeKeepsWhatPrecedesItsParameterSets();
     void pictureWithoutItsParameterSetsIsNotAStart();
     void nothingIsDeliveredBeforeAKeyframe();
+    void aKeyframeIsAskedForFiveTimesASecondWhilePacketsCome();
     void framesComeOutInOrder();
     void reorderedPacketsAreHeld();
     void lostPacketIsRequestedAndAccepted();
@@ -483,6 +484,35 @@ void TestRtpVideo::pictureWithoutItsParameterSetsIsNotAStart()
     const std::vector<EncodedVideoFrame> frames = bare.takeFrames();
     QCOMPARE(frames.size(), size_t(1));
     QVERIFY(frames[0].keyframe);
+}
+
+void TestRtpVideo::aKeyframeIsAskedForFiveTimesASecondWhilePacketsCome()
+{
+    // The official client's numbers.
+    QCOMPARE(VideoReceiver::KEYFRAME_REQUEST_INTERVAL_MS, 200);
+    QCOMPARE(VideoReceiver::SILENT_AFTER_MS, 5000);
+
+    // Nothing has come yet, so there is nobody to ask anything of.
+    Feed feed;
+    QVERIFY(!feed.receiver.poll(0).keyframeRequest);
+
+    feed.now = 1000;
+    feed.sendFrame(0, 100, false);
+    int requests = 0;
+    for (qint64 now = 1000; now < 2000; now += 10)
+        requests += feed.receiver.poll(now).keyframeRequest ? 1 : 0;
+    QCOMPARE(requests, 5);
+
+    // The stream goes quiet: asked up to five seconds after its last packet and no longer.
+    QVERIFY(feed.receiver.poll(1000 + VideoReceiver::SILENT_AFTER_MS - 1).keyframeRequest);
+    for (qint64 now = 1000 + VideoReceiver::SILENT_AFTER_MS; now < 20000; now += 100)
+        QVERIFY(!feed.receiver.poll(now).keyframeRequest);
+
+    // Its next packet, of whatever kind, has it asked again at once.
+    feed.now = 20000;
+    feed.sendFrame(1, 100, false);
+    QVERIFY(feed.receiver.poll(20000).keyframeRequest);
+    QVERIFY(feed.receiver.takeFrames().empty());
 }
 
 void TestRtpVideo::nothingIsDeliveredBeforeAKeyframe()

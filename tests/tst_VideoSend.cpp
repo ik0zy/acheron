@@ -356,16 +356,15 @@ qint64 bytesIn(const std::vector<Written> &packets)
     return bytes;
 }
 
-// What the pace lets out in a millisecond at this bitrate: 1.1 times the bitrate, as the
-// official client has it, and a burst of 40 ms of that.
-double paceOf(int bitrate)
+// What the pace lets out in a millisecond at this bitrate, and a burst: 40 ms of that.
+double paceOf(int bitrate, double factor)
 {
-    return bitrate * 1.1 / 8000.0;
+    return bitrate * factor / 8000.0;
 }
 
-double burstOf(int bitrate)
+double burstOf(int bitrate, double factor)
 {
-    return paceOf(bitrate) * 40;
+    return paceOf(bitrate, factor) * 40;
 }
 
 void tellRoundTrip(VideoSendStream &sender, int milliseconds)
@@ -1329,22 +1328,32 @@ void TestVideoSend::noPacketIsLargerThanTheLimit()
 void TestVideoSend::aFrameLeavesAtThePaceOfItsBitrate_data()
 {
     QTest::addColumn<int>("bitrate");
+    QTest::addColumn<bool>("screen");
 
-    QTest::newRow("1 Mbps") << 1000000;
-    QTest::newRow("2 Mbps") << 2000000;
-    QTest::newRow("3.5 Mbps") << 3500000;
+    QTest::newRow("a camera at 1 Mbps") << 1000000 << false;
+    QTest::newRow("a camera at 2 Mbps") << 2000000 << false;
+    QTest::newRow("a camera at 3.5 Mbps") << 3500000 << false;
+    QTest::newRow("a screen at 2 Mbps") << 2000000 << true;
+    QTest::newRow("a screen at 3.5 Mbps") << 3500000 << true;
 }
 
 void TestVideoSend::aFrameLeavesAtThePaceOfItsBitrate()
 {
     QFETCH(int, bitrate);
+    QFETCH(bool, screen);
     constexpr int PACKETS = 20;
+    // The official client's: 1.1 times the bitrate for a camera, the bitrate itself for a screen.
+    const double factor = screen ? 1.0 : 1.1;
+    QCOMPARE(screen ? VideoSendStream::SCREEN_PACING_FACTOR : VideoSendStream::CAMERA_PACING_FACTOR, factor);
 
     VideoSendStream sender = vp8Sender();
     sender.setBitrate(bitrate);
+    if (screen)
+        sender.setPacingFactor(VideoSendStream::SCREEN_PACING_FACTOR);
     QVERIFY(sender.queueFrame(vp8Frame(true, PACKETS * VP8_ROOM, 80), 0, true, 0));
 
-    const double burst = burstOf(bitrate);
+    const double burst = burstOf(bitrate, factor);
+    const double pace = paceOf(bitrate, factor);
     qint64 left = 0;
     qint64 doneAtMs = -1;
     std::vector<Written> packets;
@@ -1354,13 +1363,13 @@ void TestVideoSend::aFrameLeavesAtThePaceOfItsBitrate()
         packets.insert(packets.end(), share.begin(), share.end());
         left += bytesIn(share);
         // Never more than a burst ahead of the pace, give or take the packet that crossed the line.
-        QVERIFY2(left <= burst + paceOf(bitrate) * ms + VideoSendStream::MAX_PACKET_SIZE, qPrintable(QStringLiteral("%1 bytes out after %2 ms").arg(left).arg(ms)));
+        QVERIFY2(left <= burst + pace * ms + VideoSendStream::MAX_PACKET_SIZE, qPrintable(QStringLiteral("%1 bytes out after %2 ms").arg(left).arg(ms)));
         doneAtMs = ms;
     }
 
     QCOMPARE(packets.size(), size_t(PACKETS));
     // And not behind it either: the frame is out when the pace has earned it, to the interval.
-    const double earnedAtMs = std::max(0.0, (left - burst) / paceOf(bitrate));
+    const double earnedAtMs = std::max(0.0, (left - burst) / pace);
     QVERIFY2(doneAtMs <= earnedAtMs + VideoSendStream::PACE_INTERVAL_MS, qPrintable(QStringLiteral("out after %1 ms, earned after %2").arg(doneAtMs).arg(earnedAtMs)));
     QVERIFY(doneAtMs < VideoSendStream::MAX_QUEUE_MS);
 

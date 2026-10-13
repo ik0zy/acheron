@@ -67,9 +67,10 @@ public:
     // type for retransmissions none are sent. A change of codec forgets what the old one left.
     void setCodec(VideoCodec codec, uint8_t payloadType, std::optional<uint8_t> rtxPayloadType);
 
-    // What the video is being encoded at, in bits per second. Packets leave at PACING_FACTOR
-    // times this, and what is sent again may take up no more than this.
+    // What the video is being encoded at, in bits per second. Packets leave at the pacing
+    // factor times this, and what is sent again may take up no more than this.
     void setBitrate(int bitsPerSecond);
+    void setPacingFactor(double factor);
 
     // One whole frame, end-to-end encrypted already if it is going to be.
     bool queueFrame(std::span<const uint8_t> frame, uint32_t rtpTimestamp, bool keyframe, qint64 nowUs);
@@ -101,7 +102,10 @@ public:
     static constexpr int MAX_PACKET_SIZE = 1200;
     static constexpr int PACE_INTERVAL_MS = 5;
     static constexpr int STARTING_BITRATE = 1000000;
-    static constexpr double PACING_FACTOR = 1.1;
+    // WebRTC paces a camera at 1.1 times its bitrate, and what it is told is screen content
+    // at the bitrate itself. The official client tells it so of what it shares in a Go Live.
+    static constexpr double CAMERA_PACING_FACTOR = 1.1;
+    static constexpr double SCREEN_PACING_FACTOR = 1.0;
     static constexpr int BURST_MS = 40;
     static constexpr int MAX_BURST_BYTES = 63000;
     // WebRTC lets its queue grow to two seconds, and has a bandwidth estimate and a frame
@@ -184,6 +188,7 @@ private:
     qint64 resentLatelyBytes = 0;
 
     int targetBitrate = STARTING_BITRATE;
+    double pacingFactor = CAMERA_PACING_FACTOR;
     qint64 queuedBytes = 0;
     // Bytes that may leave now. A packet may take it below zero, which the next intervals
     // then make up for.

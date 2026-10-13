@@ -48,6 +48,7 @@ void VideoReceiver::insert(uint16_t sequence, uint32_t timestamp, bool marker, P
 {
     if (!payload || payload->size() == 0)
         return;
+    lastPacketMs = nowMs;
 
     qint64 unwrapped = unwrap(sequence);
     counters.packets++;
@@ -237,7 +238,8 @@ VideoReceiver::Feedback VideoReceiver::poll(qint64 nowMs)
         feedback.nacks.clear();
     counters.nacked += feedback.nacks.size();
 
-    if (keyframeWanted && (keyframeRequestedMs < 0 || nowMs - keyframeRequestedMs >= KEYFRAME_REQUEST_INTERVAL_MS)) {
+    const bool silent = lastPacketMs < 0 || nowMs - lastPacketMs >= SILENT_AFTER_MS;
+    if (keyframeWanted && !silent && (keyframeRequestedMs < 0 || nowMs - keyframeRequestedMs >= KEYFRAME_REQUEST_INTERVAL_MS)) {
         keyframeRequestedMs = nowMs;
         feedback.keyframeRequest = true;
         counters.keyframeRequests++;

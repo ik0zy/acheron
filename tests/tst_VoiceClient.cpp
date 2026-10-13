@@ -2,6 +2,7 @@
 // that lives in this file: a WebSocket and a UDP socket on the loopback interface that speak
 // just enough of Discord's side to bring a connection up, send it video and take video from it.
 
+#include "Discord/Voice/DaveSession.hpp"
 #include "Discord/Voice/Rtcp.hpp"
 #include "Discord/Voice/RtpPacket.hpp"
 #include "Discord/Voice/VideoDepacketizer.hpp"
@@ -677,6 +678,7 @@ private slots:
     void encodersFoundBeforeTheProtocolIsChosenNeedNoUpdate();
     void aCodecWithdrawnWhileInUseSendsNothingUntilAnotherIsNamed();
     void noVideoGoesOutWhileEndToEndKeysAreMissing();
+    void onlyACommitThatGivesSomeoneAKeyWantsAKeyframe();
 
     void sharedSoundIsAnnouncedOnceAndMarkedAtEveryRun();
     void aStreamWithoutSoundSendsNoAudio();
@@ -1515,6 +1517,21 @@ void TestVoiceClient::aCodecWithdrawnWhileInUseSendsNothingUntilAnotherIsNamed()
     QCOMPARE(call.server.rtp[0].header.timestamp, 9000u);
     QTRY_COMPARE(call.reassembled(VideoCodec::H265, OWN_VIDEO_SSRC), h265.data);
     QCOMPARE(call.server.undecryptable, 0);
+}
+
+void TestVoiceClient::onlyACommitThatGivesSomeoneAKeyWantsAKeyframe()
+{
+    using discord::dave::RosterMap;
+    const std::vector<uint8_t> key = { 1, 2, 3 };
+
+    QVERIFY(!bringsNewKeys(RosterMap{}));
+    // Someone joined, or someone's key changed.
+    QVERIFY(bringsNewKeys(RosterMap{ { 100, key } }));
+    // Someone left: they are in the changes without a key, and everyone still here has seen
+    // what came before.
+    QVERIFY(!bringsNewKeys(RosterMap{ { 100, {} } }));
+    QVERIFY(!bringsNewKeys(RosterMap{ { 100, {} }, { 200, {} } }));
+    QVERIFY(bringsNewKeys(RosterMap{ { 100, {} }, { 200, key } }));
 }
 
 void TestVoiceClient::noVideoGoesOutWhileEndToEndKeysAreMissing()

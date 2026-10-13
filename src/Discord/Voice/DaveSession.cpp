@@ -1,4 +1,8 @@
 #include "DaveSession.hpp"
+
+#include <algorithm>
+#include <utility>
+
 #include "VoiceEnums.hpp"
 #include "Core/Logging.hpp"
 
@@ -89,6 +93,11 @@ void DaveSession::onProposals(const QByteArray &payload)
     }
 }
 
+bool bringsNewKeys(const discord::dave::RosterMap &changes)
+{
+    return std::any_of(changes.begin(), changes.end(), [](const auto &member) { return !member.second.empty(); });
+}
+
 void DaveSession::onAnnounceCommitTransition(const QByteArray &payload)
 {
     if (payload.size() < 2)
@@ -107,6 +116,8 @@ void DaveSession::onAnnounceCommitTransition(const QByteArray &payload)
     if (auto *roster = std::get_if<discord::dave::RosterMap>(&result)) {
         qCInfo(LogDave) << "ProcessCommit succeeded, roster size =" << roster->size();
         pendingTransitionReady = true;
+        // Kept from a transition this one overtakes, as the official client keeps it.
+        pendingTransitionBringsKeys = pendingTransitionBringsKeys || bringsNewKeys(*roster);
         emit sendReadyForTransition(transitionId);
         if (transitionId == 0)
             completeTransition();
@@ -137,6 +148,7 @@ void DaveSession::onWelcome(const QByteArray &payload)
     if (roster) {
         qCInfo(LogDave) << "ProcessWelcome succeeded, roster size =" << roster->size();
         pendingTransitionReady = true;
+        pendingTransitionBringsKeys = true;
         emit sendReadyForTransition(transitionId);
         if (transitionId == 0)
             completeTransition();
@@ -217,6 +229,8 @@ void DaveSession::completeTransition()
     }
 
     emit daveStateChanged(true);
+    if (std::exchange(pendingTransitionBringsKeys, false))
+        emit newKeysNeedKeyframe();
 
     pendingTransitionId = -1;
 }

@@ -896,6 +896,7 @@ bool VoiceClient::prepareVideoSender()
         first.pictureId = static_cast<uint16_t>(random->bounded(0x8000));
         first.transportSequence = 1;
         videoSender = std::make_unique<VideoSendStream>(ssrc, rtxSsrc, first);
+        videoSender->setPacingFactor(params.streamContext ? VideoSendStream::SCREEN_PACING_FACTOR : VideoSendStream::CAMERA_PACING_FACTOR);
     }
 
     std::optional<uint8_t> rtxPayloadType;
@@ -1696,6 +1697,8 @@ void VoiceClient::ensureDaveSession(uint16_t protocolVersion)
             gateway, &VoiceGateway::sendDaveReadyForTransition);
     connect(daveSession.get(), &DaveSession::sendInvalidCommitWelcome,
             gateway, &VoiceGateway::sendDaveInvalidCommitWelcome);
+
+    connect(daveSession.get(), &DaveSession::newKeysNeedKeyframe, this, &VoiceClient::askForLocalKeyframe);
 
     connect(daveSession.get(), &DaveSession::daveStateChanged,
             this, [this](bool enabled) {

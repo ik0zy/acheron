@@ -73,7 +73,10 @@ public:
     static constexpr int NACK_MAX_REQUESTS = 10;
     static constexpr int NACK_GIVE_UP_MS = 1000;
     static constexpr int MAX_NACKS_PER_POLL = 250;
-    static constexpr int KEYFRAME_REQUEST_INTERVAL_MS = 1000;
+    // As the official client's WebRTC has them: a key frame is asked for again every 200 ms
+    // while one is needed, but not of a stream nothing has come from for five seconds.
+    static constexpr int KEYFRAME_REQUEST_INTERVAL_MS = 200;
+    static constexpr int SILENT_AFTER_MS = 5000;
     static constexpr int MAX_SEQUENCE_JUMP = 3000;
     static constexpr int MAX_HELD_PACKETS = 4000;
 
@@ -112,6 +115,7 @@ private:
     std::optional<uint16_t> sequenceAfterFarPacket;
     bool keyframeWanted = true;
     qint64 keyframeRequestedMs = -1;
+    qint64 lastPacketMs = -1;
 
     Stats counters;
 
