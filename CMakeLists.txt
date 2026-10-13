@@ -376,6 +376,7 @@ if(ENABLE_VOICE AND TARGET ffmpeg)
         src/Core/Media/DecodeDemand.cpp
         src/Core/Media/VideoDecoder.cpp
         src/Core/Media/VideoEncoder.cpp
+        src/Core/Media/H264Sps.cpp
         src/Core/Streams/StreamSession.cpp
         src/Core/Streams/StreamWatcher.cpp
         src/Core/Streams/StreamBroadcaster.cpp
@@ -565,7 +566,7 @@ if(BUILD_TESTS)
             add_test(NAME VideoSendTests COMMAND TestVideoSend)
 
             qt_add_executable(TestVideoEncode tests/tst_VideoEncode.cpp src/Core/Media/VideoEncoder.cpp
-                src/Core/Media/VideoDecoder.cpp src/Core/Media/RgbScaler.cpp
+                src/Core/Media/H264Sps.cpp src/Core/Media/VideoDecoder.cpp src/Core/Media/RgbScaler.cpp
                 src/Core/Video/BroadcastPipeline.cpp src/Core/Video/ScreenCapture.cpp src/Core/Video/CardScaler.cpp
                 src/Core/Logging.cpp src/Core/OrderedJson.cpp src/Core/Snowflake.cpp
                 src/Discord/Voice/RtpPacket.cpp src/Discord/Voice/VideoDepacketizer.cpp
@@ -577,7 +578,7 @@ if(BUILD_TESTS)
 
             qt_add_executable(TestCameraCapture tests/tst_CameraCapture.cpp src/Core/Video/CameraCapture.cpp
                 src/Core/Video/CameraPipeline.cpp src/Core/Media/VideoEncoder.cpp
-                src/Core/Media/VideoDecoder.cpp src/Core/Media/RgbScaler.cpp
+                src/Core/Media/H264Sps.cpp src/Core/Media/VideoDecoder.cpp src/Core/Media/RgbScaler.cpp
                 src/Core/Logging.cpp src/Core/OrderedJson.cpp src/Core/Snowflake.cpp
                 src/Discord/Voice/RtpPacket.cpp src/Discord/Voice/VideoDepacketizer.cpp
                 src/Discord/Voice/VideoReceiver.cpp src/Discord/Voice/Rtcp.cpp)
@@ -637,6 +638,12 @@ if(BUILD_TESTS)
         target_include_directories(TestMediaInput PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME MediaInputTests COMMAND TestMediaInput)
 
+        qt_add_executable(TestH264Sps tests/tst_H264Sps.cpp src/Core/Media/H264Sps.cpp src/Core/Media/VideoEncoder.cpp src/Discord/Voice/VideoDepacketizer.cpp src/Core/Logging.cpp)
+        target_link_libraries(TestH264Sps PRIVATE Qt::Core Qt::Gui Qt::Network Qt::Test ffmpeg)
+        target_compile_definitions(TestH264Sps PRIVATE ACHERON_HAVE_FFMPEG)
+        target_include_directories(TestH264Sps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME H264SpsTests COMMAND TestH264Sps)
+
         qt_add_executable(TestApng tests/tst_Apng.cpp src/Core/ApngDecoder.cpp)
         target_link_libraries(TestApng PRIVATE Qt::Core Qt::Gui Qt::Test ffmpeg)
         target_compile_definitions(TestApng PRIVATE ACHERON_HAVE_FFMPEG)
@@ -660,7 +667,7 @@ if (MSVC)
     if(BUILD_TESTS)
         set(_msvc_test_targets TestMarkdown TestUnicodeEmoji TestOrderedJson TestFrecency TestProto TestProxy TestEmojiGrid TestCdnUrls TestEmbeds TestFavoriteGifs TestVoicePayloads TestStreams TestCalls TestDecodeDemand TestSendQuality)
         if(TARGET TestApng)
-            list(APPEND _msvc_test_targets TestApng TestClips TestMediaInput)
+            list(APPEND _msvc_test_targets TestApng TestClips TestMediaInput TestH264Sps)
         endif()
         if(TARGET TestRtp)
             list(APPEND _msvc_test_targets TestRtp TestOpusEncoder TestLoopbackCapture TestUdpTransport TestSinkWants TestVoiceClient)

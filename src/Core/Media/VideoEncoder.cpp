@@ -1,6 +1,7 @@
 #include "Core/Media/VideoEncoder.hpp"
 
 #include "Core/Logging.hpp"
+#include "Core/Media/H264Sps.hpp"
 
 #include <QElapsedTimer>
 
@@ -720,6 +721,9 @@ bool EncodedFrameFinisher::finish(EncodedVideoFrame &frame)
 
 bool EncodedFrameFinisher::finishAnnexB(EncodedVideoFrame &frame)
 {
+    if (codec == VideoCodec::H264)
+        H264::rewriteSpsIn(frame.data);
+
     const std::span<const uint8_t> data(frame.data);
     const std::vector<Nal> nals = splitNals(data);
     if (!startsWithStartCode(data, nals))
@@ -822,13 +826,17 @@ void EncodedFrameFinisher::rememberParameterSets(const uint8_t *data, size_t siz
         return;
     }
 
-    const std::vector<Nal> nals = splitNals(extradata);
-    if (!startsWithStartCode(extradata, nals))
+    std::vector<uint8_t> annexB(extradata.begin(), extradata.end());
+    if (codec == VideoCodec::H264)
+        H264::rewriteSpsIn(annexB);
+
+    const std::vector<Nal> nals = splitNals(annexB);
+    if (!startsWithStartCode(annexB, nals))
         return;
     for (const Nal &nal : nals) {
-        const NalKind kind = nalKind(codec, extradata, nal);
+        const NalKind kind = nalKind(codec, annexB, nal);
         if (isParameterSet(kind))
-            parameterSets[static_cast<size_t>(kind)].assign(extradata.begin() + nal.begin, extradata.begin() + nal.end);
+            parameterSets[static_cast<size_t>(kind)].assign(annexB.begin() + nal.begin, annexB.begin() + nal.end);
     }
 }
 

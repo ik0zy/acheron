@@ -64,7 +64,9 @@ inline constexpr int MOST_ROWS_ADDED = 8;
 // each say their size, with the sequence header ahead of the picture in every key frame; a
 // temporal delimiter may come first. VP8 is a bare frame. Whether a frame is a key frame is
 // read from the frame: an IDR picture in H264, any IRAP picture in H265, a key frame that is
-// shown in AV1.
+// shown in AV1. Every H264 SPS that leaves here, in a frame or kept for a later one, is one the
+// official client does not rewrite on receiving it, since it could not then decrypt the frame
+// (H264Sps.hpp).
 class EncodedFrameFinisher
 {
 public:
