@@ -1,6 +1,7 @@
 #include "VideoSurface.hpp"
 
 #include "D3D11GlBridge.hpp"
+#include "DmabufGlBridge.hpp"
 
 #include "Core/Media/RgbScaler.hpp"
 
@@ -30,6 +31,7 @@
 
 extern "C" {
 #include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
@@ -323,7 +325,8 @@ private:
 // frame to RGB at the widget's size: the decoder's thread writes into `back` and swaps it with
 // `front`, and the widget only ever reads `front`, under the same lock, so neither image is
 // shared and none is allocated per frame. A frame still on the graphics card is passed to the
-// worker that turns it into a texture, and the widget hears of it when that is done.
+// worker that turns it into a texture, and the widget hears of it when that is done; a VAAPI
+// one is kept with its DMA-BUFs, for the widget to draw from.
 class VideoSurface::Sink : public Core::Media::VideoFrameSink, public std::enable_shared_from_this<VideoSurface::Sink>
 {
 public:
@@ -335,11 +338,21 @@ public:
         sws_freeContext(normalizer);
         av_frame_free(&last);
         av_frame_free(&handing);
+        av_frame_free(&exported);
     }
 
     void present(const AVFrame *frame) override
     {
+#ifdef ACHERON_HAVE_DMABUF
+        // Waits for the card to finish the picture: on this thread, the decoder's, and not
+        // under the lock.
+        AVFrame *handed = frame->format == AV_PIX_FMT_VAAPI ? DmabufGlBridge::exported(frame) : nullptr;
+#endif
         std::lock_guard lock(mutex);
+#ifdef ACHERON_HAVE_DMABUF
+        av_frame_free(&exported);
+        exported = handed;
+#endif
         if (!owner)
             return;
 
@@ -370,9 +383,37 @@ public:
     }
 #endif
 
+#ifdef ACHERON_HAVE_DMABUF
+    // Set by the layer that draws once it can draw the card's pictures, and cleared when it
+    // no longer can.
+    void setCardUsable(bool usable)
+    {
+        hardwareFramesUsable.store(usable, std::memory_order_relaxed);
+    }
+
+    // The frame as DMA-BUFs, when it is one from the card that could be had so. For the reader
+    // in withFrame().
+    [[nodiscard]] const AVFrame *exportedFrame() const { return exported; }
+
+    // For the reader in withFrame(), when the frame is on the card and cannot be drawn from
+    // there: it is brought into memory as the decoder would have brought it.
+    void readBack()
+    {
+        AVFrame *downloaded = av_frame_alloc();
+        if (av_hwframe_transfer_data(downloaded, last, 0) >= 0 && av_frame_copy_props(downloaded, last) >= 0)
+            store(downloaded);
+        av_frame_free(&downloaded);
+        av_frame_free(&exported);
+    }
+#endif
+
     bool acceptsHardwareFrames(int format) const override
     {
+#ifdef ACHERON_HAVE_DMABUF
+        return format == AV_PIX_FMT_VAAPI && hardwareFramesUsable.load(std::memory_order_relaxed);
+#else
         return format == AV_PIX_FMT_D3D11 && hardwareFramesUsable.load(std::memory_order_relaxed);
+#endif
     }
 
     // Whether the surface is on screen. The card's pictures are not made ready for one that
@@ -412,6 +453,7 @@ public:
     {
         std::lock_guard lock(mutex);
         av_frame_unref(last);
+        av_frame_free(&exported);
         front = QImage();
         serial++;
     }
@@ -547,6 +589,8 @@ private:
     AVFrame *last;
     // The worker's own reference to the frame it is turning into a texture.
     AVFrame *handing;
+    // `last` as DMA-BUFs, when it is a VAAPI frame.
+    AVFrame *exported = nullptr;
     quint64 serial = 0;
     Core::Media::RgbScaler scaler;
     SwsContext *normalizer = nullptr;
@@ -559,8 +603,9 @@ private:
 
 // Draws the picture with the graphics card. A frame in memory goes up as textures, and a shader
 // converts them to RGB while the card scales them to the widget. A frame the decoder left on
-// the card arrives as a finished texture, which is only drawn. The layer sits inside the
-// surface, fills it, and passes the mouse and keys on to it.
+// the card arrives as a finished texture, which is only drawn, or, from VAAPI, as textures that
+// are its planes where they lie. The layer sits inside the surface, fills it, and passes the
+// mouse and keys on to it.
 //
 // It is a window of its own inside the surface's window, not a widget. A widget that draws
 // with OpenGL makes Qt rebuild the whole window it is put into, visibly, and from then on
@@ -691,6 +736,7 @@ protected:
             uniform sampler2D planeU;
             uniform sampler2D planeV;
             uniform float interleaved;
+            uniform float pairInGreen;
             uniform vec2 lumaScale;
             uniform vec2 chromaScale;
             uniform mat3 conversion;
@@ -699,6 +745,8 @@ protected:
                 float y = texture2D(planeY, coord * lumaScale).r;
                 vec2 at = coord * chromaScale;
                 vec2 chroma = interleaved > 0.5 ? texture2D(planeU, at).ra : vec2(texture2D(planeU, at).r, texture2D(planeV, at).r);
+                if (pairInGreen > 0.5)
+                    chroma = texture2D(planeU, at).rg;
                 gl_FragColor = vec4(conversion * (vec3(y, chroma) - offset), 1.0);
             }
         )";
@@ -753,6 +801,11 @@ protected:
             // Making the worker's context can leave this one no longer current.
             makeCurrent();
         }
+#elif defined(ACHERON_HAVE_DMABUF)
+        if (usable && QSettings().value(DIRECT_FRAMES_KEY, true).toBool() && DmabufGlBridge::contextSupportsIt()) {
+            card = std::make_unique<DmabufGlBridge>();
+            sink->setCardUsable(true);
+        }
 #endif
     }
 
@@ -771,6 +824,10 @@ protected:
                 return;
             }
             picture = displaySize;
+#ifdef ACHERON_HAVE_DMABUF
+            if (frame->hw_frames_ctx && (shown != Shown::OnCard || serial != preparedSerial))
+                takeFromCard(frame, serial);
+#endif
             if (frame->hw_frames_ctx) {
                 onCard = true;
             } else if (shown != Shown::Uploaded || serial != preparedSerial) {
@@ -784,8 +841,12 @@ protected:
         if (shown == Shown::Uploaded) {
             draw(picture);
         } else if (shown == Shown::OnCard) {
+#ifdef ACHERON_HAVE_DMABUF
+            draw(picture);
+#else
             placePicture(picture);
             drawTexture(cardTexture, true);
+#endif
         }
         drawOverlays(shown != Shown::Nothing);
     }
@@ -815,7 +876,33 @@ private:
 #else
         Q_UNUSED(onCard);
 #endif
+#ifdef ACHERON_HAVE_DMABUF
+        if (card && shown != Shown::OnCard)
+            card->release();
+#endif
     }
+
+#ifdef ACHERON_HAVE_DMABUF
+    // Within withFrame(). A card that will not have the picture is not offered another, and
+    // the picture is then in memory, to be uploaded.
+    void takeFromCard(const AVFrame *frame, quint64 serial)
+    {
+        const AVFrame *exported = sink->exportedFrame();
+        if (!card || !exported || !card->update(exported, textures[FIRST_CARD_TEXTURE], textures[FIRST_CARD_TEXTURE + 1])) {
+            closeCard();
+            sink->readBack();
+            return;
+        }
+        nv12 = true;
+        // The surface is as large as the coded picture, which is rounded up to whole blocks.
+        // As with rows in memory, the shader is told how much of it to read.
+        lumaScale = QVector2D((static_cast<float>(frame->width) - 0.5f) / static_cast<float>(exported->width), (static_cast<float>(frame->height) - 0.5f) / static_cast<float>(exported->height));
+        chromaScale = QVector2D((static_cast<float>((frame->width + 1) / 2) - 0.5f) / static_cast<float>((exported->width + 1) / 2), (static_cast<float>((frame->height + 1) / 2) - 0.5f) / static_cast<float>((exported->height + 1) / 2));
+        setConversion(frame);
+        shown = Shown::OnCard;
+        preparedSerial = serial;
+    }
+#endif
 
     // Everything made in the context, which is current and about to go. The frame itself is
     // with the sink, so the picture comes back in the next context.
@@ -849,6 +936,11 @@ private:
         if (card) {
             sink->setCard(nullptr);
             card->close();
+            card.reset();
+        }
+#elif defined(ACHERON_HAVE_DMABUF)
+        if (card) {
+            sink->setCardUsable(false);
             card.reset();
         }
 #endif
@@ -966,7 +1058,11 @@ private:
         glActiveTexture(GL_TEXTURE0);
         // Back to the default, which the overlay texture is uploaded with.
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        setConversion(frame);
+    }
 
+    void setConversion(const AVFrame *frame)
+    {
         // Y'CbCr to RGB for the frame's standard and range.
         const bool bt709 = usesBt709(frame);
         const float kr = bt709 ? 0.2126f : 0.299f;
@@ -992,14 +1088,16 @@ private:
         static const GLfloat TEXCOORDS[] = { 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f };
 
         program->bind();
+        const size_t first = shown == Shown::OnCard ? FIRST_CARD_TEXTURE : 0;
         for (int unit = 0; unit < 3; unit++) {
             glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(unit));
-            glBindTexture(GL_TEXTURE_2D, textures[static_cast<size_t>(unit)]);
+            glBindTexture(GL_TEXTURE_2D, textures[first + static_cast<size_t>(unit)]);
         }
         program->setUniformValue("planeY", 0);
         program->setUniformValue("planeU", 1);
         program->setUniformValue("planeV", 2);
         program->setUniformValue("interleaved", nv12 ? 1.0f : 0.0f);
+        program->setUniformValue("pairInGreen", shown == Shown::OnCard ? 1.0f : 0.0f);
         program->setUniformValue("lumaScale", lumaScale);
         program->setUniformValue("chromaScale", chromaScale);
         program->setUniformValue("conversion", conversion);
@@ -1036,10 +1134,14 @@ private:
     QSize overlaySize;
     bool overlaysStale = true;
     bool overlaysHadPicture = false;
-    std::array<GLuint, 3> textures = {};
+    // The planes of a frame uploaded, and then those of one on the card.
+    static constexpr size_t FIRST_CARD_TEXTURE = 3;
+    std::array<GLuint, 6> textures = {};
     std::array<Allocation, 3> allocations;
 #ifdef Q_OS_WIN
     std::shared_ptr<CardPicture> card;
+#elif defined(ACHERON_HAVE_DMABUF)
+    std::unique_ptr<DmabufGlBridge> card;
 #endif
     bool glReady = false;
     GLuint cardTexture = 0;
