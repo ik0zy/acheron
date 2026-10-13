@@ -49,12 +49,15 @@ void CallVideo::setMaxDecoders(int decoders)
     QSettings().setValue(MAX_DECODERS_KEY, std::max(1, decoders));
 }
 
-void CallVideo::attach(VoiceClient *voiceClient)
+void CallVideo::attach(VoiceClient *voiceClient, Snowflake ownUserId)
 {
     detach();
     client = voiceClient;
+    ownUser = ownUserId;
 
     connect(client, &VoiceClient::remoteVideoLayersChanged, this, &CallVideo::onLayersChanged);
+    connect(client, &VoiceClient::clientReachedServer, this, &CallVideo::onUserReachedServer);
+    connect(client, &VoiceClient::clientDisconnected, this, &CallVideo::onUserLeftServer);
     connect(client, &VoiceClient::connected, this, &CallVideo::scheduleReplan);
     client->setVideoFrameHandler([this](Snowflake userId, Discord::Voice::VideoCodec codec, Discord::Voice::EncodedVideoFrame frame) {
         std::shared_ptr<Media::VideoDecoder> decoder;
@@ -74,6 +77,7 @@ void CallVideo::detach()
     if (client)
         client->disconnect(this);
     client = nullptr;
+    othersOnServer.clear();
     replanTimer.stop();
     expiryTimer.stop();
 
@@ -142,12 +146,18 @@ void CallVideo::setFocused(Snowflake userId)
     scheduleReplan();
 }
 
-void CallVideo::setOneToOne(bool value)
+void CallVideo::onUserReachedServer(Snowflake userId)
 {
-    if (oneToOne == value)
+    if (userId == ownUser || othersOnServer.contains(userId))
         return;
-    oneToOne = value;
+    othersOnServer.insert(userId);
     scheduleReplan();
+}
+
+void CallVideo::onUserLeftServer(Snowflake userId)
+{
+    if (othersOnServer.remove(userId))
+        scheduleReplan();
 }
 
 bool CallVideo::isVideoDisabled(Snowflake userId) const
@@ -196,7 +206,7 @@ void CallVideo::replan()
 
     Discord::Voice::SinkWantsInput input;
     input.focusedUser = focusedUser;
-    input.oneToOne = oneToOne;
+    input.oneToOne = othersOnServer.size() == 1;
 
     // The focused sender is considered first so that the decoder limit never leaves it out.
     QList<Snowflake> users = senders();

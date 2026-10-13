@@ -565,7 +565,7 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
     voiceConnection = new VoiceConnection(params, this);
     voiceClient = voiceConnection->client();
 #ifdef ACHERON_HAVE_STREAM_VIEW
-    callVideo->attach(voiceClient);
+    callVideo->attach(voiceClient, accountId);
 #endif
     emit rtcClientCreated(voiceClient);
     audioPipeline = new AudioPipeline;

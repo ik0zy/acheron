@@ -28,9 +28,9 @@ public:
     explicit CallVideo(QObject *parent = nullptr);
     ~CallVideo() override;
 
-    // Follows one voice connection. Call before the client starts, and detach() once it has
-    // stopped.
-    void attach(Discord::Voice::VoiceClient *client);
+    // Follows one voice connection, on which this account is `ownUserId`. Call before the
+    // client starts, and detach() once it has stopped.
+    void attach(Discord::Voice::VoiceClient *client, Snowflake ownUserId);
     void detach();
 
     [[nodiscard]] QList<Snowflake> senders() const;
@@ -42,7 +42,6 @@ public:
 
     // The participant shown large, who is asked for full quality.
     void setFocused(Snowflake userId);
-    void setOneToOne(bool oneToOne);
 
     // "Disable Video" for one person, remembered across sessions.
     [[nodiscard]] bool isVideoDisabled(Snowflake userId) const;
@@ -64,6 +63,8 @@ signals:
 
 private slots:
     void onLayersChanged(Snowflake userId, const QList<Discord::Voice::VideoLayer> &layers);
+    void onUserReachedServer(Snowflake userId);
+    void onUserLeftServer(Snowflake userId);
     void replan();
 
 private:
@@ -81,7 +82,11 @@ private:
     TileVisibility visibility;
     QSet<Snowflake> disabledUsers;
     Snowflake focusedUser;
-    bool oneToOne = false;
+    Snowflake ownUser;
+    // Whoever else the voice server says is connected to it. With exactly one, the official
+    // client asks for no more of their video than the tile it is shown in needs. It leaves
+    // a stage channel out of that, which this client does not tell from a voice channel.
+    QSet<Snowflake> othersOnServer;
 
     QElapsedTimer clock;
     QTimer replanTimer;
