@@ -231,7 +231,10 @@ jobs:
           path: acheron-windows-minimal
 
   build-windows-qt5:
-    runs-on: windows-latest
+    # Visual Studio 2022: its C++ runtime (14.4x) is the last that loads on Windows 7,
+    # and the artifact carries it beside the exe. What a newer toolset builds crashes
+    # at its first std::mutex on an installed runtime older than that toolset.
+    runs-on: windows-2022
 
     steps:
       - uses: actions/checkout@v7
@@ -261,7 +264,7 @@ jobs:
           path: build/vcpkg_installed
           # Keyed apart from the Qt6 jobs: this one also holds the from-source ffmpeg,
           # and restoring their cache would rebuild it on every run.
-          key: vcpkg-x64-windows-static-md-ffmpeg-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-x64-windows-static-md-ffmpeg-vs2022-${{ hashFiles('vcpkg.json') }}
 
       - name: Install curl-impersonate
         shell: pwsh
@@ -340,6 +343,12 @@ jobs:
           # QNetworkAccessManager needs it for HTTPS and windeployqt does not deploy it.
           Copy-Item "openssl-bin/*.dll" $out -Force
 
+          # The C++ runtime this job built against, so that the machine's own, which may
+          # be older, is not the one loaded. vccorlib140 is left out: it is for WinRT.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT" | Sort-Object FullName | Select-Object -Last 1
+          Copy-Item "$($crt.FullName)\msvcp140*.dll","$($crt.FullName)\vcruntime140*.dll" $out -Force
+
           # Drop build leftovers, and the plugins the app can never reach: main.cpp
           # forces the Fusion style and Storage only ever opens QSQLITE. The .exp
           # (and its .lib) exist because static ffmpeg marks its API dllexport, so
@@ -363,14 +372,16 @@ jobs:
         shell: pwsh
         run: |
           $out = "acheron-windows-qt5-media-tests"
-          $curlDir = "${{ github.workspace }}/curl-impersonate"
+          $app = "acheron-windows-qt5-MinSizeRel"
           New-Item -ItemType Directory -Path $out -Force
           foreach ($test in "TestVideoDecode", "TestVideoEncode", "TestVideoSend", "TestVideoSurface", "TestCameraCapture", "TestRtpVideo", "TestOpusEncoder", "TestClips", "TestMediaInput", "TestApng") {
             Copy-Item "build/MinSizeRel/$test.exe" $out
             windeployqt --no-translations --no-system-d3d-compiler "$out/$test.exe"
           }
-          Copy-Item "$curlDir/lib/*.dll" $out -Force
-          Copy-Item "openssl-bin/*.dll" $out -Force
+          # The DLLs the app ships with, the C++ runtime among them, and the platform
+          # plugin the tests that draw nothing ask for.
+          Copy-Item "$app/*.dll" $out -Force
+          Copy-Item "$env:QT_ROOT_DIR/plugins/platforms/qoffscreen.dll" "$out/platforms" -Force
 
       - name: Upload media tests
         uses: actions/upload-artifact@v7

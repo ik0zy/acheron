@@ -25,9 +25,11 @@
           "features": [
             "avcodec",
             "avformat",
+            "dav1d",
             "openssl",
             "swresample",
             "swscale",
+            "vpx",
             "zlib"
           ]
         }
