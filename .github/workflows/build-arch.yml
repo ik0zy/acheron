@@ -1,0 +1,87 @@
+name: Build (Arch Linux)
+
+# Arch-native build: system pacman packages, no vcpkg.
+# Produces a binary tarball (usr/ tree) you can extract over / or /usr/local
+# on any reasonably up-to-date Arch system.
+on:
+  push:
+    branches: [master, ci/**]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  CURL_IMPERSONATE_VERSION: v2.0.0
+
+jobs:
+  build-arch:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Harden pacman keyring
+        run: |
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Su --noconfirm --needed base-devel cmake ninja git pkgconf \
+            qt6-base qt6-svg qt6-tools qt6-imageformats qt6-translations \
+            qtkeychain-qt6 rlottie libsodium opus ffmpeg openssl libsecret zlib curl
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install curl-impersonate
+        run: |
+          curl -L -o libcurl-impersonate.tar.gz \
+            "https://github.com/lexiforest/curl-impersonate/releases/download/${{ env.CURL_IMPERSONATE_VERSION }}/libcurl-impersonate-${{ env.CURL_IMPERSONATE_VERSION }}.x86_64-linux-gnu.tar.gz"
+          mkdir -p curl-impersonate
+          tar -xzf libcurl-impersonate.tar.gz -C curl-impersonate
+          KEEP_FLAGS=$(nm --defined-only -g curl-impersonate/libcurl-impersonate.a \
+            | awk '{print $NF}' | grep '^curl_' | sort -u \
+            | sed 's/^/--keep-global-symbol=/' | tr '\n' ' ')
+          objcopy $KEEP_FLAGS \
+            curl-impersonate/libcurl-impersonate.a \
+            curl-impersonate/libcurl-impersonate-local.a
+
+      - name: Configure
+        run: >
+          cmake -B build -S .
+          -DCMAKE_BUILD_TYPE=Release
+          -DUSE_VCPKG=OFF
+          -DCURL_INCLUDE_DIR=${{ github.workspace }}/curl-impersonate/include
+          -DCURL_LIBRARY=${{ github.workspace }}/curl-impersonate/libcurl-impersonate-local.a
+          -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Stage install tree
+        run: |
+          DESTDIR="$PWD/pkg" cmake --install build
+          # certs/ and fonts/ resolve relative to applicationDirPath(),
+          # so they live next to the binary, not under share/
+          [ -d build/certs ] && cp -r build/certs pkg/usr/bin/certs
+          [ -d build/fonts ] && cp -r build/fonts pkg/usr/bin/fonts
+          strip --strip-unneeded pkg/usr/bin/acheron || true
+          echo "--- ldd ---"
+          ldd pkg/usr/bin/acheron || true
+          echo "--- tree ---"
+          find pkg -maxdepth 4 | sort
+
+      - name: Pack tarball
+        run: tar -czf acheron-arch-x86_64.tar.gz -C pkg usr
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: acheron-arch-x86_64
+          path: acheron-arch-x86_64.tar.gz
