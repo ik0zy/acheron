@@ -40,6 +40,10 @@ jobs:
         # self-contained.
         run: |
           git clone --depth 1 --branch v0.2 https://github.com/Samsung/rlottie.git rlottie-src
+          # v0.2 predates GCC 15+: vrle.cpp uses std::numeric_limits without
+          # including <limits>, which older libstdc++ headers pulled in
+          # transitively. Patch it like distro packages do.
+          sed -i '1i #include <limits>' rlottie-src/src/vector/vrle.cpp
           cmake -B rlottie-src/build -S rlottie-src \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr \
