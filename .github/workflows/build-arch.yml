@@ -68,13 +68,16 @@ jobs:
             curl-impersonate/libcurl-impersonate-local.a
 
       - name: Configure
-        run: >
-          cmake -B build -S .
-          -DCMAKE_BUILD_TYPE=Release
-          -DUSE_VCPKG=OFF
-          -DCURL_INCLUDE_DIR=${{ github.workspace }}/curl-impersonate/include
-          -DCURL_LIBRARY=${{ github.workspace }}/curl-impersonate/libcurl-impersonate-local.a
-          -DBUILD_TESTS=ON
+        # NOTE: $PWD, not ${{ github.workspace }}: in a container job the
+        # context expression is the host path, which does not exist inside
+        # the container. Steps run in the container workspace by default.
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DUSE_VCPKG=OFF \
+            -DCURL_INCLUDE_DIR="$PWD/curl-impersonate/include" \
+            -DCURL_LIBRARY="$PWD/curl-impersonate/libcurl-impersonate-local.a" \
+            -DBUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build --parallel $(nproc)
