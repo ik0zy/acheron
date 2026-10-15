@@ -74,6 +74,7 @@ jobs:
         run: |
           cmake -B build -S . \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
             -DUSE_VCPKG=OFF \
             -DCURL_INCLUDE_DIR="$PWD/curl-impersonate/include" \
             -DCURL_LIBRARY="$PWD/curl-impersonate/libcurl-impersonate-local.a" \
