@@ -25,7 +25,7 @@ jobs:
           pacman -Sy --noconfirm archlinux-keyring
           pacman -Su --noconfirm --needed base-devel cmake ninja git pkgconf \
             qt6-base qt6-svg qt6-tools qt6-imageformats qt6-translations \
-            qtkeychain-qt6 libsodium opus ffmpeg openssl libsecret zlib curl
+            qtkeychain-qt6 nlohmann-json libsodium opus ffmpeg openssl libsecret zlib curl
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -44,6 +44,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DBUILD_SHARED_LIBS=OFF \
             -DLOTTIE_TEST=OFF
           cmake --build rlottie-src/build --parallel $(nproc)
