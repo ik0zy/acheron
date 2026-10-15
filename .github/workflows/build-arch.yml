@@ -25,7 +25,7 @@ jobs:
           pacman -Sy --noconfirm archlinux-keyring
           pacman -Su --noconfirm --needed base-devel cmake ninja git pkgconf \
             qt6-base qt6-svg qt6-tools qt6-imageformats qt6-translations \
-            qtkeychain-qt6 rlottie libsodium opus ffmpeg openssl libsecret zlib curl
+            qtkeychain-qt6 libsodium opus ffmpeg openssl libsecret zlib curl
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -33,6 +33,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Build rlottie from source
+        # rlottie is no longer in the Arch repos, so build the v0.2 release
+        # the distro package used. Static + PIC so the binary stays
+        # self-contained.
+        run: |
+          git clone --depth 1 --branch v0.2 https://github.com/Samsung/rlottie.git rlottie-src
+          cmake -B rlottie-src/build -S rlottie-src \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLOTTIE_TEST=OFF
+          cmake --build rlottie-src/build --parallel $(nproc)
+          cmake --install rlottie-src/build
 
       - name: Install curl-impersonate
         run: |
